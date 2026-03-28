@@ -64,7 +64,7 @@ CRATEJOY_CLIENT_ID = os.getenv("CRATEJOY_CLIENT_ID", "")
 CRATEJOY_CLIENT_SECRET = os.getenv("CRATEJOY_CLIENT_SECRET", "")
 
 # ─── App config ───
-BASE_URL = os.getenv("BASE_URL", "https://plainly-evolved-dassie.ngrok-free.app")
+BASE_URL = os.getenv("BASE_URL", "https://obb-real-d4e16a8bb2ff.herokuapp.com")
 
 # ─── Google Sheets config ───
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
