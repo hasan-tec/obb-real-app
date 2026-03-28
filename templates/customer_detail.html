@@ -5,7 +5,9 @@
     <h1>Customer Detail</h1>
     <div class="status">
         <a href="/customers" class="btn btn-sm btn-secondary">← Back</a>
-        <button class="btn btn-sm btn-primary" onclick="document.getElementById('editCustomerForm').style.display = document.getElementById('editCustomerForm').style.display === 'none' ? 'block' : 'none'">✏️ Edit</button>
+        <button class="btn btn-sm btn-primary"
+            onclick="document.getElementById('editCustomerForm').style.display = document.getElementById('editCustomerForm').style.display === 'none' ? 'block' : 'none'">✏️
+            Edit</button>
     </div>
 </div>
 <div class="content">
@@ -13,13 +15,16 @@
 
     <!-- Edit Customer Form (hidden by default) -->
     <div id="editCustomerForm" class="card" style="display: none; margin-bottom: 20px;">
-        <div class="card-header"><h3>Edit Customer</h3></div>
+        <div class="card-header">
+            <h3>Edit Customer</h3>
+        </div>
         <div style="padding: 16px;">
             <form method="POST" action="/customers/{{ customer.id }}/edit">
                 <div class="form-row">
                     <div class="form-group">
                         <label>First Name</label>
-                        <input type="text" name="first_name" class="form-control" value="{{ customer.first_name or '' }}">
+                        <input type="text" name="first_name" class="form-control"
+                            value="{{ customer.first_name or '' }}">
                     </div>
                     <div class="form-group">
                         <label>Last Name</label>
@@ -27,7 +32,8 @@
                     </div>
                     <div class="form-group">
                         <label>Due Date</label>
-                        <input type="date" name="due_date_str" class="form-control" value="{{ customer.due_date or '' }}">
+                        <input type="date" name="due_date_str" class="form-control"
+                            value="{{ customer.due_date or '' }}">
                     </div>
                 </div>
                 <div class="form-row">
@@ -35,27 +41,32 @@
                         <label>Clothing Size</label>
                         <select name="clothing_size" class="form-control">
                             <option value="">— Not set —</option>
-                            <option value="S" {% if customer.clothing_size == 'S' %}selected{% endif %}>Small (S)</option>
-                            <option value="M" {% if customer.clothing_size == 'M' %}selected{% endif %}>Medium (M)</option>
-                            <option value="L" {% if customer.clothing_size == 'L' %}selected{% endif %}>Large (L)</option>
-                            <option value="XL" {% if customer.clothing_size == 'XL' %}selected{% endif %}>X-Large (XL)</option>
+                            <option value="S" {% if customer.clothing_size=='S' %}selected{% endif %}>Small (S)</option>
+                            <option value="M" {% if customer.clothing_size=='M' %}selected{% endif %}>Medium (M)
+                            </option>
+                            <option value="L" {% if customer.clothing_size=='L' %}selected{% endif %}>Large (L)</option>
+                            <option value="XL" {% if customer.clothing_size=='XL' %}selected{% endif %}>X-Large (XL)
+                            </option>
                         </select>
                     </div>
                     <div class="form-group">
                         <label>Expecting</label>
                         <select name="baby_gender" class="form-control">
                             <option value="">— Not set —</option>
-                            <option value="girl" {% if customer.baby_gender == 'girl' %}selected{% endif %}>Girl</option>
-                            <option value="boy" {% if customer.baby_gender == 'boy' %}selected{% endif %}>Boy</option>
-                            <option value="unknown" {% if customer.baby_gender == 'unknown' %}selected{% endif %}>Unknown</option>
+                            <option value="girl" {% if customer.baby_gender=='girl' %}selected{% endif %}>Girl</option>
+                            <option value="boy" {% if customer.baby_gender=='boy' %}selected{% endif %}>Boy</option>
+                            <option value="unknown" {% if customer.baby_gender=='unknown' %}selected{% endif %}>Unknown
+                            </option>
                         </select>
                     </div>
                     <div class="form-group">
                         <label>Platform</label>
                         <select name="platform" class="form-control">
-                            <option value="shopify" {% if customer.platform == 'shopify' %}selected{% endif %}>Shopify</option>
-                            <option value="cratejoy" {% if customer.platform == 'cratejoy' %}selected{% endif %}>Cratejoy</option>
-                            <option value="both" {% if customer.platform == 'both' %}selected{% endif %}>Both</option>
+                            <option value="shopify" {% if customer.platform=='shopify' %}selected{% endif %}>Shopify
+                            </option>
+                            <option value="cratejoy" {% if customer.platform=='cratejoy' %}selected{% endif %}>Cratejoy
+                            </option>
+                            <option value="both" {% if customer.platform=='both' %}selected{% endif %}>Both</option>
                         </select>
                     </div>
                 </div>
@@ -63,10 +74,14 @@
                     <div class="form-group">
                         <label>Status</label>
                         <select name="subscription_status" class="form-control">
-                            <option value="active" {% if customer.subscription_status == 'active' %}selected{% endif %}>Active</option>
-                            <option value="cancelled-prepaid" {% if customer.subscription_status == 'cancelled-prepaid' %}selected{% endif %}>Cancelled (Prepaid)</option>
-                            <option value="cancelled-expired" {% if customer.subscription_status == 'cancelled-expired' %}selected{% endif %}>Cancelled (Expired)</option>
-                            <option value="paused" {% if customer.subscription_status == 'paused' %}selected{% endif %}>Paused</option>
+                            <option value="active" {% if customer.subscription_status=='active' %}selected{% endif %}>
+                                Active</option>
+                            <option value="cancelled-prepaid" {% if customer.subscription_status=='cancelled-prepaid'
+                                %}selected{% endif %}>Cancelled (Prepaid)</option>
+                            <option value="cancelled-expired" {% if customer.subscription_status=='cancelled-expired'
+                                %}selected{% endif %}>Cancelled (Expired)</option>
+                            <option value="paused" {% if customer.subscription_status=='paused' %}selected{% endif %}>
+                                Paused</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -79,7 +94,8 @@
                 </div>
                 <div style="margin-top: 8px;">
                     <button type="submit" class="btn btn-primary">✓ Save Changes</button>
-                    <button type="button" class="btn btn-secondary" onclick="document.getElementById('editCustomerForm').style.display='none'">Cancel</button>
+                    <button type="button" class="btn btn-secondary"
+                        onclick="document.getElementById('editCustomerForm').style.display='none'">Cancel</button>
                 </div>
             </form>
         </div>
@@ -211,7 +227,8 @@
                             placeholder="e.g. WK21, CI33, CJ21" list="kit_sku_list">
                         <datalist id="kit_sku_list">
                             {% for k in kits %}
-                            <option value="{{ k.sku }}">{{ k.sku }} — T{{ k.trimester }}{% if k.is_welcome_kit %} (Welcome){% endif %}</option>
+                            <option value="{{ k.sku }}">{{ k.sku }} — T{{ k.trimester }}{% if k.is_welcome_kit %}
+                                (Welcome){% endif %}</option>
                             {% endfor %}
                         </datalist>
                     </div>
@@ -244,7 +261,8 @@
                     </div>
                     <div class="form-group">
                         <label>Notes</label>
-                        <input type="text" name="notes" class="form-control" placeholder="Optional — e.g. 'from V3 backup'">
+                        <input type="text" name="notes" class="form-control"
+                            placeholder="Optional — e.g. 'from V3 backup'">
                     </div>
                 </div>
                 <div style="margin-top: 8px;">

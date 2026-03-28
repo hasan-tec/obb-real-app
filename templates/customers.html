@@ -5,7 +5,9 @@
     <h1>Customers</h1>
     <div class="status">
         <span>{{ customers | length }} customers</span>
-        <button class="btn btn-sm btn-primary" onclick="document.getElementById('addCustomerForm').style.display = document.getElementById('addCustomerForm').style.display === 'none' ? 'block' : 'none'">+ Add Customer</button>
+        <button class="btn btn-sm btn-primary"
+            onclick="document.getElementById('addCustomerForm').style.display = document.getElementById('addCustomerForm').style.display === 'none' ? 'block' : 'none'">+
+            Add Customer</button>
     </div>
 </div>
 <div class="content">
@@ -109,7 +111,8 @@
                 </div>
                 <div style="margin-top: 8px;">
                     <button type="submit" class="btn btn-primary">✓ Add Customer</button>
-                    <button type="button" class="btn btn-secondary" onclick="document.getElementById('addCustomerForm').style.display='none'">Cancel</button>
+                    <button type="button" class="btn btn-secondary"
+                        onclick="document.getElementById('addCustomerForm').style.display='none'">Cancel</button>
                 </div>
             </form>
         </div>
