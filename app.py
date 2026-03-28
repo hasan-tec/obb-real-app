@@ -69,6 +69,7 @@ BASE_URL = os.getenv("BASE_URL", "https://plainly-evolved-dassie.ngrok-free.app"
 # ─── Google Sheets config ───
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Phase1 Decisions")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 SERVICE_ACCOUNT_FILE = str(Path(__file__).resolve().parent / "service_account.json")
 
 _gsheet_client = None
@@ -79,8 +80,11 @@ def get_gsheet():
     if not GOOGLE_SHEET_ID:
         logger.warning("[GSHEETS] GOOGLE_SHEET_ID not set, skipping")
         return None
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        logger.warning("[GSHEETS] service_account.json not found, skipping")
+    # Check for credentials: env var JSON first, then local file
+    has_env_json = bool(GOOGLE_SERVICE_ACCOUNT_JSON)
+    has_file = os.path.exists(SERVICE_ACCOUNT_FILE)
+    if not has_env_json and not has_file:
+        logger.warning("[GSHEETS] No Google credentials found (no env var or file), skipping")
         return None
     try:
         if _gsheet_client is None:
@@ -88,7 +92,14 @@ def get_gsheet():
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
             ]
-            creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+            if has_env_json:
+                import json as _json
+                service_info = _json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+                creds = Credentials.from_service_account_info(service_info, scopes=scopes)
+                logger.info("[GSHEETS] Using credentials from GOOGLE_SERVICE_ACCOUNT_JSON env var")
+            else:
+                creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+                logger.info("[GSHEETS] Using credentials from service_account.json file")
             _gsheet_client = gspread.authorize(creds)
             logger.info("[GSHEETS] Google Sheets client authorized successfully")
         sheet = _gsheet_client.open_by_key(GOOGLE_SHEET_ID)
