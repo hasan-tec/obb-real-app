@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Items — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Items</h1>
+    <div class="status">
+        <span>{{ items | length }} items</span>
+    </div>
+</div>
+<div class="content">
+    {% if error %}
+    <div class="alert alert-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    <!-- Add Item Form -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>Add New Item</h3>
+        </div>
+        <div style="padding: 16px;">
+            <form method="POST" action="/items/add">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Name *</label>
+                        <input type="text" name="name" class="form-control" placeholder="Product name" required>
+                    </div>
+                    <div class="form-group">
+                        <label>SKU</label>
+                        <input type="text" name="sku" class="form-control" placeholder="e.g., OBB-AIRBLOOM">
+                    </div>
+                    <div class="form-group">
+                        <label>Category</label>
+                        <input type="text" name="category" class="form-control" placeholder="e.g., skincare, clothing">
+                    </div>
+                    <div class="form-group">
+                        <label>Unit Cost ($)</label>
+                        <input type="number" name="unit_cost" class="form-control" value="0" min="0" step="0.01">
+                    </div>
+                </div>
+                <label
+                    style="display:flex; align-items:center; gap:6px; cursor:pointer; margin-top:8px; font-size:13px;">
+                    <input type="checkbox" name="is_therabox" value="true">
+                    TheraBox item (partner warehouse)
+                </label>
+                <button type="submit" class="btn btn-primary" style="margin-top:12px;">Add Item</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Items Table -->
+    <div class="card">
+        <div class="card-header">
+            <h3>All Items</h3>
+        </div>
+        {% if items %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>SKU</th>
+                    <th>Category</th>
+                    <th>Cost</th>
+                    <th>Source</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for i in items %}
+                <tr>
+                    <td>{{ i.name }}</td>
+                    <td style="font-family: monospace; font-size: 12px;">{{ i.sku or '—' }}</td>
+                    <td>{{ i.category or '—' }}</td>
+                    <td>{% if i.unit_cost %}${{ "%.2f" | format(i.unit_cost) }}{% else %}—{% endif %}</td>
+                    <td>
+                        {% if i.is_therabox %}
+                        <span class="badge badge-yellow">TheraBox</span>
+                        {% else %}
+                        <span class="badge badge-dim">OBB</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+            <div class="icon">🏷️</div>
+            <p>No items yet. Add items using the form above.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

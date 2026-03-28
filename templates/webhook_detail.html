@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Webhook Detail — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Webhook Detail</h1>
+    <div class="status">
+        <a href="/webhooks" class="btn btn-sm btn-secondary">← Back to Webhooks</a>
+    </div>
+</div>
+<div class="content">
+    {% if webhook %}
+    <div class="stat-grid">
+        <div class="stat-card">
+            <div class="label">Source</div>
+            <div class="value" style="font-size:18px;">
+                {% if webhook.source == 'shopify' %}
+                <span class="badge badge-green">Shopify</span>
+                {% else %}
+                <span class="badge badge-blue">Cratejoy</span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Event Type</div>
+            <div class="value" style="font-size:18px;">{{ webhook.event_type }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Status</div>
+            <div class="value" style="font-size:18px;">
+                {% if webhook.status == 'processed' %}
+                <span class="badge badge-green">{{ webhook.status }}</span>
+                {% elif webhook.status == 'failed' %}
+                <span class="badge badge-red">{{ webhook.status }}</span>
+                {% else %}
+                <span class="badge badge-dim">{{ webhook.status }}</span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Processing Time</div>
+            <div class="value" style="font-size:18px;">{{ webhook.processing_time_ms or '—' }} ms</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h3>Headers</h3>
+        </div>
+        <div style="padding: 16px;">
+            <div class="json-block">{{ webhook.headers | tojson(indent=2) }}</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h3>Payload</h3>
+        </div>
+        <div style="padding: 16px;">
+            <div class="json-block">{{ webhook.payload | tojson(indent=2) }}</div>
+        </div>
+    </div>
+
+    {% if webhook.error_message %}
+    <div class="card">
+        <div class="card-header">
+            <h3>Error</h3>
+        </div>
+        <div style="padding: 16px;">
+            <div class="alert alert-error">{{ webhook.error_message }}</div>
+        </div>
+    </div>
+    {% endif %}
+
+    <div style="margin-top: 12px; font-size: 12px; color: var(--text-dim);">
+        <strong>ID:</strong> {{ webhook.id }}<br>
+        <strong>Event ID:</strong> {{ webhook.event_id or '—' }}<br>
+        <strong>Created:</strong> {{ webhook.created_at }}
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Dashboard</h1>
+    <div class="status">
+        <span><span class="dot green"></span> Supabase</span>
+        <span><span class="dot green"></span> Shopify</span>
+        <span><span class="dot {% if cratejoy_webhooks > 0 %}green{% else %}yellow{% endif %}"></span> Cratejoy</span>
+    </div>
+</div>
+<div class="content">
+    {% if error %}
+    <div class="alert alert-error">⚠️ Database error: {{ error }}</div>
+    {% endif %}
+
+    <div class="stat-grid">
+        <div class="stat-card">
+            <div class="label">Total Customers</div>
+            <div class="value">{{ total_customers }}</div>
+            <div class="sub">Shopify: {{ shopify_count }} · Cratejoy: {{ cratejoy_count }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Webhooks Received</div>
+            <div class="value">{{ total_webhooks }}</div>
+            <div class="sub">Shopify: {{ shopify_webhooks }} · Cratejoy: {{ cratejoy_webhooks }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Decisions</div>
+            <div class="value">{{ total_decisions }}</div>
+            <div class="sub">Pending: {{ pending_decisions }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Kits in Inventory</div>
+            <div class="value">{{ total_kits }}</div>
+            <div class="sub">Total units: {{ total_kit_units }}</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h3>Recent Activity</h3>
+            <a href="/activity" class="btn btn-sm btn-secondary">View All</a>
+        </div>
+        {% if recent_activity %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Type</th>
+                    <th>Summary</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for a in recent_activity %}
+                <tr>
+                    <td>{{ a.created_at[:19] | replace("T", " ") }}</td>
+                    <td><span class="badge badge-purple">{{ a.type }}</span></td>
+                    <td>{{ a.summary }}</td>
+                    <td>
+                        {% if a.result == 'success' %}
+                        <span class="badge badge-green">{{ a.result }}</span>
+                        {% elif a.result == 'error' %}
+                        <span class="badge badge-red">{{ a.result }}</span>
+                        {% elif a.result == 'warning' %}
+                        <span class="badge badge-yellow">{{ a.result }}</span>
+                        {% else %}
+                        <span class="badge badge-blue">{{ a.result }}</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+            <div class="icon">📋</div>
+            <p>No activity yet. Webhooks and actions will appear here.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

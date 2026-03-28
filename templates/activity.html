@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Activity Log — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Activity Log</h1>
+    <div class="status">
+        <span>{{ activities | length }} entries</span>
+    </div>
+</div>
+<div class="content">
+    {% if error %}
+    <div class="alert alert-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    <div class="card">
+        <div class="card-header">
+            <h3>All Activity</h3>
+        </div>
+        {% if activities %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Type</th>
+                    <th>Summary</th>
+                    <th>Detail</th>
+                    <th>Result</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for a in activities %}
+                <tr>
+                    <td style="white-space: nowrap;">{{ a.created_at[:19] | replace("T", " ") }}</td>
+                    <td><span class="badge badge-purple">{{ a.type }}</span></td>
+                    <td>{{ a.summary }}</td>
+                    <td
+                        style="max-width: 300px; font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis;">
+                        {{ a.detail or '—' }}</td>
+                    <td>
+                        {% if a.result == 'success' %}
+                        <span class="badge badge-green">{{ a.result }}</span>
+                        {% elif a.result == 'error' %}
+                        <span class="badge badge-red">{{ a.result }}</span>
+                        {% elif a.result == 'warning' %}
+                        <span class="badge badge-yellow">{{ a.result }}</span>
+                        {% else %}
+                        <span class="badge badge-blue">{{ a.result }}</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+            <div class="icon">📋</div>
+            <p>No activity recorded yet.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

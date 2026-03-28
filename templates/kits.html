@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}Kits — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Kits Inventory</h1>
+    <div class="status">
+        <span>{{ kits | length }} kits</span>
+    </div>
+</div>
+<div class="content">
+    {% if error %}
+    <div class="alert alert-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    <!-- Add Kit Form -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>Add New Kit</h3>
+        </div>
+        <div style="padding: 16px;">
+            <form method="POST" action="/kits/add">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>SKU *</label>
+                        <input type="text" name="sku" class="form-control" placeholder="e.g., CK21" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Name</label>
+                        <input type="text" name="name" class="form-control" placeholder="Kit name">
+                    </div>
+                    <div class="form-group">
+                        <label>Trimester *</label>
+                        <select name="trimester" class="form-control" required>
+                            <option value="1">T1 — Early Pregnancy</option>
+                            <option value="2">T2 — Mid Pregnancy</option>
+                            <option value="3">T3 — Late Pregnancy</option>
+                            <option value="4">T4 — Postpartum</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Size Variant</label>
+                        <select name="size_variant" class="form-control">
+                            <option value="1">1 — Universal</option>
+                            <option value="2">2 — M</option>
+                            <option value="3">3 — L</option>
+                            <option value="4">4 — XL</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Quantity</label>
+                        <input type="number" name="quantity_available" class="form-control" value="0" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label>Age Rank (FIFO)</label>
+                        <input type="number" name="age_rank" class="form-control" value="0" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label>Cost per Kit ($)</label>
+                        <input type="number" name="cost_per_kit" class="form-control" value="0" min="0" step="0.01">
+                    </div>
+                    <div class="form-group" style="display:flex; align-items:end;">
+                        <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+                            <input type="checkbox" name="is_welcome_kit" value="true">
+                            Welcome Kit
+                        </label>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary" style="margin-top:8px;">Add Kit</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Kits Table -->
+    <div class="card">
+        <div class="card-header">
+            <h3>All Kits</h3>
+        </div>
+        {% if kits %}
+        <table>
+            <thead>
+                <tr>
+                    <th>SKU</th>
+                    <th>Name</th>
+                    <th>Trimester</th>
+                    <th>Size</th>
+                    <th>Type</th>
+                    <th>Items</th>
+                    <th>Quantity</th>
+                    <th>Age Rank</th>
+                    <th>Cost</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for k in kits %}
+                <tr>
+                    <td style="font-weight: 600; font-family: monospace;">
+                        <a href="/kits/{{ k.id }}" style="color: var(--accent);">{{ k.sku }}</a>
+                    </td>
+                    <td>{{ k.name or '—' }}</td>
+                    <td><span class="badge badge-purple">T{{ k.trimester }}</span></td>
+                    <td>
+                        {% if k.size_variant == 1 %}Universal
+                        {% elif k.size_variant == 2 %}M
+                        {% elif k.size_variant == 3 %}L
+                        {% elif k.size_variant == 4 %}XL
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if k.is_welcome_kit %}
+                        <span class="badge badge-blue">Welcome</span>
+                        {% else %}
+                        <span class="badge badge-dim">Regular</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% set count = kit_item_counts.get(k.id, 0) %}
+                        {% if count > 0 %}
+                        <a href="/kits/{{ k.id }}" style="color: var(--accent);">{{ count }} item{{ 's' if count != 1
+                            }}</a>
+                        {% else %}
+                        <span style="color: var(--text-dim);">0</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if k.quantity_available <= 10 %} <span style="color: var(--red); font-weight: 600;">{{
+                            k.quantity_available }}</span>
+                            {% elif k.quantity_available <= 50 %} <span style="color: var(--yellow);">{{
+                                k.quantity_available }}</span>
+                                {% else %}
+                                {{ k.quantity_available }}
+                                {% endif %}
+                    </td>
+                    <td>{{ k.age_rank }}</td>
+                    <td>{% if k.cost_per_kit %}${{ "%.2f" | format(k.cost_per_kit) }}{% else %}—{% endif %}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+            <div class="icon">📦</div>
+            <p>No kits yet. Add kits using the form above.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

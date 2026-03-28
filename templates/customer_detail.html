@@ -1,0 +1,272 @@
+{% extends "base.html" %}
+{% block title %}{{ customer.first_name or '' }} {{ customer.last_name or '' }} — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Customer Detail</h1>
+    <div class="status">
+        <a href="/customers" class="btn btn-sm btn-secondary">← Back</a>
+        <button class="btn btn-sm btn-primary" onclick="document.getElementById('editCustomerForm').style.display = document.getElementById('editCustomerForm').style.display === 'none' ? 'block' : 'none'">✏️ Edit</button>
+    </div>
+</div>
+<div class="content">
+    {% if customer %}
+
+    <!-- Edit Customer Form (hidden by default) -->
+    <div id="editCustomerForm" class="card" style="display: none; margin-bottom: 20px;">
+        <div class="card-header"><h3>Edit Customer</h3></div>
+        <div style="padding: 16px;">
+            <form method="POST" action="/customers/{{ customer.id }}/edit">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>First Name</label>
+                        <input type="text" name="first_name" class="form-control" value="{{ customer.first_name or '' }}">
+                    </div>
+                    <div class="form-group">
+                        <label>Last Name</label>
+                        <input type="text" name="last_name" class="form-control" value="{{ customer.last_name or '' }}">
+                    </div>
+                    <div class="form-group">
+                        <label>Due Date</label>
+                        <input type="date" name="due_date_str" class="form-control" value="{{ customer.due_date or '' }}">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Clothing Size</label>
+                        <select name="clothing_size" class="form-control">
+                            <option value="">— Not set —</option>
+                            <option value="S" {% if customer.clothing_size == 'S' %}selected{% endif %}>Small (S)</option>
+                            <option value="M" {% if customer.clothing_size == 'M' %}selected{% endif %}>Medium (M)</option>
+                            <option value="L" {% if customer.clothing_size == 'L' %}selected{% endif %}>Large (L)</option>
+                            <option value="XL" {% if customer.clothing_size == 'XL' %}selected{% endif %}>X-Large (XL)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Expecting</label>
+                        <select name="baby_gender" class="form-control">
+                            <option value="">— Not set —</option>
+                            <option value="girl" {% if customer.baby_gender == 'girl' %}selected{% endif %}>Girl</option>
+                            <option value="boy" {% if customer.baby_gender == 'boy' %}selected{% endif %}>Boy</option>
+                            <option value="unknown" {% if customer.baby_gender == 'unknown' %}selected{% endif %}>Unknown</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Platform</label>
+                        <select name="platform" class="form-control">
+                            <option value="shopify" {% if customer.platform == 'shopify' %}selected{% endif %}>Shopify</option>
+                            <option value="cratejoy" {% if customer.platform == 'cratejoy' %}selected{% endif %}>Cratejoy</option>
+                            <option value="both" {% if customer.platform == 'both' %}selected{% endif %}>Both</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Status</label>
+                        <select name="subscription_status" class="form-control">
+                            <option value="active" {% if customer.subscription_status == 'active' %}selected{% endif %}>Active</option>
+                            <option value="cancelled-prepaid" {% if customer.subscription_status == 'cancelled-prepaid' %}selected{% endif %}>Cancelled (Prepaid)</option>
+                            <option value="cancelled-expired" {% if customer.subscription_status == 'cancelled-expired' %}selected{% endif %}>Cancelled (Expired)</option>
+                            <option value="paused" {% if customer.subscription_status == 'paused' %}selected{% endif %}>Paused</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Daddy Item?</label>
+                        <select name="wants_daddy_item" class="form-control">
+                            <option value="" {% if not customer.wants_daddy_item %}selected{% endif %}>No</option>
+                            <option value="on" {% if customer.wants_daddy_item %}selected{% endif %}>Yes</option>
+                        </select>
+                    </div>
+                </div>
+                <div style="margin-top: 8px;">
+                    <button type="submit" class="btn btn-primary">✓ Save Changes</button>
+                    <button type="button" class="btn btn-secondary" onclick="document.getElementById('editCustomerForm').style.display='none'">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <div class="stat-grid">
+        <div class="stat-card">
+            <div class="label">Name</div>
+            <div class="value" style="font-size:18px;">{{ customer.first_name or '' }} {{ customer.last_name or '' }}
+            </div>
+            <div class="sub">{{ customer.email }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Platform</div>
+            <div class="value" style="font-size:18px;">
+                {% if customer.platform == 'shopify' %}
+                <span class="badge badge-green">Shopify</span>
+                {% elif customer.platform == 'cratejoy' %}
+                <span class="badge badge-blue">Cratejoy</span>
+                {% elif customer.platform == 'both' %}
+                <span class="badge badge-purple">Both</span>
+                {% endif %}
+            </div>
+            <div class="sub">
+                {% if customer.shopify_customer_id %}Shopify ID: {{ customer.shopify_customer_id }}{% endif %}
+                {% if customer.cratejoy_customer_id %}CJ ID: {{ customer.cratejoy_customer_id }}{% endif %}
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Trimester</div>
+            <div class="value" style="font-size:18px;">
+                {% if customer.trimester %}T{{ customer.trimester }}{% else %}—{% endif %}
+            </div>
+            <div class="sub">Due: {{ customer.due_date or 'Not set' }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Details</div>
+            <div class="value" style="font-size:14px;">
+                Size: {{ customer.clothing_size or '—' }}<br>
+                Gender: {{ customer.baby_gender or '—' }}<br>
+                Daddy: {{ '✓' if customer.wants_daddy_item else '✗' }}
+            </div>
+        </div>
+    </div>
+
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div class="card">
+            <div class="card-header">
+                <h3>Decisions ({{ decisions | length }})</h3>
+            </div>
+            {% if decisions %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Type</th>
+                        <th>Kit</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for d in decisions %}
+                    <tr>
+                        <td>{{ d.created_at[:10] }}</td>
+                        <td><span class="badge badge-purple">{{ d.decision_type }}</span></td>
+                        <td>{{ d.kit_sku or '—' }}</td>
+                        <td>
+                            {% if d.status == 'pending' %}<span class="badge badge-yellow">{{ d.status }}</span>
+                            {% elif d.status == 'approved' %}<span class="badge badge-green">{{ d.status }}</span>
+                            {% elif d.status == 'shipped' %}<span class="badge badge-blue">{{ d.status }}</span>
+                            {% else %}<span class="badge badge-dim">{{ d.status }}</span>{% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state" style="padding:30px;">
+                <p>No decisions yet</p>
+            </div>
+            {% endif %}
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h3>Shipment History ({{ shipments | length }})</h3>
+            </div>
+            {% if shipments %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Kit</th>
+                        <th>Trimester</th>
+                        <th>Platform</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in shipments %}
+                    <tr>
+                        <td>{{ s.ship_date or s.created_at[:10] }}</td>
+                        <td>{{ s.kit_sku or '—' }}</td>
+                        <td>{% if s.trimester_at_ship %}T{{ s.trimester_at_ship }}{% else %}—{% endif %}</td>
+                        <td>{{ s.platform or '—' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state" style="padding:30px;">
+                <p>No shipments yet</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+        <div class="card-header">
+            <h3>Add Shipment History</h3>
+        </div>
+        <div style="padding: 16px;">
+            <p style="font-size: 12px; color: var(--text-dim); margin-bottom: 12px;">
+                Enter past kits this customer received. This builds their history for duplicate-item checking.
+            </p>
+            <form method="POST" action="/customers/{{ customer.id }}/shipments/add">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Kit SKU *</label>
+                        <input type="text" name="kit_sku" class="form-control" required
+                            placeholder="e.g. WK21, CI33, CJ21" list="kit_sku_list">
+                        <datalist id="kit_sku_list">
+                            {% for k in kits %}
+                            <option value="{{ k.sku }}">{{ k.sku }} — T{{ k.trimester }}{% if k.is_welcome_kit %} (Welcome){% endif %}</option>
+                            {% endfor %}
+                        </datalist>
+                    </div>
+                    <div class="form-group">
+                        <label>Ship Date</label>
+                        <input type="date" name="ship_date_str" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label>Trimester at Ship</label>
+                        <select name="trimester_at_ship" class="form-control">
+                            <option value="0">— Unknown —</option>
+                            <option value="1">T1</option>
+                            <option value="2">T2</option>
+                            <option value="3">T3</option>
+                            <option value="4">T4 (Postpartum)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Platform</label>
+                        <select name="platform" class="form-control">
+                            <option value="shopify">Shopify</option>
+                            <option value="cratejoy">Cratejoy</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Order ID</label>
+                        <input type="text" name="order_id" class="form-control" placeholder="Optional">
+                    </div>
+                    <div class="form-group">
+                        <label>Notes</label>
+                        <input type="text" name="notes" class="form-control" placeholder="Optional — e.g. 'from V3 backup'">
+                    </div>
+                </div>
+                <div style="margin-top: 8px;">
+                    <button type="submit" class="btn btn-primary">+ Add Shipment</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+        <div class="card-header">
+            <h3>Address</h3>
+        </div>
+        <div style="padding: 16px; font-size: 13px; color: var(--text-dim);">
+            {{ customer.address_line1 or '' }}{% if customer.address_line2 %}, {{ customer.address_line2 }}{% endif
+            %}<br>
+            {{ customer.city or '' }}{% if customer.province %}, {{ customer.province }}{% endif %} {{ customer.zip or
+            '' }}<br>
+            {{ customer.country or '' }}
+            {% if customer.phone %}<br>📞 {{ customer.phone }}{% endif %}
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

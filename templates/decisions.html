@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Decisions — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Kit Decisions</h1>
+    <div class="status">
+        <span>{{ decisions | length }} decisions</span>
+    </div>
+</div>
+<div class="content">
+    {% if error %}
+    <div class="alert alert-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    <div class="card">
+        <div class="card-header">
+            <h3>All Decisions</h3>
+        </div>
+        {% if decisions %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Customer</th>
+                    <th>Platform</th>
+                    <th>Trimester</th>
+                    <th>Type</th>
+                    <th>Kit</th>
+                    <th>Status</th>
+                    <th>Reason</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for d in decisions %}
+                <tr>
+                    <td>{{ d.created_at[:10] }}</td>
+                    <td>
+                        {% if d.customers %}
+                        <a href="/customers/{{ d.customer_id }}">
+                            {{ d.customers.first_name or '' }} {{ d.customers.last_name or '' }}
+                            <br><small style="color: var(--text-dim);">{{ d.customers.email }}</small>
+                        </a>
+                        {% else %}
+                        {{ d.customer_id[:8] }}...
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if d.platform == 'shopify' %}
+                        <span class="badge badge-green">Shopify</span>
+                        {% elif d.platform == 'cratejoy' %}
+                        <span class="badge badge-blue">Cratejoy</span>
+                        {% else %}
+                        <span class="badge badge-dim">{{ d.platform or '—' }}</span>
+                        {% endif %}
+                    </td>
+                    <td>{% if d.trimester %}<span class="badge badge-purple">T{{ d.trimester }}</span>{% else %}—{%
+                        endif %}</td>
+                    <td>
+                        {% if d.decision_type == 'auto' %}
+                        <span class="badge badge-green">Auto</span>
+                        {% elif d.decision_type == 'needs-curation' %}
+                        <span class="badge badge-yellow">Needs Curation</span>
+                        {% elif d.decision_type == 'incomplete-data' %}
+                        <span class="badge badge-red">Incomplete</span>
+                        {% elif d.decision_type == 'manual-override' %}
+                        <span class="badge badge-blue">Override</span>
+                        {% endif %}
+                    </td>
+                    <td style="font-weight: 600;">{{ d.kit_sku or '—' }}</td>
+                    <td>
+                        {% if d.status == 'pending' %}<span class="badge badge-yellow">{{ d.status }}</span>
+                        {% elif d.status == 'approved' %}<span class="badge badge-green">{{ d.status }}</span>
+                        {% elif d.status == 'shipped' %}<span class="badge badge-blue">{{ d.status }}</span>
+                        {% else %}<span class="badge badge-dim">{{ d.status }}</span>{% endif %}
+                    </td>
+                    <td
+                        style="max-width: 250px; font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis;">
+                        {{ d.reason or '—' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+            <div class="icon">✅</div>
+            <p>No decisions yet. Process some webhooks first!</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

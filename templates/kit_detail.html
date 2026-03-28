@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}Kit {{ kit.sku }} — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>
+        <a href="/kits" style="color: var(--text-dim); font-size: 14px;">← Kits</a>
+        &nbsp; {{ kit.sku }} {% if kit.name %}— {{ kit.name }}{% endif %}
+    </h1>
+    <div class="status">
+        <span class="badge badge-purple">T{{ kit.trimester }}</span>
+        {% if kit.is_welcome_kit %}<span class="badge badge-blue">Welcome Kit</span>{% endif %}
+    </div>
+</div>
+<div class="content">
+    <!-- Kit Info -->
+    <div class="stat-grid">
+        <div class="stat-card">
+            <div class="label">SKU</div>
+            <div class="value" style="font-size:20px; font-family:monospace;">{{ kit.sku }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Trimester</div>
+            <div class="value" style="font-size:20px;">T{{ kit.trimester }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Size</div>
+            <div class="value" style="font-size:20px;">
+                {% if kit.size_variant == 1 %}Universal
+                {% elif kit.size_variant == 2 %}M
+                {% elif kit.size_variant == 3 %}L
+                {% elif kit.size_variant == 4 %}XL
+                {% endif %}
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Quantity</div>
+            <div class="value" style="font-size:20px;">{{ kit.quantity_available }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Age Rank (FIFO)</div>
+            <div class="value" style="font-size:20px;">{{ kit.age_rank }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Cost per Kit</div>
+            <div class="value" style="font-size:20px;">{% if kit.cost_per_kit %}${{ "%.2f" | format(kit.cost_per_kit)
+                }}{% else %}—{% endif %}</div>
+        </div>
+    </div>
+
+    <!-- Add Item to Kit -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>Add Item to This Kit</h3>
+        </div>
+        <div style="padding: 16px;">
+            {% if available_items %}
+            <form method="POST" action="/kits/{{ kit.id }}/items/add">
+                <div style="display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
+                    <div class="form-group" style="flex: 3; min-width: 250px; margin-bottom: 0;">
+                        <label>Select Item</label>
+                        <select name="item_id" class="form-control" required>
+                            <option value="">— Choose an item —</option>
+                            {% for item in available_items %}
+                            <option value="{{ item.id }}">{{ item.name }}{% if item.sku %} ({{ item.sku }}){% endif %}{%
+                                if item.is_therabox %} [TheraBox]{% endif %}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-group" style="flex: 0 0 80px; margin-bottom: 0;">
+                        <label>Qty</label>
+                        <input type="number" name="quantity" class="form-control" value="1" min="1">
+                    </div>
+                    <div style="flex: 0 0 auto; padding-bottom: 1px;">
+                        <button type="submit" class="btn btn-primary">+ Add Item</button>
+                    </div>
+                </div>
+            </form>
+            {% else %}
+            <p style="color: var(--text-dim); font-size: 13px;">
+                {% if kit_items %}All available items are already linked to this kit.{% else %}No items exist yet. <a
+                    href="/items">Add items first</a>.{% endif %}
+            </p>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Linked Items Table -->
+    <div class="card">
+        <div class="card-header">
+            <h3>Items in This Kit ({{ kit_items | length }})</h3>
+        </div>
+        {% if kit_items %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Item Name</th>
+                    <th>SKU</th>
+                    <th>Category</th>
+                    <th>Source</th>
+                    <th>Cost</th>
+                    <th>Qty in Kit</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for ki in kit_items %}
+                {% set item = ki.items %}
+                <tr>
+                    <td style="font-weight: 500;">{{ item.name if item else '—' }}</td>
+                    <td style="font-family: monospace; font-size: 12px;">{{ item.sku if item and item.sku else '—' }}
+                    </td>
+                    <td>{{ item.category if item and item.category else '—' }}</td>
+                    <td>
+                        {% if item and item.is_therabox %}
+                        <span class="badge badge-yellow">TheraBox</span>
+                        {% else %}
+                        <span class="badge badge-dim">OBB</span>
+                        {% endif %}
+                    </td>
+                    <td>{% if item and item.unit_cost %}${{ "%.2f" | format(item.unit_cost) }}{% else %}—{% endif %}
+                    </td>
+                    <td>{{ ki.quantity }}</td>
+                    <td>
+                        <form method="POST" action="/kits/{{ kit.id }}/items/{{ ki.item_id }}/remove"
+                            style="display:inline;">
+                            <button type="submit" class="btn btn-danger btn-sm"
+                                onclick="return confirm('Remove this item from the kit?')">✕ Remove</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+            <div class="icon">🏷️</div>
+            <p>No items linked to this kit yet. Use the form above to add items.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

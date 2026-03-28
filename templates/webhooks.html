@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Webhooks — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Webhook Logs</h1>
+    <div class="status">
+        <span>Last 50 webhooks</span>
+    </div>
+</div>
+<div class="content">
+    {% if error %}
+    <div class="alert alert-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    <div class="card">
+        <div class="card-header">
+            <h3>Received Webhooks</h3>
+        </div>
+        {% if webhooks %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Source</th>
+                    <th>Event</th>
+                    <th>Event ID</th>
+                    <th>Status</th>
+                    <th>Time (ms)</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for w in webhooks %}
+                <tr>
+                    <td>{{ w.created_at[:19] | replace("T", " ") }}</td>
+                    <td>
+                        {% if w.source == 'shopify' %}
+                        <span class="badge badge-green">Shopify</span>
+                        {% else %}
+                        <span class="badge badge-blue">Cratejoy</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ w.event_type }}</td>
+                    <td
+                        style="font-family: monospace; font-size: 11px; max-width: 200px; overflow: hidden; text-overflow: ellipsis;">
+                        {{ w.event_id or '—' }}</td>
+                    <td>
+                        {% if w.status == 'processed' %}
+                        <span class="badge badge-green">{{ w.status }}</span>
+                        {% elif w.status == 'failed' %}
+                        <span class="badge badge-red">{{ w.status }}</span>
+                        {% elif w.status == 'duplicate' %}
+                        <span class="badge badge-yellow">{{ w.status }}</span>
+                        {% else %}
+                        <span class="badge badge-dim">{{ w.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ w.processing_time_ms or '—' }}</td>
+                    <td><a href="/webhooks/{{ w.id }}" class="btn btn-sm btn-secondary">View</a></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+            <div class="icon">🔗</div>
+            <p>No webhooks received yet.</p>
+            <p style="margin-top:8px; font-size:12px;">Create an order in Shopify to trigger a webhook, or use the test
+                button in Settings.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
