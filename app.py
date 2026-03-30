@@ -121,7 +121,7 @@ def get_gsheet():
 
 
 def write_decision_to_sheet(decision_data: dict):
-    """Write a decision row to Google Sheets. Non-blocking — logs errors but doesn't raise."""
+    """Write a NEW decision row to Google Sheets. Non-blocking — logs errors but doesn't raise."""
     try:
         ws = get_gsheet()
         if ws is None:
@@ -148,6 +148,50 @@ def write_decision_to_sheet(decision_data: dict):
         logger.info(f"[GSHEETS] Wrote decision row for {decision_data.get('email', '?')} — due_date={decision_data.get('due_date', '')}, size={decision_data.get('clothing_size', '')}")
     except Exception as e:
         logger.error(f"[GSHEETS] Error writing to sheet: {e}", exc_info=True)
+
+
+def update_decision_status_in_sheet(email: str, order_id: str, new_status: str, reason_prefix: str = ""):
+    """
+    Update an EXISTING row in Google Sheets instead of appending a duplicate.
+    Finds the row by email (col D) + order_id (col J), then updates:
+      - Column F (order_type) → new_status
+      - Column H (decision_status) → new_status
+      - Column I (reason) → prepend prefix to existing reason
+    Falls back to logging a warning if the row is not found.
+    """
+    try:
+        ws = get_gsheet()
+        if ws is None:
+            logger.info("[GSHEETS] Skipping update — Google Sheets not configured")
+            return
+
+        # Find the row by email + order_id
+        all_values = ws.get_all_values()
+        target_row = None
+        for idx, row in enumerate(all_values):
+            if idx == 0:
+                continue  # skip header
+            # Col D = email (index 3), Col J = order_id (index 9)
+            row_email = (row[3] if len(row) > 3 else "").strip().lower()
+            row_order_id = (row[9] if len(row) > 9 else "").strip()
+            if row_email == email.strip().lower() and row_order_id == str(order_id or "").strip():
+                target_row = idx + 1  # gspread is 1-indexed
+                break
+
+        if target_row:
+            # Update status columns in-place: F (col 6), H (col 8), I (col 9)
+            ws.update_cell(target_row, 6, new_status)  # order_type
+            ws.update_cell(target_row, 8, new_status)  # decision_status
+            if reason_prefix:
+                existing_reason = all_values[target_row - 1][8] if len(all_values[target_row - 1]) > 8 else ""
+                # Don't double-prefix if already has it
+                if not existing_reason.startswith(f"[{reason_prefix}]"):
+                    ws.update_cell(target_row, 9, f"[{reason_prefix}] {existing_reason}")
+            logger.info(f"[GSHEETS] Updated row {target_row} for {email} → status={new_status}")
+        else:
+            logger.warning(f"[GSHEETS] Row not found for email={email}, order_id={order_id} — cannot update status to '{new_status}'")
+    except Exception as e:
+        logger.error(f"[GSHEETS] Error updating sheet row: {e}", exc_info=True)
 
 
 def fix_gsheet_headers():
@@ -1600,6 +1644,12 @@ async def activity_page(request: Request):
         })
 
 
+@app.get("/flow-diagram", response_class=HTMLResponse)
+async def flow_diagram(request: Request):
+    """Visual Mermaid.js diagram of the full application flow."""
+    return templates.TemplateResponse("flow_diagram.html", {"request": request})
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
     """Settings and integration status."""
@@ -2166,21 +2216,13 @@ async def approve_decision(request: Request, decision_id: str):
             cust_name = f"{d['customers'].get('first_name', '')} {d['customers'].get('last_name', '')}".strip()
         await log_activity("decision", f"Approved decision for {cust_email}", f"Kit: {d.get('kit_sku', '—')}", "success")
 
-        # Update Google Sheets with approval status
-        write_decision_to_sheet({
-            "date": date.today().isoformat(),
-            "customer_name": cust_name or cust_email,
-            "email": cust_email,
-            "platform": d.get("platform", ""),
-            "trimester": d.get("trimester", "?"),
-            "order_type": "approved",
-            "kit_sku": d.get("kit_sku", "—"),
-            "decision_type": "approved",
-            "reason": f"[Approved] {d.get('reason', '')}",
-            "order_id": d.get("order_id", ""),
-            "due_date": "",
-            "clothing_size": "",
-        })
+        # Update existing row in Google Sheets (don't create duplicate)
+        update_decision_status_in_sheet(
+            email=cust_email,
+            order_id=d.get("order_id", ""),
+            new_status="approved",
+            reason_prefix="Approved",
+        )
     except Exception as e:
         logger.error(f"[APPROVE] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to approve decision: {e}", "", "error")
@@ -2274,21 +2316,13 @@ async def ship_decision(request: Request, decision_id: str):
         await log_activity("shipment", f"Shipped {d.get('kit_sku', '—')} to {cust_email}",
                           f"Decision: {decision_id[:8]}, Shipment: {shipment_id[:8] if shipment_id else '?'}", "success")
 
-        # Update Google Sheets with shipped status
-        write_decision_to_sheet({
-            "date": date.today().isoformat(),
-            "customer_name": cust_name or cust_email,
-            "email": cust_email,
-            "platform": d.get("platform", ""),
-            "trimester": d.get("trimester", "?"),
-            "order_type": "shipped",
-            "kit_sku": d.get("kit_sku", "—"),
-            "decision_type": "shipped",
-            "reason": f"[Shipped] {d.get('reason', '')}",
-            "order_id": d.get("order_id", ""),
-            "due_date": "",
-            "clothing_size": "",
-        })
+        # Update existing row in Google Sheets (don't create duplicate)
+        update_decision_status_in_sheet(
+            email=cust_email,
+            order_id=d.get("order_id", ""),
+            new_status="shipped",
+            reason_prefix="Shipped",
+        )
     except Exception as e:
         logger.error(f"[SHIP] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to ship decision: {e}", "", "error")
