@@ -10,7 +10,8 @@
         <span class="badge badge-purple">T{{ kit.trimester }}</span>
         {% if kit.is_welcome_kit %}<span class="badge badge-blue">Welcome Kit</span>{% endif %}
         <button class="btn btn-sm btn-secondary"
-            onclick="document.getElementById('editKitForm').style.display = document.getElementById('editKitForm').style.display === 'none' ? 'block' : 'none'">✏️ Edit Kit</button>
+            onclick="document.getElementById('editKitForm').style.display = document.getElementById('editKitForm').style.display === 'none' ? 'block' : 'none'">✏️
+            Edit Kit</button>
     </div>
 </div>
 <div class="content">
@@ -24,7 +25,9 @@
 
     <!-- Edit Kit Form (hidden by default) -->
     <div id="editKitForm" class="card" style="display: none; margin-bottom: 20px;">
-        <div class="card-header"><h3>Edit Kit {{ kit.sku }}</h3></div>
+        <div class="card-header">
+            <h3>Edit Kit {{ kit.sku }}</h3>
+        </div>
         <div style="padding: 16px;">
             <form method="POST" action="/kits/{{ kit.id }}/edit">
                 <div class="form-row">
@@ -35,26 +38,27 @@
                     <div class="form-group">
                         <label>Trimester *</label>
                         <select name="trimester" class="form-control" required>
-                            <option value="1" {% if kit.trimester == 1 %}selected{% endif %}>T1</option>
-                            <option value="2" {% if kit.trimester == 2 %}selected{% endif %}>T2</option>
-                            <option value="3" {% if kit.trimester == 3 %}selected{% endif %}>T3</option>
-                            <option value="4" {% if kit.trimester == 4 %}selected{% endif %}>T4</option>
+                            <option value="1" {% if kit.trimester==1 %}selected{% endif %}>T1</option>
+                            <option value="2" {% if kit.trimester==2 %}selected{% endif %}>T2</option>
+                            <option value="3" {% if kit.trimester==3 %}selected{% endif %}>T3</option>
+                            <option value="4" {% if kit.trimester==4 %}selected{% endif %}>T4</option>
                         </select>
                     </div>
                     <div class="form-group">
                         <label>Size Variant</label>
                         <select name="size_variant" class="form-control">
-                            <option value="1" {% if kit.size_variant == 1 %}selected{% endif %}>Universal</option>
-                            <option value="2" {% if kit.size_variant == 2 %}selected{% endif %}>M</option>
-                            <option value="3" {% if kit.size_variant == 3 %}selected{% endif %}>L</option>
-                            <option value="4" {% if kit.size_variant == 4 %}selected{% endif %}>XL</option>
+                            <option value="1" {% if kit.size_variant==1 %}selected{% endif %}>Universal</option>
+                            <option value="2" {% if kit.size_variant==2 %}selected{% endif %}>M</option>
+                            <option value="3" {% if kit.size_variant==3 %}selected{% endif %}>L</option>
+                            <option value="4" {% if kit.size_variant==4 %}selected{% endif %}>XL</option>
                         </select>
                     </div>
                 </div>
                 <div class="form-row">
                     <div class="form-group">
                         <label>Quantity</label>
-                        <input type="number" name="quantity_available" class="form-control" value="{{ kit.quantity_available }}" min="0">
+                        <input type="number" name="quantity_available" class="form-control"
+                            value="{{ kit.quantity_available }}" min="0">
                     </div>
                     <div class="form-group">
                         <label>Age Rank (FIFO)</label>
@@ -62,18 +66,21 @@
                     </div>
                     <div class="form-group">
                         <label>Cost per Kit ($)</label>
-                        <input type="number" name="cost_per_kit" class="form-control" value="{{ kit.cost_per_kit or 0 }}" min="0" step="0.01">
+                        <input type="number" name="cost_per_kit" class="form-control"
+                            value="{{ kit.cost_per_kit or 0 }}" min="0" step="0.01">
                     </div>
                     <div class="form-group" style="display:flex; align-items:end;">
                         <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
-                            <input type="checkbox" name="is_welcome_kit" value="true" {% if kit.is_welcome_kit %}checked{% endif %}>
+                            <input type="checkbox" name="is_welcome_kit" value="true" {% if kit.is_welcome_kit
+                                %}checked{% endif %}>
                             Welcome Kit
                         </label>
                     </div>
                 </div>
                 <div style="margin-top: 8px;">
                     <button type="submit" class="btn btn-primary">✓ Save Changes</button>
-                    <button type="button" class="btn btn-secondary" onclick="document.getElementById('editKitForm').style.display='none'">Cancel</button>
+                    <button type="button" class="btn btn-secondary"
+                        onclick="document.getElementById('editKitForm').style.display='none'">Cancel</button>
                 </div>
             </form>
         </div>
@@ -163,7 +170,8 @@
                         <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;">
                             <div class="form-group" style="flex: 2; min-width: 180px; margin-bottom: 0;">
                                 <label>Item Name *</label>
-                                <input type="text" name="name" class="form-control" placeholder="e.g., WAY OF WILL Face Serum" required>
+                                <input type="text" name="name" class="form-control"
+                                    placeholder="e.g., WAY OF WILL Face Serum" required>
                             </div>
                             <div class="form-group" style="flex: 1; min-width: 120px; margin-bottom: 0;">
                                 <label>SKU</label>
@@ -175,14 +183,16 @@
                             </div>
                             <div class="form-group" style="flex: 0 0 80px; margin-bottom: 0;">
                                 <label>Cost ($)</label>
-                                <input type="number" name="unit_cost" class="form-control" value="0" min="0" step="0.01">
+                                <input type="number" name="unit_cost" class="form-control" value="0" min="0"
+                                    step="0.01">
                             </div>
                             <div class="form-group" style="flex: 0 0 60px; margin-bottom: 0;">
                                 <label>Qty</label>
                                 <input type="number" name="quantity" class="form-control" value="1" min="1">
                             </div>
                             <div style="flex: 0 0 auto; padding-bottom: 1px;">
-                                <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; margin-bottom: 6px;">
+                                <label
+                                    style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; margin-bottom: 6px;">
                                     <input type="checkbox" name="is_therabox" value="true"> TheraBox
                                 </label>
                                 <button type="submit" class="btn btn-primary btn-sm">Create & Add</button>

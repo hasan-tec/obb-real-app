@@ -1,20 +1,38 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OBB Curation Engine — Flow Diagram</title>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
         body {
             background: #0d1117;
             color: #e6edf3;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
             padding: 24px;
         }
-        h1 { text-align: center; margin-bottom: 8px; font-size: 1.8rem; }
-        .subtitle { text-align: center; color: #8b949e; margin-bottom: 24px; font-size: 0.95rem; }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 8px;
+            font-size: 1.8rem;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #8b949e;
+            margin-bottom: 24px;
+            font-size: 0.95rem;
+        }
+
         .diagram-section {
             background: #161b22;
             border: 1px solid #30363d;
@@ -22,6 +40,7 @@
             padding: 24px;
             margin-bottom: 32px;
         }
+
         .diagram-section h2 {
             color: #58a6ff;
             margin-bottom: 16px;
@@ -29,7 +48,11 @@
             border-bottom: 1px solid #30363d;
             padding-bottom: 8px;
         }
-        .mermaid { text-align: center; }
+
+        .mermaid {
+            text-align: center;
+        }
+
         .legend {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -39,6 +62,7 @@
             background: #0d1117;
             border-radius: 8px;
         }
+
         .legend-item {
             display: flex;
             align-items: center;
@@ -46,12 +70,14 @@
             font-size: 0.85rem;
             color: #8b949e;
         }
+
         .legend-color {
             width: 16px;
             height: 16px;
             border-radius: 4px;
             flex-shrink: 0;
         }
+
         .back-link {
             display: inline-block;
             color: #58a6ff;
@@ -59,9 +85,13 @@
             margin-bottom: 16px;
             font-size: 0.9rem;
         }
-        .back-link:hover { text-decoration: underline; }
+
+        .back-link:hover {
+            text-decoration: underline;
+        }
     </style>
 </head>
+
 <body>
     <a href="/" class="back-link">← Back to Dashboard</a>
     <h1>OBB Curation Engine — System Flow</h1>
@@ -71,89 +101,89 @@
     <div class="diagram-section">
         <h2>1. Order → Decision → Shipment Flow</h2>
         <div class="mermaid">
-flowchart TD
-    subgraph ENTRY["📥 Order Entry Points"]
-        SHOP_WH["🛍️ Shopify Webhook<br/><code>POST /webhooks/shopify/orders/create</code>"]
-        CJ_WH["📦 Cratejoy Webhook<br/><code>POST /webhooks/cratejoy/order</code>"]
-        MANUAL["✏️ Manual Add Customer<br/><code>POST /customers/add</code>"]
-        RECURATE["🔄 Re-curate<br/><code>POST /customers/:id/recurate</code>"]
-    end
+            flowchart TD
+            subgraph ENTRY["📥 Order Entry Points"]
+            SHOP_WH["🛍️ Shopify Webhook<br /><code>POST /webhooks/shopify/orders/create</code>"]
+            CJ_WH["📦 Cratejoy Webhook<br /><code>POST /webhooks/cratejoy/order</code>"]
+            MANUAL["✏️ Manual Add Customer<br /><code>POST /customers/add</code>"]
+            RECURATE["🔄 Re-curate<br /><code>POST /customers/:id/recurate</code>"]
+            end
 
-    subgraph VERIFY["🔐 Verification"]
-        HMAC["HMAC-SHA256 Verify"]
-        IDEMP["Idempotency Check<br/><code>webhook_logs.event_id</code>"]
-    end
+            subgraph VERIFY["🔐 Verification"]
+            HMAC["HMAC-SHA256 Verify"]
+            IDEMP["Idempotency Check<br /><code>webhook_logs.event_id</code>"]
+            end
 
-    subgraph PROCESS["⚙️ Processing Pipeline"]
-        QUIZ["Extract Quiz Data<br/>due_date, size, gender, daddy_item"]
-        TRIM["Calculate Trimester<br/>T1 → T2 → T3 → T4"]
-        UPSERT["Upsert Customer<br/>Match by email (case-insensitive)"]
-    end
+            subgraph PROCESS["⚙️ Processing Pipeline"]
+            QUIZ["Extract Quiz Data<br />due_date, size, gender, daddy_item"]
+            TRIM["Calculate Trimester<br />T1 → T2 → T3 → T4"]
+            UPSERT["Upsert Customer<br />Match by email (case-insensitive)"]
+            end
 
-    subgraph ENGINE["🧠 Decision Engine — assign_kit()"]
-        HISTORY["Get Customer History<br/>shipments → shipment_items"]
-        BLOCKED["Build Blocked Items<br/>received + alternatives"]
-        KITS["Query Available Kits<br/>trimester + stock > 0"]
-        SIZEF["Filter by Size Variant<br/>universal / M / L / XL"]
-        DUPCHECK["Check Duplicate Items<br/>kit_items ∩ blocked_items"]
-        FIFO["Sort by Age Rank — FIFO<br/>oldest inventory first"]
-        DECIDE{"Valid Kit Found?"}
-    end
+            subgraph ENGINE["🧠 Decision Engine — assign_kit()"]
+            HISTORY["Get Customer History<br />shipments → shipment_items"]
+            BLOCKED["Build Blocked Items<br />received + alternatives"]
+            KITS["Query Available Kits<br />trimester + stock > 0"]
+            SIZEF["Filter by Size Variant<br />universal / M / L / XL"]
+            DUPCHECK["Check Duplicate Items<br />kit_items ∩ blocked_items"]
+            FIFO["Sort by Age Rank — FIFO<br />oldest inventory first"]
+            DECIDE{"Valid Kit Found?"}
+            end
 
-    subgraph OUTPUTS["📤 Output"]
-        DECISION_AUTO["✅ Auto-Assigned<br/>status = pending"]
-        DECISION_NEEDS["⚠️ Needs Curation<br/>manual intervention"]
-        DECISION_INCOMPLETE["❌ Incomplete Data<br/>missing due_date / trimester"]
-    end
+            subgraph OUTPUTS["📤 Output"]
+            DECISION_AUTO["✅ Auto-Assigned<br />status = pending"]
+            DECISION_NEEDS["⚠️ Needs Curation<br />manual intervention"]
+            DECISION_INCOMPLETE["❌ Incomplete Data<br />missing due_date / trimester"]
+            end
 
-    subgraph ACTIONS["👤 Admin Actions"]
-        APPROVE["✓ Approve<br/>Stock decremented"]
-        REJECT["✗ Reject"]
-        SHIP["📦 Ship<br/>Creates shipment record"]
-    end
+            subgraph ACTIONS["👤 Admin Actions"]
+            APPROVE["✓ Approve<br />Stock decremented"]
+            REJECT["✗ Reject"]
+            SHIP["📦 Ship<br />Creates shipment record"]
+            end
 
-    subgraph SYNC["📊 External Sync"]
-        GSHEET["Google Sheets<br/>One row per decision<br/>Updated in-place on approve/ship"]
-        DB["Supabase DB<br/>decisions table"]
-        ACTIVITY["Activity Log"]
-    end
+            subgraph SYNC["📊 External Sync"]
+            GSHEET["Google Sheets<br />One row per decision<br />Updated in-place on approve/ship"]
+            DB["Supabase DB<br />decisions table"]
+            ACTIVITY["Activity Log"]
+            end
 
-    SHOP_WH --> HMAC --> IDEMP
-    CJ_WH --> IDEMP
-    IDEMP --> QUIZ --> TRIM --> UPSERT
-    MANUAL --> UPSERT
-    UPSERT --> HISTORY
-    RECURATE --> HISTORY
-    HISTORY --> BLOCKED --> KITS --> SIZEF --> DUPCHECK --> FIFO --> DECIDE
-    DECIDE -->|Yes| DECISION_AUTO
-    DECIDE -->|No kits match| DECISION_NEEDS
-    DECIDE -->|Missing data| DECISION_INCOMPLETE
+            SHOP_WH --> HMAC --> IDEMP
+            CJ_WH --> IDEMP
+            IDEMP --> QUIZ --> TRIM --> UPSERT
+            MANUAL --> UPSERT
+            UPSERT --> HISTORY
+            RECURATE --> HISTORY
+            HISTORY --> BLOCKED --> KITS --> SIZEF --> DUPCHECK --> FIFO --> DECIDE
+            DECIDE -->|Yes| DECISION_AUTO
+            DECIDE -->|No kits match| DECISION_NEEDS
+            DECIDE -->|Missing data| DECISION_INCOMPLETE
 
-    DECISION_AUTO --> DB
-    DECISION_NEEDS --> DB
-    DECISION_INCOMPLETE --> DB
-    DB --> GSHEET
-    DB --> ACTIVITY
+            DECISION_AUTO --> DB
+            DECISION_NEEDS --> DB
+            DECISION_INCOMPLETE --> DB
+            DB --> GSHEET
+            DB --> ACTIVITY
 
-    DECISION_AUTO --> APPROVE
-    DECISION_AUTO --> SHIP
-    APPROVE --> SHIP
-    DECISION_AUTO --> REJECT
-    SHIP --> |"Creates shipment +<br/>shipment_items"| DB
+            DECISION_AUTO --> APPROVE
+            DECISION_AUTO --> SHIP
+            APPROVE --> SHIP
+            DECISION_AUTO --> REJECT
+            SHIP --> |"Creates shipment +<br />shipment_items"| DB
 
-    style SHOP_WH fill:#238636,stroke:#2ea043,color:#fff
-    style CJ_WH fill:#1f6feb,stroke:#388bfd,color:#fff
-    style MANUAL fill:#8b5cf6,stroke:#a78bfa,color:#fff
-    style RECURATE fill:#d29922,stroke:#e3b341,color:#fff
-    style HMAC fill:#da3633,stroke:#f85149,color:#fff
-    style DECIDE fill:#d29922,stroke:#e3b341,color:#fff
-    style DECISION_AUTO fill:#238636,stroke:#2ea043,color:#fff
-    style DECISION_NEEDS fill:#d29922,stroke:#e3b341,color:#fff
-    style DECISION_INCOMPLETE fill:#da3633,stroke:#f85149,color:#fff
-    style GSHEET fill:#1f6feb,stroke:#388bfd,color:#fff
-    style APPROVE fill:#238636,stroke:#2ea043,color:#fff
-    style SHIP fill:#1f6feb,stroke:#388bfd,color:#fff
-    style REJECT fill:#da3633,stroke:#f85149,color:#fff
+            style SHOP_WH fill:#238636,stroke:#2ea043,color:#fff
+            style CJ_WH fill:#1f6feb,stroke:#388bfd,color:#fff
+            style MANUAL fill:#8b5cf6,stroke:#a78bfa,color:#fff
+            style RECURATE fill:#d29922,stroke:#e3b341,color:#fff
+            style HMAC fill:#da3633,stroke:#f85149,color:#fff
+            style DECIDE fill:#d29922,stroke:#e3b341,color:#fff
+            style DECISION_AUTO fill:#238636,stroke:#2ea043,color:#fff
+            style DECISION_NEEDS fill:#d29922,stroke:#e3b341,color:#fff
+            style DECISION_INCOMPLETE fill:#da3633,stroke:#f85149,color:#fff
+            style GSHEET fill:#1f6feb,stroke:#388bfd,color:#fff
+            style APPROVE fill:#238636,stroke:#2ea043,color:#fff
+            style SHIP fill:#1f6feb,stroke:#388bfd,color:#fff
+            style REJECT fill:#da3633,stroke:#f85149,color:#fff
         </div>
     </div>
 
@@ -161,118 +191,118 @@ flowchart TD
     <div class="diagram-section">
         <h2>2. Database Schema (10 Tables)</h2>
         <div class="mermaid">
-erDiagram
-    customers ||--o{ decisions : "has"
-    customers ||--o{ shipments : "has"
-    kits ||--o{ kit_items : "contains"
-    kits ||--o{ decisions : "assigned in"
-    kits ||--o{ shipments : "shipped as"
-    items ||--o{ kit_items : "belongs to"
-    items ||--o{ shipment_items : "shipped in"
-    items ||--o{ item_alternatives : "has alt"
-    shipments ||--o{ shipment_items : "contains"
+            erDiagram
+            customers ||--o{ decisions : "has"
+            customers ||--o{ shipments : "has"
+            kits ||--o{ kit_items : "contains"
+            kits ||--o{ decisions : "assigned in"
+            kits ||--o{ shipments : "shipped as"
+            items ||--o{ kit_items : "belongs to"
+            items ||--o{ shipment_items : "shipped in"
+            items ||--o{ item_alternatives : "has alt"
+            shipments ||--o{ shipment_items : "contains"
 
-    customers {
-        uuid id PK
-        string email UK
-        string first_name
-        string last_name
-        date due_date
-        int trimester
-        string clothing_size
-        string baby_gender
-        bool wants_daddy_item
-        string platform
-        string subscription_status
-        int prepaid_months_remaining
-        string shopify_customer_id
-        string cratejoy_customer_id
-    }
+            customers {
+            uuid id PK
+            string email UK
+            string first_name
+            string last_name
+            date due_date
+            int trimester
+            string clothing_size
+            string baby_gender
+            bool wants_daddy_item
+            string platform
+            string subscription_status
+            int prepaid_months_remaining
+            string shopify_customer_id
+            string cratejoy_customer_id
+            }
 
-    kits {
-        uuid id PK
-        string sku UK
-        string name
-        int trimester
-        int size_variant
-        bool is_welcome_kit
-        int quantity_available
-        int age_rank
-        float cost_per_kit
-    }
+            kits {
+            uuid id PK
+            string sku UK
+            string name
+            int trimester
+            int size_variant
+            bool is_welcome_kit
+            int quantity_available
+            int age_rank
+            float cost_per_kit
+            }
 
-    items {
-        uuid id PK
-        string name
-        string sku
-        string category
-        float unit_cost
-        bool is_therabox
-        string veracore_sku
-    }
+            items {
+            uuid id PK
+            string name
+            string sku
+            string category
+            float unit_cost
+            bool is_therabox
+            string veracore_sku
+            }
 
-    kit_items {
-        uuid id PK
-        uuid kit_id FK
-        uuid item_id FK
-        int quantity
-    }
+            kit_items {
+            uuid id PK
+            uuid kit_id FK
+            uuid item_id FK
+            int quantity
+            }
 
-    decisions {
-        uuid id PK
-        uuid customer_id FK
-        uuid kit_id FK
-        string kit_sku
-        string decision_type
-        string status
-        string reason
-        int trimester
-        date ship_date
-        string platform
-        string order_id
-    }
+            decisions {
+            uuid id PK
+            uuid customer_id FK
+            uuid kit_id FK
+            string kit_sku
+            string decision_type
+            string status
+            string reason
+            int trimester
+            date ship_date
+            string platform
+            string order_id
+            }
 
-    shipments {
-        uuid id PK
-        uuid customer_id FK
-        uuid kit_id FK
-        string kit_sku
-        date ship_date
-        int trimester_at_ship
-        string platform
-        string order_id
-    }
+            shipments {
+            uuid id PK
+            uuid customer_id FK
+            uuid kit_id FK
+            string kit_sku
+            date ship_date
+            int trimester_at_ship
+            string platform
+            string order_id
+            }
 
-    shipment_items {
-        uuid id PK
-        uuid shipment_id FK
-        uuid item_id FK
-    }
+            shipment_items {
+            uuid id PK
+            uuid shipment_id FK
+            uuid item_id FK
+            }
 
-    item_alternatives {
-        uuid id PK
-        uuid item_id FK
-        uuid alternative_item_id FK
-    }
+            item_alternatives {
+            uuid id PK
+            uuid item_id FK
+            uuid alternative_item_id FK
+            }
 
-    webhook_logs {
-        uuid id PK
-        string source
-        string event_type
-        string event_id UK
-        jsonb payload
-        string status
-        float processing_time_ms
-    }
+            webhook_logs {
+            uuid id PK
+            string source
+            string event_type
+            string event_id UK
+            jsonb payload
+            string status
+            float processing_time_ms
+            }
 
-    activity_log {
-        uuid id PK
-        string type
-        string summary
-        string detail
-        string result
-        timestamp created_at
-    }
+            activity_log {
+            uuid id PK
+            string type
+            string summary
+            string detail
+            string result
+            timestamp created_at
+            }
         </div>
     </div>
 
@@ -280,32 +310,32 @@ erDiagram
     <div class="diagram-section">
         <h2>3. Decision Status State Machine</h2>
         <div class="mermaid">
-stateDiagram-v2
-    [*] --> pending: Webhook / Re-curate creates decision
+            stateDiagram-v2
+            [*] --> pending: Webhook / Re-curate creates decision
 
-    pending --> approved: ✓ Approve (stock -1)
-    pending --> rejected: ✗ Reject
-    pending --> shipped: 📦 Direct Ship (stock -1)
+            pending --> approved: ✓ Approve (stock -1)
+            pending --> rejected: ✗ Reject
+            pending --> shipped: 📦 Direct Ship (stock -1)
 
-    approved --> shipped: 📦 Ship (creates shipment)
+            approved --> shipped: 📦 Ship (creates shipment)
 
-    shipped --> [*]: Terminal
-    rejected --> [*]: Terminal
+            shipped --> [*]: Terminal
+            rejected --> [*]: Terminal
 
-    note right of pending
-        Initial state for all decisions.
-        GSheet row created here.
-    end note
+            note right of pending
+            Initial state for all decisions.
+            GSheet row created here.
+            end note
 
-    note right of approved
-        Stock decremented.
-        GSheet row UPDATED (not duplicated).
-    end note
+            note right of approved
+            Stock decremented.
+            GSheet row UPDATED (not duplicated).
+            end note
 
-    note right of shipped
-        Shipment + shipment_items created.
-        GSheet row UPDATED (not duplicated).
-    end note
+            note right of shipped
+            Shipment + shipment_items created.
+            GSheet row UPDATED (not duplicated).
+            end note
         </div>
     </div>
 
@@ -313,57 +343,57 @@ stateDiagram-v2
     <div class="diagram-section">
         <h2>4. Customer Journey</h2>
         <div class="mermaid">
-flowchart LR
-    subgraph PLATFORMS["Order Platforms"]
-        S["🛍️ Shopify"]
-        C["📦 Cratejoy"]
-        R["🔄 Recharge<br/>($0 prepaid renewals)"]
-    end
+            flowchart LR
+            subgraph PLATFORMS["Order Platforms"]
+            S["🛍️ Shopify"]
+            C["📦 Cratejoy"]
+            R["🔄 Recharge<br />($0 prepaid renewals)"]
+            end
 
-    subgraph CURATION["Monthly Curation (1st of month)"]
-        NEW{"New or<br/>Renewal?"}
-        WK["Welcome Kit Pool<br/>WK, WKA..WKH"]
-        RK["Regular Kit Pool<br/>A-Z, AA-CI, CJ+"]
-        T["Trimester Filter<br/>T1 / T2 / T3 / T4"]
-        SIZE["Size Filter<br/>Universal / M / L / XL"]
-        DUP["Duplicate Check<br/>vs all past items"]
-        AGE["FIFO Sort<br/>Oldest kit first"]
-    end
+            subgraph CURATION["Monthly Curation (1st of month)"]
+            NEW{"New or<br />Renewal?"}
+            WK["Welcome Kit Pool<br />WK, WKA..WKH"]
+            RK["Regular Kit Pool<br />A-Z, AA-CI, CJ+"]
+            T["Trimester Filter<br />T1 / T2 / T3 / T4"]
+            SIZE["Size Filter<br />Universal / M / L / XL"]
+            DUP["Duplicate Check<br />vs all past items"]
+            AGE["FIFO Sort<br />Oldest kit first"]
+            end
 
-    subgraph APPROVAL["Admin Review"]
-        PEND["📋 Pending"]
-        APP["✅ Approved"]
-        SHP["📦 Shipped"]
-    end
+            subgraph APPROVAL["Admin Review"]
+            PEND["📋 Pending"]
+            APP["✅ Approved"]
+            SHP["📦 Shipped"]
+            end
 
-    subgraph OUTPUT["Outputs"]
-        GS["📊 Google Sheet<br/>(Ting reviews)"]
-        SH["📋 Shipment Record<br/>(history for dupe check)"]
-        AL["📝 Activity Log"]
-    end
+            subgraph OUTPUT["Outputs"]
+            GS["📊 Google Sheet<br />(Ting reviews)"]
+            SH["📋 Shipment Record<br />(history for dupe check)"]
+            AL["📝 Activity Log"]
+            end
 
-    S --> NEW
-    C --> NEW
-    R --> NEW
-    NEW -->|"First order"| WK
-    NEW -->|"Has history"| RK
-    WK --> T --> SIZE --> DUP --> AGE
-    RK --> T
-    AGE --> PEND
-    PEND --> APP --> SHP
-    PEND -->|"Direct ship"| SHP
-    SHP --> GS
-    SHP --> SH
-    SHP --> AL
-    PEND --> GS
+            S --> NEW
+            C --> NEW
+            R --> NEW
+            NEW -->|"First order"| WK
+            NEW -->|"Has history"| RK
+            WK --> T --> SIZE --> DUP --> AGE
+            RK --> T
+            AGE --> PEND
+            PEND --> APP --> SHP
+            PEND -->|"Direct ship"| SHP
+            SHP --> GS
+            SHP --> SH
+            SHP --> AL
+            PEND --> GS
 
-    style S fill:#238636,stroke:#2ea043,color:#fff
-    style C fill:#1f6feb,stroke:#388bfd,color:#fff
-    style R fill:#d29922,stroke:#e3b341,color:#fff
-    style PEND fill:#d29922,stroke:#e3b341,color:#fff
-    style APP fill:#238636,stroke:#2ea043,color:#fff
-    style SHP fill:#1f6feb,stroke:#388bfd,color:#fff
-    style GS fill:#238636,stroke:#2ea043,color:#fff
+            style S fill:#238636,stroke:#2ea043,color:#fff
+            style C fill:#1f6feb,stroke:#388bfd,color:#fff
+            style R fill:#d29922,stroke:#e3b341,color:#fff
+            style PEND fill:#d29922,stroke:#e3b341,color:#fff
+            style APP fill:#238636,stroke:#2ea043,color:#fff
+            style SHP fill:#1f6feb,stroke:#388bfd,color:#fff
+            style GS fill:#238636,stroke:#2ea043,color:#fff
         </div>
     </div>
 
@@ -371,28 +401,38 @@ flowchart LR
     <div class="diagram-section">
         <h2>5. Trimester Calculation Logic</h2>
         <div class="mermaid">
-flowchart LR
-    DD["Due Date"] --> CHECK{"Compare to<br/>ship_date"}
+            flowchart LR
+            DD["Due Date"] --> CHECK{"Compare to<br />ship_date"}
 
-    CHECK -->|"due ≤ ship + 19 days"| T4["T4 — Postpartum 👶"]
-    CHECK -->|"due ≤ T4 + 13 weeks"| T3["T3 — Third Trimester"]
-    CHECK -->|"due ≤ T3 + 14 weeks"| T2["T2 — Second Trimester"]
-    CHECK -->|"beyond T2 boundary"| T1["T1 — First Trimester"]
+            CHECK -->|"due ≤ ship + 19 days"| T4["T4 — Postpartum 👶"]
+            CHECK -->|"due ≤ T4 + 13 weeks"| T3["T3 — Third Trimester"]
+            CHECK -->|"due ≤ T3 + 14 weeks"| T2["T2 — Second Trimester"]
+            CHECK -->|"beyond T2 boundary"| T1["T1 — First Trimester"]
 
-    style T4 fill:#da3633,stroke:#f85149,color:#fff
-    style T3 fill:#d29922,stroke:#e3b341,color:#fff
-    style T2 fill:#1f6feb,stroke:#388bfd,color:#fff
-    style T1 fill:#238636,stroke:#2ea043,color:#fff
-    style CHECK fill:#8b5cf6,stroke:#a78bfa,color:#fff
+            style T4 fill:#da3633,stroke:#f85149,color:#fff
+            style T3 fill:#d29922,stroke:#e3b341,color:#fff
+            style T2 fill:#1f6feb,stroke:#388bfd,color:#fff
+            style T1 fill:#238636,stroke:#2ea043,color:#fff
+            style CHECK fill:#8b5cf6,stroke:#a78bfa,color:#fff
         </div>
     </div>
 
     <div class="legend">
-        <div class="legend-item"><div class="legend-color" style="background:#238636"></div> Shopify / Success / Auto</div>
-        <div class="legend-item"><div class="legend-color" style="background:#1f6feb"></div> Cratejoy / Ship / External</div>
-        <div class="legend-item"><div class="legend-color" style="background:#d29922"></div> Pending / Warning / Recharge</div>
-        <div class="legend-item"><div class="legend-color" style="background:#da3633"></div> Error / Rejected / Verification</div>
-        <div class="legend-item"><div class="legend-color" style="background:#8b5cf6"></div> Manual / Admin Actions</div>
+        <div class="legend-item">
+            <div class="legend-color" style="background:#238636"></div> Shopify / Success / Auto
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background:#1f6feb"></div> Cratejoy / Ship / External
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background:#d29922"></div> Pending / Warning / Recharge
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background:#da3633"></div> Error / Rejected / Verification
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background:#8b5cf6"></div> Manual / Admin Actions
+        </div>
     </div>
 
     <script>
@@ -417,4 +457,5 @@ flowchart LR
         });
     </script>
 </body>
+
 </html>

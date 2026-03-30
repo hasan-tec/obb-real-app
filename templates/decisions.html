@@ -79,23 +79,26 @@
                         {{ d.reason or '—' }}</td>
                     <td style="white-space: nowrap;">
                         {% if d.status == 'pending' %}
-                            {% if d.kit_sku %}
-                            <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-primary" title="Approve and decrement stock">✓</button>
-                            </form>
-                            <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-secondary" title="Approve + Mark Shipped" onclick="return confirm('Approve and mark as shipped?')">📦</button>
-                            </form>
-                            {% endif %}
-                            <form method="POST" action="/decisions/{{ d.id }}/reject" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-danger" title="Reject" onclick="return confirm('Reject this decision?')">✕</button>
-                            </form>
+                        {% if d.kit_sku %}
+                        <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-primary"
+                                title="Approve and decrement stock">✓</button>
+                        </form>
+                        <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-secondary" title="Approve + Mark Shipped"
+                                onclick="return confirm('Approve and mark as shipped?')">📦</button>
+                        </form>
+                        {% endif %}
+                        <form method="POST" action="/decisions/{{ d.id }}/reject" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-danger" title="Reject"
+                                onclick="return confirm('Reject this decision?')">✕</button>
+                        </form>
                         {% elif d.status == 'approved' %}
-                            <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-secondary" title="Mark Shipped">📦 Ship</button>
-                            </form>
+                        <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-secondary" title="Mark Shipped">📦 Ship</button>
+                        </form>
                         {% else %}
-                            <span style="color: var(--text-dim); font-size: 11px;">—</span>
+                        <span style="color: var(--text-dim); font-size: 11px;">—</span>
                         {% endif %}
                     </td>
                 </tr>
