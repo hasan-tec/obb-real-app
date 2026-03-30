@@ -107,10 +107,11 @@ def get_gsheet():
             worksheet = sheet.worksheet(GOOGLE_SHEET_NAME)
         except gspread.WorksheetNotFound:
             worksheet = sheet.add_worksheet(title=GOOGLE_SHEET_NAME, rows=1000, cols=12)
-            # Add header row
-            worksheet.update('A1:K1', [[
-                "Date", "Customer Name", "Email", "Platform", "Trimester",
-                "Order Type", "Assigned Kit", "Decision Type", "Reason", "Status", "Order ID"
+            # Add header row — matches the columns Ting expects
+            worksheet.update('A1:L1', [[
+                "received_at", "platform", "customer_name", "email",
+                "trimester", "order_type", "assigned_kit", "decision_status",
+                "reason", "external_order_id", "due_date", "clothing_size"
             ]])
             logger.info(f"[GSHEETS] Created worksheet '{GOOGLE_SHEET_NAME}' with headers")
         return worksheet
@@ -126,23 +127,46 @@ def write_decision_to_sheet(decision_data: dict):
         if ws is None:
             logger.info("[GSHEETS] Skipping write — Google Sheets not configured")
             return
+        # Column order: received_at, platform, customer_name, email, trimester,
+        #               order_type, assigned_kit, decision_status, reason,
+        #               external_order_id, due_date, clothing_size
         row = [
             decision_data.get("date", date.today().isoformat()),
+            decision_data.get("platform", ""),
             decision_data.get("customer_name", ""),
             decision_data.get("email", ""),
-            decision_data.get("platform", ""),
             f"T{decision_data.get('trimester', '?')}",
             decision_data.get("order_type", "renewal"),
             decision_data.get("kit_sku", "—"),
             decision_data.get("decision_type", ""),
             decision_data.get("reason", ""),
-            decision_data.get("status", "pending"),
             decision_data.get("order_id", ""),
+            decision_data.get("due_date", ""),
+            decision_data.get("clothing_size", ""),
         ]
         ws.append_row(row, value_input_option="USER_ENTERED")
-        logger.info(f"[GSHEETS] Wrote decision row for {decision_data.get('email', '?')}")
+        logger.info(f"[GSHEETS] Wrote decision row for {decision_data.get('email', '?')} — due_date={decision_data.get('due_date', '')}, size={decision_data.get('clothing_size', '')}")
     except Exception as e:
         logger.error(f"[GSHEETS] Error writing to sheet: {e}", exc_info=True)
+
+
+def fix_gsheet_headers():
+    """Update the Google Sheet header row to match our current column format."""
+    try:
+        ws = get_gsheet()
+        if ws is None:
+            return False
+        headers = [
+            "received_at", "platform", "customer_name", "email",
+            "trimester", "order_type", "assigned_kit", "decision_status",
+            "reason", "external_order_id", "due_date", "clothing_size"
+        ]
+        ws.update('A1:L1', [headers], value_input_option="USER_ENTERED")
+        logger.info("[GSHEETS] ✅ Updated header row to new format")
+        return True
+    except Exception as e:
+        logger.error(f"[GSHEETS] Error fixing headers: {e}", exc_info=True)
+        return False
 
 
 # ─── FastAPI app ───
@@ -665,8 +689,9 @@ async def shopify_order_webhook(request: Request):
                     "kit_sku": kit_decision.get("kit_sku", "—"),
                     "decision_type": kit_decision["decision_type"],
                     "reason": kit_decision["reason"],
-                    "status": "pending",
                     "order_id": str(shopify_order_id),
+                    "due_date": due_date.isoformat() if due_date else "",
+                    "clothing_size": clothing_size or "",
                 })
 
         # ─── Update webhook log status ───
@@ -874,6 +899,15 @@ async def cratejoy_order_webhook(request: Request):
                 logger.info(f"[CRATEJOY WEBHOOK] Saved decision: {kit_decision['decision_type']}, kit: {kit_decision.get('kit_sku', 'none')}")
 
                 # ─── Write to Google Sheets ───
+                # Cratejoy don't always have due_date/clothing_size — pass what we have
+                cj_due_str = due_date.isoformat() if due_date else ""
+                cj_size_str = ""
+                if cust_id:
+                    try:
+                        cust_detail = db.table("customers").select("clothing_size").eq("id", cust_id).single().execute()
+                        cj_size_str = cust_detail.data.get("clothing_size", "") or "" if cust_detail.data else ""
+                    except Exception:
+                        pass
                 write_decision_to_sheet({
                     "date": date.today().isoformat(),
                     "customer_name": f"{first_name or ''} {last_name or ''}".strip(),
@@ -884,8 +918,9 @@ async def cratejoy_order_webhook(request: Request):
                     "kit_sku": kit_decision.get("kit_sku", "—"),
                     "decision_type": kit_decision["decision_type"],
                     "reason": kit_decision["reason"],
-                    "status": "pending",
                     "order_id": str(cj_order_id),
+                    "due_date": cj_due_str,
+                    "clothing_size": cj_size_str,
                 })
 
         elapsed_ms = int((time.time() - start_time) * 1000)
@@ -1210,7 +1245,7 @@ async def add_kit(
     name: str = Form(""),
     trimester: int = Form(...),
     size_variant: int = Form(1),
-    is_welcome_kit: bool = Form(False),
+    is_welcome_kit: str = Form(""),
     quantity_available: int = Form(0),
     age_rank: int = Form(0),
     cost_per_kit: float = Form(0),
@@ -1218,20 +1253,23 @@ async def add_kit(
     """Add a new kit."""
     try:
         db = get_supabase()
+        welcome = is_welcome_kit.lower() in ("true", "on", "1", "yes") if is_welcome_kit else False
+        sku_clean = sku.strip().upper()
+        logger.info(f"[KITS] Adding kit: sku={sku_clean}, T{trimester}, size={size_variant}, welcome={welcome}, qty={quantity_available}, age_rank={age_rank}")
         db.table("kits").insert({
-            "sku": sku.strip().upper(),
+            "sku": sku_clean,
             "name": name.strip() or None,
             "trimester": trimester,
             "size_variant": size_variant,
-            "is_welcome_kit": is_welcome_kit,
+            "is_welcome_kit": welcome,
             "quantity_available": quantity_available,
             "age_rank": age_rank,
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
         }).execute()
-        logger.info(f"[KITS] Added kit: {sku}")
-        await log_activity("kit", f"Kit {sku} added", f"T{trimester}, Qty: {quantity_available}", "success")
+        logger.info(f"[KITS] ✅ Added kit: {sku_clean}")
+        await log_activity("kit", f"Kit {sku_clean} added", f"T{trimester}, Qty: {quantity_available}, Welcome: {welcome}", "success")
     except Exception as e:
-        logger.error(f"[KITS] Error adding kit: {e}")
+        logger.error(f"[KITS] Error adding kit: {e}", exc_info=True)
         await log_activity("kit", f"Failed to add kit {sku}: {e}", "", "error")
     return RedirectResponse("/kits", status_code=303)
 
@@ -1264,22 +1302,27 @@ async def add_item(
     sku: str = Form(""),
     category: str = Form(""),
     unit_cost: float = Form(0),
-    is_therabox: bool = Form(False),
+    is_therabox: str = Form(""),
 ):
     """Add a new item."""
     try:
         db = get_supabase()
+        therabox = is_therabox.lower() in ("true", "on", "1", "yes") if is_therabox else False
+        name_clean = name.strip()
+        sku_clean = sku.strip().upper() or None
+        logger.info(f"[ITEMS] Adding item: name='{name_clean}', sku={sku_clean}, category={category}, therabox={therabox}")
         db.table("items").insert({
-            "name": name.strip(),
-            "sku": sku.strip().upper() or None,
+            "name": name_clean,
+            "sku": sku_clean,
             "category": category.strip() or None,
             "unit_cost": unit_cost if unit_cost > 0 else None,
-            "is_therabox": is_therabox,
+            "is_therabox": therabox,
         }).execute()
-        logger.info(f"[ITEMS] Added item: {name}")
-        await log_activity("item", f"Item '{name}' added", f"SKU: {sku}", "success")
+        logger.info(f"[ITEMS] ✅ Added item: {name_clean}")
+        await log_activity("item", f"Item '{name_clean}' added", f"SKU: {sku_clean}, TheraBox: {therabox}", "success")
     except Exception as e:
-        logger.error(f"[ITEMS] Error adding item: {e}")
+        logger.error(f"[ITEMS] Error adding item: {e}", exc_info=True)
+        await log_activity("item", f"Failed to add item: {e}", "", "error")
     return RedirectResponse("/items", status_code=303)
 
 
@@ -1294,7 +1337,7 @@ async def add_customer(
     baby_gender: str = Form(""),
     platform: str = Form("shopify"),
     subscription_status: str = Form("active"),
-    wants_daddy_item: bool = Form(False),
+    wants_daddy_item: str = Form(""),
     phone: str = Form(""),
     address_line1: str = Form(""),
     city: str = Form(""),
@@ -1305,6 +1348,8 @@ async def add_customer(
     try:
         db = get_supabase()
         email_clean = email.strip().lower()
+        daddy = wants_daddy_item.lower() in ("true", "on", "1", "yes") if wants_daddy_item else False
+        logger.info(f"[CUSTOMER ADD] Adding: email={email_clean}, platform={platform}, daddy={daddy}")
         if not email_clean:
             logger.error("[CUSTOMER ADD] Empty email")
             return RedirectResponse("/customers", status_code=303)
@@ -1329,7 +1374,7 @@ async def add_customer(
             "baby_gender": baby_gender.strip() or None,
             "platform": platform,
             "subscription_status": subscription_status,
-            "wants_daddy_item": wants_daddy_item,
+            "wants_daddy_item": daddy,
             "phone": phone.strip() or None,
             "address_line1": address_line1.strip() or None,
             "city": city.strip() or None,
@@ -1359,11 +1404,12 @@ async def edit_customer(
     baby_gender: str = Form(""),
     platform: str = Form("shopify"),
     subscription_status: str = Form("active"),
-    wants_daddy_item: bool = Form(False),
+    wants_daddy_item: str = Form(""),
 ):
     """Edit an existing customer's details."""
     try:
         db = get_supabase()
+        daddy = wants_daddy_item.lower() in ("true", "on", "1", "yes") if wants_daddy_item else False
         due_date = parse_due_date(due_date_str) if due_date_str.strip() else None
         trimester = calculate_trimester(due_date, date.today()) if due_date else None
         size = normalize_clothing_size(clothing_size) if clothing_size.strip() else None
@@ -1377,10 +1423,10 @@ async def edit_customer(
             "baby_gender": baby_gender.strip() or None,
             "platform": platform,
             "subscription_status": subscription_status,
-            "wants_daddy_item": wants_daddy_item,
+            "wants_daddy_item": daddy,
         }
         db.table("customers").update(record).eq("id", customer_id).execute()
-        logger.info(f"[CUSTOMER EDIT] Updated customer {customer_id}: T{trimester}, {platform}")
+        logger.info(f"[CUSTOMER EDIT] Updated customer {customer_id}: T{trimester}, {platform}, daddy={daddy}")
         await log_activity("customer", f"Edited customer {customer_id}", f"T{trimester}, {platform}", "success")
     except Exception as e:
         logger.error(f"[CUSTOMER EDIT] Error: {e}", exc_info=True)
@@ -1541,6 +1587,17 @@ async def health():
         return {"status": "unhealthy", "database": str(e)}
 
 
+# ─── Fix Google Sheets headers ───
+@app.post("/api/fix-gsheet-headers")
+async def api_fix_gsheet_headers():
+    """Update Google Sheet header row to match current column format (12 columns)."""
+    result = fix_gsheet_headers()
+    if result:
+        await log_activity("gsheets", "Fixed Google Sheet headers", "Updated to 12-column format", "success")
+        return JSONResponse({"status": "ok", "message": "Headers updated successfully"})
+    return JSONResponse({"status": "error", "message": "Failed to update headers — check logs"}, status_code=500)
+
+
 # ─── API: Test webhook (manual trigger for testing) ───
 @app.post("/api/test-webhook")
 async def test_webhook(request: Request):
@@ -1677,8 +1734,9 @@ async def test_webhook(request: Request):
                 "kit_sku": kit_decision.get("kit_sku", "—"),
                 "decision_type": kit_decision["decision_type"],
                 "reason": kit_decision["reason"],
-                "status": "pending",
                 "order_id": test_order_id,
+                "due_date": due_date.isoformat() if due_date else "",
+                "clothing_size": quiz.get("clothing_size", "") or "",
             })
 
         # Update webhook log
@@ -1892,8 +1950,9 @@ async def test_webhook_cratejoy(request: Request):
                 "kit_sku": kit_decision.get("kit_sku", "—"),
                 "decision_type": kit_decision["decision_type"],
                 "reason": kit_decision["reason"],
-                "status": "pending",
                 "order_id": cj_order_id,
+                "due_date": due_date.isoformat() if due_date else "",
+                "clothing_size": clothing_size or "",
             })
 
         if webhook_log_id:
@@ -1915,6 +1974,246 @@ async def test_webhook_cratejoy(request: Request):
         logger.error(f"[CJ TEST] Error: {e}", exc_info=True)
         await log_activity("test", f"Cratejoy test failed: {e}", "", "error")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+# ═══════════════════════════════════════════════════════════
+# DECISION APPROVAL / REJECT / SHIP
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/decisions/{decision_id}/approve")
+async def approve_decision(request: Request, decision_id: str):
+    """
+    Approve a pending decision.
+    - Changes status from 'pending' to 'approved'
+    - Decrements kit quantity_available by 1 (stock sync)
+    """
+    try:
+        db = get_supabase()
+        decision = db.table("decisions").select("*, customers(email, first_name, last_name)").eq("id", decision_id).single().execute()
+        if not decision.data:
+            logger.error(f"[APPROVE] Decision {decision_id} not found")
+            return JSONResponse({"error": "Decision not found"}, status_code=404)
+
+        d = decision.data
+        current_status = d.get("status")
+        if current_status != "pending":
+            logger.warning(f"[APPROVE] Decision {decision_id} is '{current_status}', not 'pending' — skipping")
+            return RedirectResponse("/decisions", status_code=303)
+
+        # Update decision status
+        db.table("decisions").update({"status": "approved"}).eq("id", decision_id).execute()
+        logger.info(f"[APPROVE] Decision {decision_id} approved. Kit: {d.get('kit_sku', 'none')}")
+
+        # Decrement kit stock if kit was assigned
+        kit_id = d.get("kit_id")
+        if kit_id:
+            kit = db.table("kits").select("sku, quantity_available").eq("id", kit_id).single().execute()
+            if kit.data:
+                new_qty = max(0, kit.data["quantity_available"] - 1)
+                db.table("kits").update({"quantity_available": new_qty}).eq("id", kit_id).execute()
+                logger.info(f"[APPROVE] Kit {kit.data['sku']} stock: {kit.data['quantity_available']} → {new_qty}")
+
+        cust_email = d.get("customers", {}).get("email", decision_id[:8]) if d.get("customers") else decision_id[:8]
+        await log_activity("decision", f"Approved decision for {cust_email}", f"Kit: {d.get('kit_sku', '—')}", "success")
+    except Exception as e:
+        logger.error(f"[APPROVE] Error: {e}", exc_info=True)
+        await log_activity("decision", f"Failed to approve decision: {e}", "", "error")
+    return RedirectResponse("/decisions", status_code=303)
+
+
+@app.post("/decisions/{decision_id}/reject")
+async def reject_decision(request: Request, decision_id: str):
+    """Reject a pending decision."""
+    try:
+        db = get_supabase()
+        decision = db.table("decisions").select("*, customers(email)").eq("id", decision_id).single().execute()
+        if not decision.data:
+            return JSONResponse({"error": "Decision not found"}, status_code=404)
+
+        d = decision.data
+        if d.get("status") != "pending":
+            logger.warning(f"[REJECT] Decision {decision_id} is '{d.get('status')}', not 'pending'")
+            return RedirectResponse("/decisions", status_code=303)
+
+        db.table("decisions").update({"status": "rejected"}).eq("id", decision_id).execute()
+        cust_email = d.get("customers", {}).get("email", decision_id[:8]) if d.get("customers") else decision_id[:8]
+        logger.info(f"[REJECT] Decision {decision_id} rejected for {cust_email}")
+        await log_activity("decision", f"Rejected decision for {cust_email}", f"Kit: {d.get('kit_sku', '—')}", "info")
+    except Exception as e:
+        logger.error(f"[REJECT] Error: {e}", exc_info=True)
+    return RedirectResponse("/decisions", status_code=303)
+
+
+@app.post("/decisions/{decision_id}/ship")
+async def ship_decision(request: Request, decision_id: str):
+    """
+    Mark an approved decision as shipped.
+    - Creates a shipment record in shipments table
+    - Populates shipment_items from kit_items
+    """
+    try:
+        db = get_supabase()
+        decision = db.table("decisions").select("*, customers(email, first_name, last_name)").eq("id", decision_id).single().execute()
+        if not decision.data:
+            return JSONResponse({"error": "Decision not found"}, status_code=404)
+
+        d = decision.data
+        if d.get("status") not in ("approved", "pending"):
+            logger.warning(f"[SHIP] Decision {decision_id} is '{d.get('status')}', cannot ship")
+            return RedirectResponse("/decisions", status_code=303)
+
+        # If shipping from pending, also decrement stock
+        if d.get("status") == "pending" and d.get("kit_id"):
+            kit = db.table("kits").select("sku, quantity_available").eq("id", d["kit_id"]).single().execute()
+            if kit.data:
+                new_qty = max(0, kit.data["quantity_available"] - 1)
+                db.table("kits").update({"quantity_available": new_qty}).eq("id", d["kit_id"]).execute()
+                logger.info(f"[SHIP] Kit {kit.data['sku']} stock: {kit.data['quantity_available']} → {new_qty}")
+
+        # Update decision status to shipped
+        db.table("decisions").update({"status": "shipped"}).eq("id", decision_id).execute()
+
+        # Create shipment record
+        shipment_record = {
+            "customer_id": d["customer_id"],
+            "kit_id": d.get("kit_id"),
+            "kit_sku": d.get("kit_sku"),
+            "ship_date": date.today().isoformat(),
+            "trimester_at_ship": d.get("trimester"),
+            "platform": d.get("platform"),
+            "order_id": d.get("order_id"),
+            "notes": f"Auto-created from decision {decision_id[:8]}",
+        }
+        ship_result = db.table("shipments").insert(shipment_record).execute()
+        shipment_id = ship_result.data[0]["id"] if ship_result.data else None
+        logger.info(f"[SHIP] Created shipment {shipment_id} for decision {decision_id[:8]}")
+
+        # Populate shipment_items from kit_items
+        if d.get("kit_id") and shipment_id:
+            kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
+            for ki in (kit_items.data or []):
+                try:
+                    db.table("shipment_items").insert({
+                        "shipment_id": shipment_id,
+                        "item_id": ki["item_id"],
+                    }).execute()
+                except Exception as si_err:
+                    logger.warning(f"[SHIP] Could not add shipment_item: {si_err}")
+            logger.info(f"[SHIP] Added {len(kit_items.data or [])} items to shipment")
+
+        cust_email = d.get("customers", {}).get("email", d["customer_id"][:8]) if d.get("customers") else d["customer_id"][:8]
+        await log_activity("shipment", f"Shipped {d.get('kit_sku', '—')} to {cust_email}",
+                          f"Decision: {decision_id[:8]}, Shipment: {shipment_id[:8] if shipment_id else '?'}", "success")
+    except Exception as e:
+        logger.error(f"[SHIP] Error: {e}", exc_info=True)
+        await log_activity("decision", f"Failed to ship decision: {e}", "", "error")
+    return RedirectResponse("/decisions", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════
+# RE-CURATE (Re-run decision engine for a customer)
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/customers/{customer_id}/recurate")
+async def recurate_customer(request: Request, customer_id: str):
+    """
+    Re-run the decision engine for a customer.
+    Useful when:
+    - New kits have been added
+    - Customer data was updated (due date, size)
+    - Previous decision was 'needs-curation' and new kits are now available
+    """
+    try:
+        db = get_supabase()
+        cust = db.table("customers").select("email, first_name, last_name, due_date, clothing_size, trimester").eq("id", customer_id).single().execute()
+        if not cust.data:
+            logger.error(f"[RECURATE] Customer {customer_id} not found")
+            return RedirectResponse(f"/customers/{customer_id}", status_code=303)
+
+        email = cust.data["email"]
+        logger.info(f"[RECURATE] Re-running decision engine for {email} (customer_id={customer_id})")
+
+        # Run the decision engine
+        kit_decision = await assign_kit(customer_id, date.today())
+        logger.info(f"[RECURATE] Result: {kit_decision['decision_type']} — Kit: {kit_decision.get('kit_sku', 'none')}")
+
+        # Save new decision
+        trimester = cust.data.get("trimester")
+        decision_record = {
+            "customer_id": customer_id,
+            "kit_id": kit_decision.get("kit_id"),
+            "kit_sku": kit_decision.get("kit_sku"),
+            "decision_type": kit_decision["decision_type"],
+            "reason": f"[Re-curated] {kit_decision['reason']}",
+            "status": "pending",
+            "order_id": None,
+            "platform": None,
+            "trimester": trimester,
+            "ship_date": date.today().isoformat(),
+        }
+        db.table("decisions").insert(decision_record).execute()
+
+        # Write to Google Sheets
+        write_decision_to_sheet({
+            "date": date.today().isoformat(),
+            "customer_name": f"{cust.data.get('first_name', '')} {cust.data.get('last_name', '')}".strip(),
+            "email": email,
+            "platform": "re-curate",
+            "trimester": trimester,
+            "order_type": "re-curate",
+            "kit_sku": kit_decision.get("kit_sku", "—"),
+            "decision_type": kit_decision["decision_type"],
+            "reason": f"[Re-curated] {kit_decision['reason']}",
+            "order_id": "",
+            "due_date": cust.data.get("due_date", "") or "",
+            "clothing_size": cust.data.get("clothing_size", "") or "",
+        })
+
+        await log_activity("decision", f"Re-curated {email}: {kit_decision['decision_type']}",
+                          f"Kit: {kit_decision.get('kit_sku', '—')}, T{trimester}", "success")
+    except Exception as e:
+        logger.error(f"[RECURATE] Error: {e}", exc_info=True)
+        await log_activity("decision", f"Failed to re-curate: {e}", "", "error")
+    return RedirectResponse(f"/customers/{customer_id}", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════
+# KIT EDIT
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/kits/{kit_id}/edit")
+async def edit_kit(
+    request: Request,
+    kit_id: str,
+    name: str = Form(""),
+    trimester: int = Form(...),
+    size_variant: int = Form(1),
+    is_welcome_kit: str = Form(""),
+    quantity_available: int = Form(0),
+    age_rank: int = Form(0),
+    cost_per_kit: float = Form(0),
+):
+    """Edit an existing kit's details."""
+    try:
+        db = get_supabase()
+        welcome = is_welcome_kit.lower() in ("true", "on", "1", "yes") if is_welcome_kit else False
+        record = {
+            "name": name.strip() or None,
+            "trimester": trimester,
+            "size_variant": size_variant,
+            "is_welcome_kit": welcome,
+            "quantity_available": quantity_available,
+            "age_rank": age_rank,
+            "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
+        }
+        db.table("kits").update(record).eq("id", kit_id).execute()
+        kit = db.table("kits").select("sku").eq("id", kit_id).single().execute()
+        sku = kit.data["sku"] if kit.data else kit_id[:8]
+        logger.info(f"[KIT EDIT] Updated kit {sku}: T{trimester}, qty={quantity_available}, welcome={welcome}")
+        await log_activity("kit", f"Edited kit {sku}", f"T{trimester}, Qty: {quantity_available}", "success")
+    except Exception as e:
+        logger.error(f"[KIT EDIT] Error: {e}", exc_info=True)
+    return RedirectResponse(f"/kits/{kit_id}", status_code=303)
 
 
 if __name__ == "__main__":

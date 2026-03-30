@@ -5,7 +5,10 @@
     <h1>Customer Detail</h1>
     <div class="status">
         <a href="/customers" class="btn btn-sm btn-secondary">← Back</a>
-        <button class="btn btn-sm btn-primary"
+        <form method="POST" action="/customers/{{ customer.id }}/recurate" style="display:inline;">
+            <button type="submit" class="btn btn-sm btn-primary" title="Re-run the decision engine for this customer" onclick="return confirm('Re-run kit assignment for this customer?')">🔄 Re-curate</button>
+        </form>
+        <button class="btn btn-sm btn-secondary"
             onclick="document.getElementById('editCustomerForm').style.display = document.getElementById('editCustomerForm').style.display === 'none' ? 'block' : 'none'">✏️
             Edit</button>
     </div>
@@ -153,6 +156,7 @@
                         <th>Type</th>
                         <th>Kit</th>
                         <th>Status</th>
+                        <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -166,6 +170,24 @@
                             {% elif d.status == 'approved' %}<span class="badge badge-green">{{ d.status }}</span>
                             {% elif d.status == 'shipped' %}<span class="badge badge-blue">{{ d.status }}</span>
                             {% else %}<span class="badge badge-dim">{{ d.status }}</span>{% endif %}
+                        </td>
+                        <td style="white-space: nowrap;">
+                            {% if d.status == 'pending' %}
+                                {% if d.kit_sku %}
+                                <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
+                                    <button type="submit" class="btn btn-sm btn-primary" title="Approve">✓</button>
+                                </form>
+                                {% endif %}
+                                <form method="POST" action="/decisions/{{ d.id }}/reject" style="display:inline;">
+                                    <button type="submit" class="btn btn-sm btn-danger" title="Reject">✕</button>
+                                </form>
+                            {% elif d.status == 'approved' %}
+                                <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
+                                    <button type="submit" class="btn btn-sm btn-secondary" title="Ship">📦</button>
+                                </form>
+                            {% else %}
+                                —
+                            {% endif %}
                         </td>
                     </tr>
                     {% endfor %}
