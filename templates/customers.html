@@ -109,6 +109,62 @@
                         <input type="text" name="zip_code" class="form-control" placeholder="10001">
                     </div>
                 </div>
+
+                <!-- Shipment History Section -->
+                <div style="margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px;">
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+                        <label style="font-weight: 600; font-size: 13px;">📦 Shipment History</label>
+                        <span style="font-size: 11px; color: var(--text-dim);">(optional — add kits this customer already received)</span>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="addShipmentRow()">+ Add Entry</button>
+                    </div>
+                    <div id="shipmentHistoryRows">
+                        <!-- rows are added dynamically via JS -->
+                    </div>
+                </div>
+                <script>
+                    function addShipmentRow() {
+                        const container = document.getElementById('shipmentHistoryRows');
+                        const idx = container.children.length;
+                        const row = document.createElement('div');
+                        row.className = 'form-row';
+                        row.style.marginBottom = '8px';
+                        row.style.background = 'var(--surface2)';
+                        row.style.padding = '10px';
+                        row.style.borderRadius = '6px';
+                        row.innerHTML = `
+                            <div class="form-group" style="flex:2; min-width:120px;">
+                                <label>Kit SKU *</label>
+                                <input type="text" name="ship_kit_sku" class="form-control" placeholder="e.g., WKH21, CI33" required>
+                            </div>
+                            <div class="form-group" style="flex:1; min-width:120px;">
+                                <label>Ship Date</label>
+                                <input type="date" name="ship_date" class="form-control">
+                            </div>
+                            <div class="form-group" style="flex:0 0 100px;">
+                                <label>Trimester</label>
+                                <select name="ship_trimester" class="form-control">
+                                    <option value="">—</option>
+                                    <option value="1">T1</option>
+                                    <option value="2">T2</option>
+                                    <option value="3">T3</option>
+                                    <option value="4">T4</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="flex:0 0 100px;">
+                                <label>Platform</label>
+                                <select name="ship_platform" class="form-control">
+                                    <option value="shopify">Shopify</option>
+                                    <option value="cratejoy">Cratejoy</option>
+                                </select>
+                            </div>
+                            <div style="flex:0 0 auto; display:flex; align-items:end; padding-bottom:2px;">
+                                <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.form-row').remove()" title="Remove">✕</button>
+                            </div>
+                        `;
+                        container.appendChild(row);
+                    }
+                </script>
+
                 <div style="margin-top: 8px;">
                     <button type="submit" class="btn btn-primary">✓ Add Customer</button>
                     <button type="button" class="btn btn-secondary"

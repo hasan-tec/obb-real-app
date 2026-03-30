@@ -14,6 +14,14 @@
     </div>
 </div>
 <div class="content">
+    {% if msg %}
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="
+        padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 13px;
+        {% if msg_type == 'error' %}background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid var(--red);
+        {% else %}background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid var(--green);{% endif %}
+    ">{{ msg }}</div>
+    {% endif %}
+
     <!-- Edit Kit Form (hidden by default) -->
     <div id="editKitForm" class="card" style="display: none; margin-bottom: 20px;">
         <div class="card-header"><h3>Edit Kit {{ kit.sku }}</h3></div>
@@ -137,9 +145,52 @@
             {% else %}
             <p style="color: var(--text-dim); font-size: 13px;">
                 {% if kit_items %}All available items are already linked to this kit.{% else %}No items exist yet. <a
-                    href="/items">Add items first</a>.{% endif %}
+                    href="/items">Add items first</a> or use the quick-add form below.{% endif %}
             </p>
             {% endif %}
+
+            <!-- Quick Create + Add Item (inline) -->
+            <div style="margin-top: 16px; border-top: 1px solid var(--border); padding-top: 16px;">
+                <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+                    <span style="font-size: 13px; color: var(--text-dim);">Don't see the item you need?</span>
+                    <button type="button" class="btn btn-sm btn-secondary"
+                        onclick="document.getElementById('quickAddItemForm').style.display = document.getElementById('quickAddItemForm').style.display === 'none' ? 'block' : 'none'">
+                        + Create New Item & Add to Kit
+                    </button>
+                </div>
+                <div id="quickAddItemForm" style="display: none;">
+                    <form method="POST" action="/kits/{{ kit.id }}/items/quick-add">
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;">
+                            <div class="form-group" style="flex: 2; min-width: 180px; margin-bottom: 0;">
+                                <label>Item Name *</label>
+                                <input type="text" name="name" class="form-control" placeholder="e.g., WAY OF WILL Face Serum" required>
+                            </div>
+                            <div class="form-group" style="flex: 1; min-width: 120px; margin-bottom: 0;">
+                                <label>SKU</label>
+                                <input type="text" name="sku" class="form-control" placeholder="e.g., OBB-FACESRM">
+                            </div>
+                            <div class="form-group" style="flex: 1; min-width: 120px; margin-bottom: 0;">
+                                <label>Category</label>
+                                <input type="text" name="category" class="form-control" placeholder="e.g., skincare">
+                            </div>
+                            <div class="form-group" style="flex: 0 0 80px; margin-bottom: 0;">
+                                <label>Cost ($)</label>
+                                <input type="number" name="unit_cost" class="form-control" value="0" min="0" step="0.01">
+                            </div>
+                            <div class="form-group" style="flex: 0 0 60px; margin-bottom: 0;">
+                                <label>Qty</label>
+                                <input type="number" name="quantity" class="form-control" value="1" min="1">
+                            </div>
+                            <div style="flex: 0 0 auto; padding-bottom: 1px;">
+                                <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; margin-bottom: 6px;">
+                                    <input type="checkbox" name="is_therabox" value="true"> TheraBox
+                                </label>
+                                <button type="submit" class="btn btn-primary btn-sm">Create & Add</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
         </div>
     </div>
 

@@ -67,7 +67,29 @@
                         </label>
                     </div>
                 </div>
-                <button type="submit" class="btn btn-primary" style="margin-top:8px;">Add Kit</button>
+
+                <!-- Item Selection (optional — select items to include in this kit) -->
+                {% if all_items %}
+                <div style="margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px;">
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+                        <label style="font-weight: 600; font-size: 13px;">Select Items for This Kit</label>
+                        <span style="font-size: 11px; color: var(--text-dim);">(optional — you can also add items later from the kit detail page)</span>
+                    </div>
+                    <div style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: var(--bg);">
+                        {% for item in all_items %}
+                        <label style="display: flex; align-items: center; gap: 8px; padding: 4px 6px; cursor: pointer; font-size: 13px; border-radius: 4px;"
+                            onmouseover="this.style.background='var(--surface2)'" onmouseout="this.style.background='transparent'">
+                            <input type="checkbox" name="item_ids" value="{{ item.id }}">
+                            <span style="font-weight: 500;">{{ item.name }}</span>
+                            {% if item.sku %}<span style="font-family: monospace; font-size: 11px; color: var(--text-dim);">({{ item.sku }})</span>{% endif %}
+                            {% if item.is_therabox %}<span class="badge badge-yellow" style="font-size: 10px;">TheraBox</span>{% endif %}
+                        </label>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
+                <button type="submit" class="btn btn-primary" style="margin-top:12px;">Add Kit</button>
             </form>
         </div>
     </div>

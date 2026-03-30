@@ -1221,10 +1221,14 @@ async def kits_page(request: Request):
                 kid = ki["kit_id"]
                 kit_item_counts[kid] = kit_item_counts.get(kid, 0) + 1
 
+        # Get all items for the kit creation form
+        all_items = db.table("items").select("*").order("name").execute()
+
         return templates.TemplateResponse("kits.html", {
             "request": request,
             "kits": kits_data.data or [],
             "kit_item_counts": kit_item_counts,
+            "all_items": all_items.data or [],
             "page": "kits",
         })
     except Exception as e:
@@ -1233,6 +1237,7 @@ async def kits_page(request: Request):
             "request": request,
             "kits": [],
             "kit_item_counts": {},
+            "all_items": [],
             "error": str(e),
             "page": "kits",
         })
@@ -1250,13 +1255,13 @@ async def add_kit(
     age_rank: int = Form(0),
     cost_per_kit: float = Form(0),
 ):
-    """Add a new kit."""
+    """Add a new kit with optional item selection."""
     try:
         db = get_supabase()
         welcome = is_welcome_kit.lower() in ("true", "on", "1", "yes") if is_welcome_kit else False
         sku_clean = sku.strip().upper()
         logger.info(f"[KITS] Adding kit: sku={sku_clean}, T{trimester}, size={size_variant}, welcome={welcome}, qty={quantity_available}, age_rank={age_rank}")
-        db.table("kits").insert({
+        kit_result = db.table("kits").insert({
             "sku": sku_clean,
             "name": name.strip() or None,
             "trimester": trimester,
@@ -1266,7 +1271,31 @@ async def add_kit(
             "age_rank": age_rank,
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
         }).execute()
-        logger.info(f"[KITS] ✅ Added kit: {sku_clean}")
+        kit_id = kit_result.data[0]["id"] if kit_result.data else None
+        logger.info(f"[KITS] ✅ Added kit: {sku_clean}, id={kit_id}")
+
+        # Link selected items to the kit
+        if kit_id:
+            form_data = await request.form()
+            selected_items = form_data.getlist("item_ids")
+            logger.info(f"[KITS] Selected items for kit {sku_clean}: {selected_items}")
+            for item_id in selected_items:
+                if item_id and item_id.strip():
+                    try:
+                        db.table("kit_items").insert({
+                            "kit_id": kit_id,
+                            "item_id": item_id.strip(),
+                            "quantity": 1,
+                        }).execute()
+                        logger.info(f"[KITS] Linked item {item_id} to kit {sku_clean}")
+                    except Exception as link_err:
+                        logger.warning(f"[KITS] Could not link item {item_id}: {link_err}")
+
+            items_count = len(selected_items)
+            await log_activity("kit", f"Kit {sku_clean} added with {items_count} items", f"T{trimester}, Qty: {quantity_available}, Welcome: {welcome}", "success")
+            # Redirect to kit detail so user can see and edit items
+            return RedirectResponse(f"/kits/{kit_id}", status_code=303)
+
         await log_activity("kit", f"Kit {sku_clean} added", f"T{trimester}, Qty: {quantity_available}, Welcome: {welcome}", "success")
     except Exception as e:
         logger.error(f"[KITS] Error adding kit: {e}", exc_info=True)
@@ -1344,7 +1373,7 @@ async def add_customer(
     province: str = Form(""),
     zip_code: str = Form(""),
 ):
-    """Manually add a customer."""
+    """Manually add a customer, optionally with shipment history."""
     try:
         db = get_supabase()
         email_clean = email.strip().lower()
@@ -1384,7 +1413,59 @@ async def add_customer(
         result = db.table("customers").insert(record).execute()
         cust_id = result.data[0]["id"] if result.data else None
         logger.info(f"[CUSTOMER ADD] Created customer: {email_clean}, id={cust_id}, T{trimester}")
-        await log_activity("customer", f"Manually added customer: {email_clean}", f"T{trimester}, {platform}", "success")
+
+        # Process shipment history entries from form
+        if cust_id:
+            form_data = await request.form()
+            ship_skus = form_data.getlist("ship_kit_sku")
+            ship_dates = form_data.getlist("ship_date")
+            ship_trimesters = form_data.getlist("ship_trimester")
+            ship_platforms = form_data.getlist("ship_platform")
+            logger.info(f"[CUSTOMER ADD] Shipment history entries: {len(ship_skus)}")
+
+            for i, ship_sku in enumerate(ship_skus):
+                ship_sku_clean = ship_sku.strip().upper() if ship_sku else ""
+                if not ship_sku_clean:
+                    continue
+                try:
+                    s_date = parse_due_date(ship_dates[i]) if i < len(ship_dates) and ship_dates[i].strip() else None
+                    s_tri = int(ship_trimesters[i]) if i < len(ship_trimesters) and ship_trimesters[i].strip() else None
+                    s_plat = ship_platforms[i] if i < len(ship_platforms) and ship_platforms[i].strip() else platform
+
+                    # Try to find kit by SKU
+                    kit_id = None
+                    kit_result = db.table("kits").select("id").eq("sku", ship_sku_clean).execute()
+                    if kit_result.data:
+                        kit_id = kit_result.data[0]["id"]
+
+                    ship_result = db.table("shipments").insert({
+                        "customer_id": cust_id,
+                        "kit_id": kit_id,
+                        "kit_sku": ship_sku_clean,
+                        "ship_date": s_date.isoformat() if s_date else None,
+                        "trimester_at_ship": s_tri if s_tri and s_tri > 0 else None,
+                        "platform": s_plat,
+                        "notes": "Added during customer creation",
+                    }).execute()
+                    shipment_id = ship_result.data[0]["id"] if ship_result.data else None
+
+                    # Populate shipment_items from kit_items if kit exists
+                    if kit_id and shipment_id:
+                        kit_items = db.table("kit_items").select("item_id").eq("kit_id", kit_id).execute()
+                        for ki in (kit_items.data or []):
+                            try:
+                                db.table("shipment_items").insert({
+                                    "shipment_id": shipment_id,
+                                    "item_id": ki["item_id"],
+                                }).execute()
+                            except Exception:
+                                pass
+
+                    logger.info(f"[CUSTOMER ADD] Added shipment #{i+1}: {ship_sku_clean} for {email_clean}")
+                except Exception as ship_err:
+                    logger.warning(f"[CUSTOMER ADD] Error adding shipment #{i+1}: {ship_err}")
+
+        await log_activity("customer", f"Manually added customer: {email_clean}", f"T{trimester}, {platform}, {len(ship_skus) if cust_id else 0} shipments", "success")
         if cust_id:
             return RedirectResponse(f"/customers/{cust_id}", status_code=303)
     except Exception as e:
@@ -1783,11 +1864,17 @@ async def kit_detail(request: Request, kit_id: str):
         all_items = db.table("items").select("*").order("name").execute()
         available_items = [i for i in (all_items.data or []) if i["id"] not in linked_item_ids]
 
+        # Read optional flash messages from query params
+        msg = request.query_params.get("msg", "")
+        msg_type = request.query_params.get("msg_type", "success")
+
         return templates.TemplateResponse("kit_detail.html", {
             "request": request,
             "kit": kit.data,
             "kit_items": linked_items,
             "available_items": available_items,
+            "msg": msg,
+            "msg_type": msg_type,
             "page": "kits",
         })
     except Exception as e:
@@ -1803,13 +1890,20 @@ async def add_item_to_kit(
     quantity: int = Form(1),
 ):
     """Link an item to a kit."""
+    from urllib.parse import quote
     try:
         db = get_supabase()
+        logger.info(f"[KIT-ITEM] Attempting to add item_id={item_id} to kit_id={kit_id} qty={quantity}")
+
+        if not item_id or item_id.strip() == "":
+            logger.warning(f"[KIT-ITEM] No item selected")
+            return RedirectResponse(f"/kits/{kit_id}?msg={quote('Please select an item')}&msg_type=error", status_code=303)
+
         # Check if already linked
         existing = db.table("kit_items").select("id").eq("kit_id", kit_id).eq("item_id", item_id).execute()
         if existing.data:
             logger.info(f"[KIT-ITEM] Item {item_id} already linked to kit {kit_id}")
-            return RedirectResponse(f"/kits/{kit_id}", status_code=303)
+            return RedirectResponse(f"/kits/{kit_id}?msg={quote('Item already in this kit')}&msg_type=error", status_code=303)
 
         db.table("kit_items").insert({
             "kit_id": kit_id,
@@ -1822,11 +1916,12 @@ async def add_item_to_kit(
         item = db.table("items").select("name").eq("id", item_id).single().execute()
         kit_sku = kit.data["sku"] if kit.data else kit_id
         item_name = item.data["name"] if item.data else item_id
-        logger.info(f"[KIT-ITEM] Added item '{item_name}' to kit {kit_sku} (qty: {quantity})")
+        logger.info(f"[KIT-ITEM] ✅ Added item '{item_name}' to kit {kit_sku} (qty: {quantity})")
         await log_activity("kit", f"Added item '{item_name}' to kit {kit_sku}", f"Qty: {quantity}", "success")
+        return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Added {item_name} to kit')}&msg_type=success", status_code=303)
     except Exception as e:
         logger.error(f"[KIT-ITEM] Error adding item to kit: {e}", exc_info=True)
-    return RedirectResponse(f"/kits/{kit_id}", status_code=303)
+        return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Error adding item: {str(e)[:80]}')}&msg_type=error", status_code=303)
 
 
 @app.post("/kits/{kit_id}/items/{item_id}/remove")
@@ -1845,6 +1940,58 @@ async def remove_item_from_kit(request: Request, kit_id: str, item_id: str):
     except Exception as e:
         logger.error(f"[KIT-ITEM] Error removing item from kit: {e}", exc_info=True)
     return RedirectResponse(f"/kits/{kit_id}", status_code=303)
+
+
+@app.post("/kits/{kit_id}/items/quick-add")
+async def quick_add_item_to_kit(
+    request: Request,
+    kit_id: str,
+    name: str = Form(...),
+    sku: str = Form(""),
+    category: str = Form(""),
+    unit_cost: float = Form(0),
+    is_therabox: str = Form(""),
+    quantity: int = Form(1),
+):
+    """Create a new item AND link it to this kit in one step."""
+    from urllib.parse import quote
+    try:
+        db = get_supabase()
+        therabox = is_therabox.lower() in ("true", "on", "1", "yes") if is_therabox else False
+        name_clean = name.strip()
+        sku_clean = sku.strip().upper() or None
+        if not name_clean:
+            return RedirectResponse(f"/kits/{kit_id}?msg={quote('Item name is required')}&msg_type=error", status_code=303)
+
+        logger.info(f"[KIT-ITEM QUICK] Creating item '{name_clean}' and linking to kit {kit_id}")
+
+        # Create the item
+        item_result = db.table("items").insert({
+            "name": name_clean,
+            "sku": sku_clean,
+            "category": category.strip() or None,
+            "unit_cost": unit_cost if unit_cost > 0 else None,
+            "is_therabox": therabox,
+        }).execute()
+        item_id = item_result.data[0]["id"] if item_result.data else None
+        if not item_id:
+            return RedirectResponse(f"/kits/{kit_id}?msg={quote('Failed to create item')}&msg_type=error", status_code=303)
+
+        # Link to kit
+        db.table("kit_items").insert({
+            "kit_id": kit_id,
+            "item_id": item_id,
+            "quantity": quantity,
+        }).execute()
+
+        kit = db.table("kits").select("sku").eq("id", kit_id).single().execute()
+        kit_sku = kit.data["sku"] if kit.data else kit_id
+        logger.info(f"[KIT-ITEM QUICK] ✅ Created '{name_clean}' and added to kit {kit_sku}")
+        await log_activity("kit", f"Quick-added item '{name_clean}' to kit {kit_sku}", f"SKU: {sku_clean}, Qty: {quantity}", "success")
+        return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Created and added {name_clean}')}&msg_type=success", status_code=303)
+    except Exception as e:
+        logger.error(f"[KIT-ITEM QUICK] Error: {e}", exc_info=True)
+        return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Error: {str(e)[:80]}')}&msg_type=error", status_code=303)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2014,7 +2161,26 @@ async def approve_decision(request: Request, decision_id: str):
                 logger.info(f"[APPROVE] Kit {kit.data['sku']} stock: {kit.data['quantity_available']} → {new_qty}")
 
         cust_email = d.get("customers", {}).get("email", decision_id[:8]) if d.get("customers") else decision_id[:8]
+        cust_name = ""
+        if d.get("customers"):
+            cust_name = f"{d['customers'].get('first_name', '')} {d['customers'].get('last_name', '')}".strip()
         await log_activity("decision", f"Approved decision for {cust_email}", f"Kit: {d.get('kit_sku', '—')}", "success")
+
+        # Update Google Sheets with approval status
+        write_decision_to_sheet({
+            "date": date.today().isoformat(),
+            "customer_name": cust_name or cust_email,
+            "email": cust_email,
+            "platform": d.get("platform", ""),
+            "trimester": d.get("trimester", "?"),
+            "order_type": "approved",
+            "kit_sku": d.get("kit_sku", "—"),
+            "decision_type": "approved",
+            "reason": f"[Approved] {d.get('reason', '')}",
+            "order_id": d.get("order_id", ""),
+            "due_date": "",
+            "clothing_size": "",
+        })
     except Exception as e:
         logger.error(f"[APPROVE] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to approve decision: {e}", "", "error")
@@ -2102,8 +2268,27 @@ async def ship_decision(request: Request, decision_id: str):
             logger.info(f"[SHIP] Added {len(kit_items.data or [])} items to shipment")
 
         cust_email = d.get("customers", {}).get("email", d["customer_id"][:8]) if d.get("customers") else d["customer_id"][:8]
+        cust_name = ""
+        if d.get("customers"):
+            cust_name = f"{d['customers'].get('first_name', '')} {d['customers'].get('last_name', '')}".strip()
         await log_activity("shipment", f"Shipped {d.get('kit_sku', '—')} to {cust_email}",
                           f"Decision: {decision_id[:8]}, Shipment: {shipment_id[:8] if shipment_id else '?'}", "success")
+
+        # Update Google Sheets with shipped status
+        write_decision_to_sheet({
+            "date": date.today().isoformat(),
+            "customer_name": cust_name or cust_email,
+            "email": cust_email,
+            "platform": d.get("platform", ""),
+            "trimester": d.get("trimester", "?"),
+            "order_type": "shipped",
+            "kit_sku": d.get("kit_sku", "—"),
+            "decision_type": "shipped",
+            "reason": f"[Shipped] {d.get('reason', '')}",
+            "order_id": d.get("order_id", ""),
+            "due_date": "",
+            "clothing_size": "",
+        })
     except Exception as e:
         logger.error(f"[SHIP] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to ship decision: {e}", "", "error")
