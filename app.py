@@ -786,29 +786,42 @@ async def cratejoy_order_webhook(request: Request):
     # ─── Parse payload ───
     try:
         raw_text = body.decode("utf-8")
-        # Cratejoy sends escaped JSON strings sometimes
-        try:
-            payload = json.loads(raw_text)
-        except json.JSONDecodeError:
-            payload = json.loads(json.loads(raw_text))
+        # Cratejoy sends escaped JSON strings sometimes (double-encoded)
+        # e.g., body = '"{\"type\": \"subscription\", ...}"' → first parse → str → second parse → dict
+        payload = json.loads(raw_text)
+        if isinstance(payload, str):
+            logger.info(f"[CRATEJOY WEBHOOK] Payload was double-encoded JSON string, parsing inner layer")
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            logger.error(f"[CRATEJOY WEBHOOK] Payload parsed but is not a dict: type={type(payload).__name__}")
+            payload = {"raw": str(payload)}
+        logger.info(f"[CRATEJOY WEBHOOK] Parsed payload keys: {list(payload.keys()) if isinstance(payload, dict) else 'N/A'}")
     except Exception as e:
-        logger.error(f"[CRATEJOY WEBHOOK] Parse error: {e}")
+        logger.error(f"[CRATEJOY WEBHOOK] Parse error: {e}", exc_info=True)
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
     db = get_supabase()
 
     # Determine event type from payload structure
+    # Cratejoy sends the object directly — e.g. subscription_renewed sends the subscription object
+    # The "type" field is the object type: "subscription", "order", "customer"
     event_type = "unknown"
-    if "subscription" in payload:
+    payload_type = payload.get("type", "") if isinstance(payload, dict) else ""
+
+    if payload_type == "subscription":
+        event_type = "subscription_renewed"
+    elif payload_type == "order":
+        event_type = "order_new"
+    elif payload_type == "customer":
+        event_type = "customer_new"
+    elif "subscription" in payload:
         event_type = "subscription_renewed"
     elif "order" in payload:
         event_type = "order_new"
     elif "customer" in payload:
         event_type = "customer_new"
 
-    # If the payload itself has a type field
-    if isinstance(payload, dict) and "type" in payload:
-        event_type = payload["type"]
+    logger.info(f"[CRATEJOY WEBHOOK] Detected event_type={event_type} from payload_type='{payload_type}'")
 
     # Use a combo key for idempotency 
     cj_order_id = ""
@@ -839,9 +852,34 @@ async def cratejoy_order_webhook(request: Request):
     # ─── Extract customer info ───
     try:
         # Cratejoy payloads vary by event type — normalize
-        order_data = payload.get("order", payload)
-        subscription_data = payload.get("subscription", {})
-        customer_data = payload.get("customer", order_data.get("customer", order_data))
+        # Case 1: Payload IS the subscription object (type=subscription) — subscription_renewed
+        # Case 2: Payload IS the order object (type=order) — order_new
+        # Case 3: Payload wraps: {"subscription": {...}, "order": {...}} — less common
+        if payload_type == "subscription":
+            subscription_data = payload
+            order_data = payload.get("order", {})
+            customer_data = payload.get("customer", {})
+            logger.info(f"[CRATEJOY WEBHOOK] Payload IS a subscription object (id={payload.get('id')})")
+        elif payload_type == "order":
+            order_data = payload
+            subscription_data = payload.get("subscription", {})
+            customer_data = payload.get("customer", order_data.get("customer", {}))
+            logger.info(f"[CRATEJOY WEBHOOK] Payload IS an order object (id={payload.get('id')})")
+        elif payload_type == "customer":
+            customer_data = payload
+            order_data = {}
+            subscription_data = {}
+            logger.info(f"[CRATEJOY WEBHOOK] Payload IS a customer object (id={payload.get('id')})")
+        else:
+            order_data = payload.get("order", payload)
+            subscription_data = payload.get("subscription", {})
+            customer_data = payload.get("customer", order_data.get("customer", order_data) if isinstance(order_data, dict) else {})
+            logger.info(f"[CRATEJOY WEBHOOK] Payload has generic structure, extracting from nested keys")
+
+        # Ensure customer_data is a dict (safety)
+        if not isinstance(customer_data, dict):
+            logger.warning(f"[CRATEJOY WEBHOOK] customer_data is not a dict: {type(customer_data).__name__}")
+            customer_data = {}
 
         email = (customer_data.get("email", "") or "").strip().lower()
         first_name = customer_data.get("first_name", customer_data.get("name", ""))
