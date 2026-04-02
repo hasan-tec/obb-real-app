@@ -317,8 +317,8 @@ def extract_quiz_data(note_attributes: list, line_items: list) -> dict:
 
     # --- note_attributes (primary source) ---
     for attr in (note_attributes or []):
-        name = (attr.get("name") or "").strip().lower()
-        value = (attr.get("value") or "").strip()
+        name = str(attr.get("name") or "").strip().lower()
+        value = str(attr.get("value") or "").strip()
         if not value:
             continue
 
