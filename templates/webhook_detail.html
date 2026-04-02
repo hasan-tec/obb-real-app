@@ -4,6 +4,11 @@
 <div class="topbar">
     <h1>Webhook Detail</h1>
     <div class="status">
+        {% if webhook and webhook.status in ('failed', 'received') %}
+        <form method="POST" action="/webhooks/{{ webhook.id }}/replay" style="display:inline;" onsubmit="return confirm('Replay this webhook? It will re-process the stored payload and create a new decision.');">
+            <button type="submit" class="btn btn-sm" style="background: var(--yellow); color: #000; margin-right: 8px;">🔄 Replay</button>
+        </form>
+        {% endif %}
         <a href="/webhooks" class="btn btn-sm btn-secondary">← Back to Webhooks</a>
     </div>
 </div>
@@ -31,6 +36,8 @@
                 <span class="badge badge-green">{{ webhook.status }}</span>
                 {% elif webhook.status == 'failed' %}
                 <span class="badge badge-red">{{ webhook.status }}</span>
+                {% elif webhook.status == 'replayed' %}
+                <span class="badge badge-yellow">{{ webhook.status }}</span>
                 {% else %}
                 <span class="badge badge-dim">{{ webhook.status }}</span>
                 {% endif %}

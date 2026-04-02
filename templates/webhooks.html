@@ -49,7 +49,7 @@
                         <span class="badge badge-green">{{ w.status }}</span>
                         {% elif w.status == 'failed' %}
                         <span class="badge badge-red">{{ w.status }}</span>
-                        {% elif w.status == 'duplicate' %}
+                        {% elif w.status == 'duplicate' or w.status == 'replayed' %}
                         <span class="badge badge-yellow">{{ w.status }}</span>
                         {% else %}
                         <span class="badge badge-dim">{{ w.status }}</span>

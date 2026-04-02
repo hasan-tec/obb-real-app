@@ -1463,6 +1463,439 @@ async def webhook_detail(request: Request, webhook_id: str):
         return HTMLResponse(f"Webhook not found: {e}", status_code=404)
 
 
+@app.post("/webhooks/{webhook_id}/replay")
+async def replay_webhook(webhook_id: str):
+    """
+    Replay a failed/received webhook by re-processing its stored payload.
+    Creates a NEW webhook_log entry for the replay attempt.
+    Skips HMAC verification and idempotency checks.
+    """
+    start_time = time.time()
+    db = get_supabase()
+    replay_log_id = None
+
+    try:
+        # ─── Load original webhook ───
+        original = db.table("webhook_logs").select("*").eq("id", webhook_id).single().execute()
+        if not original.data:
+            logger.error(f"[WEBHOOK REPLAY] Webhook {webhook_id} not found")
+            return RedirectResponse(f"/webhooks/{webhook_id}", status_code=303)
+
+        wh = original.data
+        source = wh.get("source", "")
+        payload = wh.get("payload", {})
+        original_event_id = wh.get("event_id", "")
+        original_status = wh.get("status", "")
+
+        logger.info(f"[WEBHOOK REPLAY] Starting replay for webhook {webhook_id}, source={source}, event_type={wh.get('event_type')}, original_status={original_status}")
+
+        # ─── Only allow replay of failed/received webhooks ───
+        if original_status not in ("failed", "received"):
+            logger.warning(f"[WEBHOOK REPLAY] Cannot replay webhook with status '{original_status}' — only 'failed' or 'received' allowed")
+            return RedirectResponse(f"/webhooks/{webhook_id}", status_code=303)
+
+        # ─── Create new webhook log for replay ───
+        replay_event_id = f"replay_{original_event_id or webhook_id}_{int(time.time())}"
+        replay_log = db.table("webhook_logs").insert({
+            "source": source,
+            "event_type": f"replay_{wh.get('event_type', 'unknown')}",
+            "event_id": replay_event_id,
+            "payload": payload,
+            "headers": {"replayed_from": webhook_id, "original_event_id": original_event_id},
+            "status": "received",
+        }).execute()
+        replay_log_id = replay_log.data[0]["id"] if replay_log.data else None
+        logger.info(f"[WEBHOOK REPLAY] Created replay log: {replay_log_id}")
+
+        # ═══════════════════════════════════════════════════════
+        # SHOPIFY REPLAY
+        # ═══════════════════════════════════════════════════════
+        if source == "shopify":
+            logger.info(f"[WEBHOOK REPLAY] Processing Shopify payload")
+
+            shopify_order_id = str(payload.get("id", ""))
+            customer_data = payload.get("customer", {})
+            email = (str(customer_data.get("email") or payload.get("email") or "")).strip().lower()
+            first_name = customer_data.get("first_name", "")
+            last_name = customer_data.get("last_name", "")
+            shopify_customer_id = str(customer_data.get("id", ""))
+            phone = customer_data.get("phone", "")
+
+            shipping = payload.get("shipping_address", {})
+            address_line1 = shipping.get("address1", "")
+            city = shipping.get("city", "")
+            province = shipping.get("province", "")
+            zip_code = shipping.get("zip", "")
+            country = shipping.get("country_code", "US")
+
+            line_items = payload.get("line_items", [])
+            note_attributes = payload.get("note_attributes", [])
+            quiz = extract_quiz_data(note_attributes, line_items)
+
+            due_date_str = quiz["due_date_str"]
+            clothing_size = quiz["clothing_size"]
+            baby_gender = quiz["baby_gender"]
+            wants_daddy = quiz["wants_daddy"]
+
+            due_date = parse_due_date(due_date_str)
+            trimester = None
+            if due_date:
+                trimester = calculate_trimester(due_date, date.today())
+                logger.info(f"[WEBHOOK REPLAY] Shopify: due_date={due_date}, T{trimester}, size={clothing_size}")
+
+            total_price = float(payload.get("total_price", "0") or "0")
+            source_name = payload.get("source_name", "")
+            is_renewal = (total_price == 0) or (not source_name) or (source_name not in ("web", "shopify_draft_order"))
+            if quiz["subscription_plan"]:
+                is_renewal = False
+
+            logger.info(f"[WEBHOOK REPLAY] Shopify customer: {email}, order: {shopify_order_id}, renewal={is_renewal}")
+
+            if email:
+                existing_customer = db.table("customers").select("*").ilike("email", email).execute()
+                customer_record = {
+                    "email": email,
+                    "first_name": first_name or None,
+                    "last_name": last_name or None,
+                    "shopify_customer_id": shopify_customer_id or None,
+                    "phone": phone or None,
+                    "address_line1": address_line1 or None,
+                    "city": city or None,
+                    "province": province or None,
+                    "zip": zip_code or None,
+                    "country": country or "US",
+                }
+                if due_date:
+                    customer_record["due_date"] = due_date.isoformat()
+                if trimester:
+                    customer_record["trimester"] = trimester
+                if clothing_size:
+                    customer_record["clothing_size"] = clothing_size
+                if baby_gender:
+                    customer_record["baby_gender"] = baby_gender
+                customer_record["wants_daddy_item"] = wants_daddy
+
+                if existing_customer.data:
+                    cust_id = existing_customer.data[0]["id"]
+                    if existing_customer.data[0].get("cratejoy_customer_id"):
+                        customer_record["platform"] = "both"
+                    else:
+                        customer_record["platform"] = "shopify"
+                    db.table("customers").update(customer_record).eq("id", cust_id).execute()
+                    logger.info(f"[WEBHOOK REPLAY] Updated existing customer: {cust_id}")
+                else:
+                    customer_record["platform"] = "shopify"
+                    customer_record["subscription_status"] = "active"
+                    result = db.table("customers").insert(customer_record).execute()
+                    cust_id = result.data[0]["id"] if result.data else None
+                    logger.info(f"[WEBHOOK REPLAY] Created new customer: {cust_id}")
+
+                if cust_id:
+                    kit_decision = await assign_kit(cust_id, date.today())
+                    logger.info(f"[WEBHOOK REPLAY] Decision: {kit_decision['decision_type']} — {kit_decision.get('kit_sku', 'none')}")
+
+                    decision = {
+                        "customer_id": cust_id,
+                        "kit_id": kit_decision.get("kit_id"),
+                        "kit_sku": kit_decision.get("kit_sku"),
+                        "decision_type": kit_decision["decision_type"],
+                        "reason": kit_decision["reason"],
+                        "status": "pending",
+                        "order_id": shopify_order_id,
+                        "platform": "shopify",
+                        "trimester": trimester,
+                        "ship_date": date.today().isoformat(),
+                    }
+                    db.table("decisions").insert(decision).execute()
+                    logger.info(f"[WEBHOOK REPLAY] Saved Shopify decision")
+
+                    write_decision_to_sheet({
+                        "date": date.today().isoformat(),
+                        "customer_name": f"{first_name or ''} {last_name or ''}".strip(),
+                        "email": email,
+                        "platform": "shopify",
+                        "trimester": trimester,
+                        "order_type": "renewal" if is_renewal else "new",
+                        "kit_sku": kit_decision.get("kit_sku", "—"),
+                        "decision_type": kit_decision["decision_type"],
+                        "reason": kit_decision["reason"],
+                        "order_id": str(shopify_order_id),
+                        "due_date": due_date.isoformat() if due_date else "",
+                        "clothing_size": clothing_size or "",
+                    })
+
+            # Mark replay as successful
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            if replay_log_id:
+                db.table("webhook_logs").update({"status": "processed", "processing_time_ms": elapsed_ms}).eq("id", replay_log_id).execute()
+            db.table("webhook_logs").update({"status": "replayed", "error_message": f"Replayed successfully → {replay_log_id}"}).eq("id", webhook_id).execute()
+            await log_activity("webhook", f"Replayed Shopify webhook (order #{shopify_order_id})", f"Original: {webhook_id}, Replay: {replay_log_id}", "success")
+            logger.info(f"[WEBHOOK REPLAY] Shopify replay complete in {elapsed_ms}ms")
+            return RedirectResponse(f"/webhooks/{replay_log_id}", status_code=303)
+
+        # ═══════════════════════════════════════════════════════
+        # CRATEJOY REPLAY
+        # ═══════════════════════════════════════════════════════
+        elif source == "cratejoy":
+            logger.info(f"[WEBHOOK REPLAY] Processing Cratejoy payload")
+
+            payload_type = payload.get("type", "") if isinstance(payload, dict) else ""
+            event_type = wh.get("event_type", "unknown")
+
+            # Subscription status
+            sub_status_raw = payload.get("status", "") if isinstance(payload, dict) else ""
+            sub_status_map = {1: "unpaid", 2: "active", 3: "cancelled", 4: "suspended", 5: "expired",
+                              6: "past_due", 7: "pending_renewal", 8: "renewing"}
+            if isinstance(sub_status_raw, int):
+                sub_status_str = sub_status_map.get(sub_status_raw, str(sub_status_raw))
+            else:
+                sub_status_str = str(sub_status_raw).lower().strip()
+
+            is_cancelled = sub_status_str == "cancelled"
+            is_expired = sub_status_str == "expired"
+            is_prepaid = False
+
+            if is_cancelled or is_expired:
+                term_data = payload.get("term", {}) if isinstance(payload, dict) else {}
+                num_cycles = term_data.get("num_cycles", 1) if isinstance(term_data, dict) else 1
+                end_date_str = payload.get("end_date", "") if isinstance(payload, dict) else ""
+                if num_cycles and num_cycles > 1 and end_date_str:
+                    try:
+                        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00")).date()
+                        if end_dt > date.today():
+                            is_prepaid = True
+                            logger.info(f"[WEBHOOK REPLAY] CJ cancelled but prepaid — end_date {end_dt} in future")
+                    except Exception:
+                        pass
+
+            # Extract customer
+            if payload_type == "subscription":
+                customer_data = payload.get("customer", {})
+                subscription_data = payload
+                order_data = payload.get("order", {})
+            elif payload_type == "order":
+                customer_data = payload.get("customer", payload.get("order", {}).get("customer", {}))
+                order_data = payload
+                subscription_data = payload.get("subscription", {})
+            else:
+                customer_data = payload.get("customer", {})
+                order_data = payload.get("order", payload)
+                subscription_data = payload.get("subscription", {})
+
+            if not isinstance(customer_data, dict):
+                customer_data = {}
+
+            email = (str(customer_data.get("email", "") or "")).strip().lower()
+            first_name = customer_data.get("first_name", customer_data.get("name", ""))
+            last_name = customer_data.get("last_name", "")
+            cratejoy_customer_id = str(customer_data.get("id", ""))
+            cj_order_id = str(payload.get("id", ""))
+
+            address_data = customer_data.get("shipping_address", customer_data.get("address", {}))
+            if isinstance(address_data, dict):
+                address_line1 = address_data.get("street", address_data.get("address1", ""))
+                city = address_data.get("city", "")
+                province = address_data.get("state", address_data.get("province", ""))
+                zip_code = address_data.get("zip_code", address_data.get("zip", ""))
+                country = address_data.get("country", "US")
+            else:
+                address_line1 = city = province = zip_code = ""
+                country = "US"
+
+            # Due date from note
+            due_date_str = None
+            due_date = None
+            note = (subscription_data or {}).get("note", (order_data or {}).get("note", "")) if isinstance(subscription_data, dict) else ""
+            if note and isinstance(note, str):
+                date_match = re.search(r'\d{4}-\d{2}-\d{2}', note)
+                if date_match:
+                    due_date_str = date_match.group()
+            # Also check custom_fields
+            custom_fields = customer_data.get("custom_fields", (subscription_data or {}).get("custom_fields", {})) if isinstance(subscription_data, dict) else {}
+            if isinstance(custom_fields, dict):
+                for key, val in custom_fields.items():
+                    if "due" in key.lower() and val:
+                        due_date_str = str(val)
+                        break
+
+            if due_date_str:
+                due_date = parse_due_date(due_date_str)
+
+            trimester = None
+            if due_date:
+                trimester = calculate_trimester(due_date, date.today())
+
+            logger.info(f"[WEBHOOK REPLAY] CJ customer: {email}, sub_status={sub_status_str}, due_date={due_date}, T{trimester}")
+
+            if email:
+                existing_customer = db.table("customers").select("*").ilike("email", email).execute()
+                customer_record = {
+                    "email": email,
+                    "first_name": first_name or None,
+                    "last_name": last_name or None,
+                    "cratejoy_customer_id": cratejoy_customer_id or None,
+                    "address_line1": address_line1 or None,
+                    "city": city or None,
+                    "province": province or None,
+                    "zip": zip_code or None,
+                    "country": country or "US",
+                }
+                if due_date:
+                    customer_record["due_date"] = due_date.isoformat()
+                if trimester:
+                    customer_record["trimester"] = trimester
+
+                if is_cancelled and is_prepaid:
+                    customer_record["subscription_status"] = "cancelled-prepaid"
+                elif is_cancelled or is_expired:
+                    customer_record["subscription_status"] = "cancelled-expired"
+
+                if existing_customer.data:
+                    cust_id = existing_customer.data[0]["id"]
+                    existing_cust = existing_customer.data[0]
+                    customer_record["platform"] = "both" if existing_cust.get("shopify_customer_id") else "cratejoy"
+                    # Preserve existing data
+                    if not due_date and existing_cust.get("due_date"):
+                        logger.info(f"[WEBHOOK REPLAY] Preserving existing due_date: {existing_cust['due_date']}")
+                    if not is_cancelled and not is_expired and sub_status_str not in ("suspended", "paused"):
+                        if existing_cust.get("subscription_status") == "active":
+                            customer_record.pop("subscription_status", None)
+                    db.table("customers").update(customer_record).eq("id", cust_id).execute()
+                    logger.info(f"[WEBHOOK REPLAY] Updated existing CJ customer: {cust_id}")
+                else:
+                    customer_record["platform"] = "cratejoy"
+                    if "subscription_status" not in customer_record:
+                        customer_record["subscription_status"] = "active"
+                    result = db.table("customers").insert(customer_record).execute()
+                    cust_id = result.data[0]["id"] if result.data else None
+                    logger.info(f"[WEBHOOK REPLAY] Created new CJ customer: {cust_id}")
+
+                # Re-read merged data
+                db_trimester = trimester
+                db_due_date = due_date.isoformat() if due_date else None
+                db_clothing_size = ""
+                if cust_id:
+                    merged = db.table("customers").select("*").eq("id", cust_id).single().execute()
+                    if merged.data:
+                        db_trimester = merged.data.get("trimester")
+                        db_due_date = merged.data.get("due_date")
+                        db_clothing_size = merged.data.get("clothing_size", "")
+
+                # Fetch survey results
+                if cust_id and CRATEJOY_CLIENT_ID and CRATEJOY_CLIENT_SECRET:
+                    cj_sub_id = payload.get("id", "")
+                    if cj_sub_id:
+                        try:
+                            auth_str = base64.b64encode(f"{CRATEJOY_CLIENT_ID}:{CRATEJOY_CLIENT_SECRET}".encode()).decode()
+                            cj_headers = {"Authorization": f"Basic {auth_str}", "Accept": "application/json"}
+                            async with httpx.AsyncClient(timeout=15.0) as client:
+                                survey_url = f"https://api.cratejoy.com/v1/product_survey_results/?subscription_id={cj_sub_id}"
+                                logger.info(f"[WEBHOOK REPLAY] Fetching CJ survey: {survey_url}")
+                                survey_resp = await client.get(survey_url, headers=cj_headers)
+                                if survey_resp.status_code == 200:
+                                    survey_data = survey_resp.json()
+                                    update_from_survey = {}
+                                    for sr in survey_data.get("results", []):
+                                        for ans in sr.get("answers", []):
+                                            field = ans.get("field", {})
+                                            field_name = field.get("name", "").lower().strip() if isinstance(field, dict) else ""
+                                            value = str(ans.get("value", "")).strip()
+                                            if not value:
+                                                continue
+                                            if "due date" in field_name:
+                                                parsed_due = parse_due_date(value)
+                                                if parsed_due:
+                                                    update_from_survey["due_date"] = parsed_due.isoformat()
+                                                    update_from_survey["trimester"] = calculate_trimester(parsed_due, date.today())
+                                                    db_due_date = update_from_survey["due_date"]
+                                                    db_trimester = update_from_survey["trimester"]
+                                            elif "clothing size" in field_name:
+                                                norm = normalize_clothing_size(value)
+                                                if norm:
+                                                    update_from_survey["clothing_size"] = norm
+                                                    db_clothing_size = norm
+                                            elif "expecting" in field_name or "whom" in field_name:
+                                                gl = value.lower()
+                                                update_from_survey["baby_gender"] = "boy" if "boy" in gl else ("girl" if "girl" in gl else "unknown")
+                                            elif "second parent" in field_name or "matching apparel" in field_name:
+                                                update_from_survey["wants_daddy_item"] = value.lower() in ("yes", "y", "true", "sure")
+                                    if update_from_survey:
+                                        db.table("customers").update(update_from_survey).eq("id", cust_id).execute()
+                                        logger.info(f"[WEBHOOK REPLAY] Updated CJ customer with survey: {list(update_from_survey.keys())}")
+                                else:
+                                    logger.warning(f"[WEBHOOK REPLAY] Survey API returned {survey_resp.status_code}")
+                        except Exception as e:
+                            logger.warning(f"[WEBHOOK REPLAY] Survey fetch failed (non-fatal): {e}")
+
+                # Decision
+                if cust_id:
+                    if (is_cancelled and not is_prepaid) or is_expired:
+                        db.table("decisions").insert({
+                            "customer_id": cust_id, "kit_id": None, "kit_sku": None,
+                            "decision_type": "skipped",
+                            "reason": f"Subscription {sub_status_str} — no prepaid remaining",
+                            "status": "rejected", "order_id": cj_order_id, "platform": "cratejoy",
+                            "trimester": db_trimester, "ship_date": date.today().isoformat(),
+                        }).execute()
+                        logger.info(f"[WEBHOOK REPLAY] Saved skipped decision for cancelled CJ sub")
+                    elif not db_trimester:
+                        db.table("decisions").insert({
+                            "customer_id": cust_id, "kit_id": None, "kit_sku": None,
+                            "decision_type": "needs-data-entry",
+                            "reason": "Missing quiz data — add due date & size manually, then re-curate",
+                            "status": "pending", "order_id": cj_order_id, "platform": "cratejoy",
+                            "trimester": None, "ship_date": date.today().isoformat(),
+                        }).execute()
+                        logger.info(f"[WEBHOOK REPLAY] Saved needs-data-entry decision for CJ customer")
+                    else:
+                        kit_decision = await assign_kit(cust_id, date.today())
+                        logger.info(f"[WEBHOOK REPLAY] CJ Decision: {kit_decision['decision_type']} — {kit_decision.get('kit_sku', 'none')}")
+                        db.table("decisions").insert({
+                            "customer_id": cust_id,
+                            "kit_id": kit_decision.get("kit_id"),
+                            "kit_sku": kit_decision.get("kit_sku"),
+                            "decision_type": kit_decision["decision_type"],
+                            "reason": kit_decision["reason"],
+                            "status": "pending", "order_id": cj_order_id, "platform": "cratejoy",
+                            "trimester": db_trimester, "ship_date": date.today().isoformat(),
+                        }).execute()
+                        write_decision_to_sheet({
+                            "date": date.today().isoformat(),
+                            "customer_name": f"{first_name or ''} {last_name or ''}".strip(),
+                            "email": email, "platform": "cratejoy", "trimester": db_trimester,
+                            "order_type": event_type, "kit_sku": kit_decision.get("kit_sku", "—"),
+                            "decision_type": kit_decision["decision_type"], "reason": kit_decision["reason"],
+                            "order_id": str(cj_order_id), "due_date": db_due_date or "",
+                            "clothing_size": db_clothing_size or "",
+                        })
+
+            # Mark replay as successful
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            if replay_log_id:
+                db.table("webhook_logs").update({"status": "processed", "processing_time_ms": elapsed_ms}).eq("id", replay_log_id).execute()
+            db.table("webhook_logs").update({"status": "replayed", "error_message": f"Replayed successfully → {replay_log_id}"}).eq("id", webhook_id).execute()
+            await log_activity("webhook", f"Replayed Cratejoy webhook (CJ ID: {cj_order_id})", f"Original: {webhook_id}, Replay: {replay_log_id}", "success")
+            logger.info(f"[WEBHOOK REPLAY] Cratejoy replay complete in {elapsed_ms}ms")
+            return RedirectResponse(f"/webhooks/{replay_log_id}", status_code=303)
+
+        # ═══════════════════════════════════════════════════════
+        # UNKNOWN SOURCE
+        # ═══════════════════════════════════════════════════════
+        else:
+            logger.error(f"[WEBHOOK REPLAY] Unknown source '{source}' — cannot replay")
+            if replay_log_id:
+                db.table("webhook_logs").update({"status": "failed", "error_message": f"Unknown source: {source}"}).eq("id", replay_log_id).execute()
+            return RedirectResponse(f"/webhooks/{webhook_id}", status_code=303)
+
+    except Exception as e:
+        logger.error(f"[WEBHOOK REPLAY] Error replaying webhook {webhook_id}: {e}", exc_info=True)
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        if replay_log_id:
+            db.table("webhook_logs").update({"status": "failed", "error_message": str(e), "processing_time_ms": elapsed_ms}).eq("id", replay_log_id).execute()
+        await log_activity("webhook", f"Webhook replay failed: {e}", f"Original: {webhook_id}", "error")
+        return RedirectResponse(f"/webhooks/{webhook_id}", status_code=303)
+
+
 @app.get("/customers", response_class=HTMLResponse)
 async def customers_page(request: Request):
     """View all customers."""
