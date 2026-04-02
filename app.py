@@ -823,6 +823,48 @@ async def cratejoy_order_webhook(request: Request):
 
     logger.info(f"[CRATEJOY WEBHOOK] Detected event_type={event_type} from payload_type='{payload_type}'")
 
+    # ─── Check subscription status (cancelled, expired, etc.) ───
+    sub_status_raw = payload.get("status", "") if isinstance(payload, dict) else ""
+    # Cratejoy sends status as string or int: 2=Active, 3=Cancelled, 4=Suspended, 5=Expired
+    sub_status_map = {1: "unpaid", 2: "active", 3: "cancelled", 4: "suspended", 5: "expired",
+                      6: "past_due", 7: "pending_renewal", 8: "renewing"}
+    if isinstance(sub_status_raw, int):
+        sub_status_str = sub_status_map.get(sub_status_raw, str(sub_status_raw))
+    else:
+        sub_status_str = str(sub_status_raw).lower().strip()
+
+    logger.info(f"[CRATEJOY WEBHOOK] Subscription status: '{sub_status_str}' (raw: '{sub_status_raw}')")
+
+    # Determine if this is a cancelled subscription and whether prepaid boxes remain
+    is_cancelled = sub_status_str == "cancelled"
+    is_expired = sub_status_str == "expired"
+    is_prepaid = False
+    prepaid_end_date = None
+
+    if is_cancelled or is_expired:
+        # Check if prepaid subscription with remaining boxes
+        term_data = payload.get("term", {}) if isinstance(payload, dict) else {}
+        num_cycles = term_data.get("num_cycles", 1) if isinstance(term_data, dict) else 1
+        end_date_str = payload.get("end_date", "") if isinstance(payload, dict) else ""
+
+        if num_cycles and num_cycles > 1 and end_date_str:
+            try:
+                # Parse end_date (e.g. "2026-05-01T07:54:00Z")
+                end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00")).date()
+                if end_dt > date.today():
+                    is_prepaid = True
+                    prepaid_end_date = end_dt
+                    logger.info(f"[CRATEJOY WEBHOOK] Cancelled BUT prepaid — end_date {end_dt} is in the future ({num_cycles} cycles). Will set cancelled-prepaid.")
+                else:
+                    logger.info(f"[CRATEJOY WEBHOOK] Cancelled AND expired — end_date {end_dt} is in the past. Will set cancelled-expired.")
+            except Exception as e:
+                logger.warning(f"[CRATEJOY WEBHOOK] Could not parse end_date '{end_date_str}': {e}")
+
+        if is_cancelled and not is_prepaid:
+            logger.info(f"[CRATEJOY WEBHOOK] Subscription is cancelled (no prepaid remaining). Will skip decision engine.")
+        if is_expired:
+            logger.info(f"[CRATEJOY WEBHOOK] Subscription is expired. Will skip decision engine.")
+
     # Use a combo key for idempotency 
     cj_order_id = ""
     if isinstance(payload, dict):
@@ -945,65 +987,265 @@ async def cratejoy_order_webhook(request: Request):
             if trimester:
                 customer_record["trimester"] = trimester
 
+            # ─── Set subscription status based on Cratejoy status ───
+            if is_cancelled and is_prepaid:
+                customer_record["subscription_status"] = "cancelled-prepaid"
+                logger.info(f"[CRATEJOY WEBHOOK] Setting status: cancelled-prepaid (prepaid until {prepaid_end_date})")
+            elif is_cancelled or is_expired:
+                customer_record["subscription_status"] = "cancelled-expired"
+                logger.info(f"[CRATEJOY WEBHOOK] Setting status: cancelled-expired")
+            elif sub_status_str in ("suspended", "paused"):
+                customer_record["subscription_status"] = "paused"
+                logger.info(f"[CRATEJOY WEBHOOK] Setting status: paused")
+
             if existing_customer.data:
                 cust_id = existing_customer.data[0]["id"]
-                if existing_customer.data[0].get("shopify_customer_id"):
+                existing_cust = existing_customer.data[0]
+                if existing_cust.get("shopify_customer_id"):
                     customer_record["platform"] = "both"
                 else:
                     customer_record["platform"] = "cratejoy"
+
+                # IMPORTANT: Don't overwrite existing data with empty values from Cratejoy
+                # If existing customer already has due_date/trimester/clothing_size from Shopify, preserve it
+                if not due_date and existing_cust.get("due_date"):
+                    logger.info(f"[CRATEJOY WEBHOOK] Preserving existing due_date: {existing_cust['due_date']} (Cratejoy has no quiz data)")
+                    # Don't add due_date to update — keep existing
+                if not trimester and existing_cust.get("trimester"):
+                    logger.info(f"[CRATEJOY WEBHOOK] Preserving existing trimester: T{existing_cust['trimester']} (from Shopify/DB)")
+                # Don't overwrite subscription_status if existing is active and CJ is sending a renewal
+                if not is_cancelled and not is_expired and sub_status_str not in ("suspended", "paused"):
+                    if existing_cust.get("subscription_status") == "active":
+                        customer_record.pop("subscription_status", None)  # Keep existing active status
+
                 db.table("customers").update(customer_record).eq("id", cust_id).execute()
                 logger.info(f"[CRATEJOY WEBHOOK] Updated existing customer: {cust_id}")
             else:
                 customer_record["platform"] = "cratejoy"
-                customer_record["subscription_status"] = "active"
+                if "subscription_status" not in customer_record:
+                    customer_record["subscription_status"] = "active"
                 result = db.table("customers").insert(customer_record).execute()
                 cust_id = result.data[0]["id"] if result.data else None
                 logger.info(f"[CRATEJOY WEBHOOK] Created new customer: {cust_id}")
 
-            # ─── Run Decision Engine ───
+            # ─── Re-read customer from DB to get merged data (Shopify + Cratejoy) ───
             if cust_id:
-                kit_decision = await assign_kit(cust_id, date.today())
-                logger.info(f"[CRATEJOY WEBHOOK] Decision engine result: {kit_decision['decision_type']} — {kit_decision.get('kit_sku', 'none')}")
+                merged_cust = db.table("customers").select("*").eq("id", cust_id).single().execute()
+                merged_data = merged_cust.data if merged_cust.data else {}
+                db_trimester = merged_data.get("trimester")
+                db_due_date = merged_data.get("due_date")
+                db_clothing_size = merged_data.get("clothing_size", "")
+                db_status = merged_data.get("subscription_status", "active")
 
-                decision = {
-                    "customer_id": cust_id,
-                    "kit_id": kit_decision.get("kit_id"),
-                    "kit_sku": kit_decision.get("kit_sku"),
-                    "decision_type": kit_decision["decision_type"],
-                    "reason": kit_decision["reason"],
-                    "status": "pending",
-                    "order_id": cj_order_id,
-                    "platform": "cratejoy",
-                    "trimester": trimester,
-                    "ship_date": date.today().isoformat(),
-                }
-                db.table("decisions").insert(decision).execute()
-                logger.info(f"[CRATEJOY WEBHOOK] Saved decision: {kit_decision['decision_type']}, kit: {kit_decision.get('kit_sku', 'none')}")
+                logger.info(f"[CRATEJOY WEBHOOK] Merged customer data — trimester: {f'T{db_trimester}' if db_trimester else 'MISSING'}, "
+                            f"due_date: {db_due_date or 'MISSING'}, size: {db_clothing_size or 'MISSING'}, status: {db_status}")
 
-                # ─── Write to Google Sheets ───
-                # Cratejoy don't always have due_date/clothing_size — pass what we have
-                cj_due_str = due_date.isoformat() if due_date else ""
-                cj_size_str = ""
-                if cust_id:
+            # ─── Fetch Cratejoy Survey Results (quiz data: due date, size, gender, daddy) ───
+            if cust_id and CRATEJOY_CLIENT_ID and CRATEJOY_CLIENT_SECRET:
+                cj_sub_id = payload.get("id", "")
+                if cj_sub_id:
+                    logger.info(f"[CRATEJOY WEBHOOK] Fetching survey results for subscription {cj_sub_id}")
                     try:
-                        cust_detail = db.table("customers").select("clothing_size").eq("id", cust_id).single().execute()
-                        cj_size_str = cust_detail.data.get("clothing_size", "") or "" if cust_detail.data else ""
-                    except Exception:
-                        pass
-                write_decision_to_sheet({
-                    "date": date.today().isoformat(),
-                    "customer_name": f"{first_name or ''} {last_name or ''}".strip(),
-                    "email": email,
-                    "platform": "cratejoy",
-                    "trimester": trimester,
-                    "order_type": event_type,
-                    "kit_sku": kit_decision.get("kit_sku", "—"),
-                    "decision_type": kit_decision["decision_type"],
-                    "reason": kit_decision["reason"],
-                    "order_id": str(cj_order_id),
-                    "due_date": cj_due_str,
-                    "clothing_size": cj_size_str,
-                })
+                        auth_str = base64.b64encode(f"{CRATEJOY_CLIENT_ID}:{CRATEJOY_CLIENT_SECRET}".encode()).decode()
+                        cj_headers = {"Authorization": f"Basic {auth_str}", "Accept": "application/json"}
+
+                        survey_due_date = None
+                        survey_size = None
+                        survey_gender = None
+                        survey_daddy = None
+                        survey_past_subscriber = None
+
+                        async with httpx.AsyncClient(timeout=15.0) as client:
+                            # Merchant API: GET /v1/product_survey_results/?subscription_id={id}
+                            survey_url = f"https://api.cratejoy.com/v1/product_survey_results/?subscription_id={cj_sub_id}"
+                            logger.info(f"[CRATEJOY WEBHOOK] Calling survey API: {survey_url}")
+                            survey_resp = await client.get(survey_url, headers=cj_headers)
+
+                            if survey_resp.status_code == 200:
+                                survey_data = survey_resp.json()
+                                logger.info(f"[CRATEJOY WEBHOOK] Survey API response (count={survey_data.get('count', '?')}): {json.dumps(survey_data)[:1000]}")
+
+                                survey_results = survey_data.get("results", [])
+                                for sr in survey_results:
+                                    answers = sr.get("answers", [])
+                                    for ans in answers:
+                                        field_name = ""
+                                        field = ans.get("field", {})
+                                        if isinstance(field, dict):
+                                            field_name = field.get("name", "").lower().strip()
+                                        value = str(ans.get("value", "")).strip()
+
+                                        if not value:
+                                            continue
+
+                                        logger.info(f"[CRATEJOY WEBHOOK] Survey answer: '{field_name}' = '{value}'")
+
+                                        # Match OBB's 5 survey questions by keyword matching
+                                        if "due date" in field_name:
+                                            survey_due_date = value
+                                            logger.info(f"[CRATEJOY WEBHOOK] → Due date: {value}")
+                                        elif "clothing size" in field_name:
+                                            survey_size = value
+                                            logger.info(f"[CRATEJOY WEBHOOK] → Clothing size: {value}")
+                                        elif "expecting" in field_name or "whom" in field_name:
+                                            survey_gender = value
+                                            logger.info(f"[CRATEJOY WEBHOOK] → Expecting: {value}")
+                                        elif "second parent" in field_name or "matching apparel" in field_name:
+                                            survey_daddy = value
+                                            logger.info(f"[CRATEJOY WEBHOOK] → Daddy item: {value}")
+                                        elif "received" in field_name and "oh baby box" in field_name:
+                                            survey_past_subscriber = value
+                                            logger.info(f"[CRATEJOY WEBHOOK] → Past subscriber: {value}")
+                            else:
+                                logger.warning(f"[CRATEJOY WEBHOOK] Survey API returned {survey_resp.status_code}: {survey_resp.text[:300]}")
+
+                        # Apply survey data to customer
+                        update_from_survey = {}
+
+                        if survey_due_date:
+                            parsed_due = parse_due_date(survey_due_date)
+                            if parsed_due:
+                                update_from_survey["due_date"] = parsed_due.isoformat()
+                                update_from_survey["trimester"] = calculate_trimester(parsed_due, date.today())
+                                db_due_date = parsed_due.isoformat()
+                                db_trimester = update_from_survey["trimester"]
+                                logger.info(f"[CRATEJOY WEBHOOK] Survey → due_date={db_due_date}, T{db_trimester}")
+
+                        if survey_size:
+                            norm_size = normalize_clothing_size(survey_size)
+                            if norm_size:
+                                update_from_survey["clothing_size"] = norm_size
+                                db_clothing_size = norm_size
+                                logger.info(f"[CRATEJOY WEBHOOK] Survey → clothing_size={norm_size}")
+
+                        if survey_gender:
+                            # Normalize: "Baby Boy" → "boy", "Baby Girl" → "girl", etc.
+                            gender_lower = survey_gender.lower().strip()
+                            if "boy" in gender_lower:
+                                update_from_survey["baby_gender"] = "boy"
+                            elif "girl" in gender_lower:
+                                update_from_survey["baby_gender"] = "girl"
+                            else:
+                                update_from_survey["baby_gender"] = "unknown"
+                            logger.info(f"[CRATEJOY WEBHOOK] Survey → baby_gender={update_from_survey['baby_gender']}")
+
+                        if survey_daddy:
+                            daddy_lower = survey_daddy.lower().strip()
+                            update_from_survey["wants_daddy_item"] = daddy_lower in ("yes", "y", "true", "sure", "ok", "okay")
+                            logger.info(f"[CRATEJOY WEBHOOK] Survey → wants_daddy_item={update_from_survey['wants_daddy_item']}")
+
+                        if update_from_survey:
+                            db.table("customers").update(update_from_survey).eq("id", cust_id).execute()
+                            logger.info(f"[CRATEJOY WEBHOOK] Updated customer {cust_id} with survey data: {list(update_from_survey.keys())}")
+                        else:
+                            logger.info(f"[CRATEJOY WEBHOOK] No survey data found to update customer")
+
+                    except Exception as e:
+                        logger.warning(f"[CRATEJOY WEBHOOK] Survey enrichment failed (non-fatal): {e}", exc_info=True)
+
+            # ─── Decide: run decision engine or flag as needs-data-entry ───
+            if cust_id:
+                # Skip decision engine for truly cancelled/expired subscriptions (no prepaid remaining)
+                if (is_cancelled and not is_prepaid) or is_expired:
+                    logger.info(f"[CRATEJOY WEBHOOK] Skipping decision engine — subscription is {sub_status_str} (no prepaid remaining)")
+                    cancel_decision = {
+                        "customer_id": cust_id,
+                        "kit_id": None,
+                        "kit_sku": None,
+                        "decision_type": "skipped",
+                        "reason": f"Subscription {sub_status_str} on Cratejoy (no prepaid boxes remaining). No kit assignment needed.",
+                        "status": "rejected",
+                        "order_id": cj_order_id,
+                        "platform": "cratejoy",
+                        "trimester": db_trimester if db_due_date else None,
+                        "ship_date": date.today().isoformat(),
+                    }
+                    db.table("decisions").insert(cancel_decision).execute()
+                    logger.info(f"[CRATEJOY WEBHOOK] Saved skipped decision for cancelled/expired subscription")
+
+                    write_decision_to_sheet({
+                        "date": date.today().isoformat(),
+                        "customer_name": f"{first_name or ''} {last_name or ''}".strip(),
+                        "email": email,
+                        "platform": "cratejoy",
+                        "trimester": db_trimester if db_due_date else None,
+                        "order_type": event_type,
+                        "kit_sku": "—",
+                        "decision_type": "skipped",
+                        "reason": f"Subscription {sub_status_str} — no prepaid remaining",
+                        "order_id": str(cj_order_id),
+                        "due_date": db_due_date or "",
+                        "clothing_size": db_clothing_size or "",
+                    })
+
+                # If customer STILL has no trimester → can't assign a kit, flag for manual data entry
+                elif not db_trimester:
+                    logger.warning(f"[CRATEJOY WEBHOOK] Customer {email} has NO trimester after all enrichment. Flagging as needs-data-entry.")
+                    needs_data_decision = {
+                        "customer_id": cust_id,
+                        "kit_id": None,
+                        "kit_sku": None,
+                        "decision_type": "needs-data-entry",
+                        "reason": "Cratejoy customer missing quiz data (due date, size). Cratejoy does not capture this data — please edit the customer to add due date and clothing size, then click Re-curate.",
+                        "status": "pending",
+                        "order_id": cj_order_id,
+                        "platform": "cratejoy",
+                        "trimester": None,
+                        "ship_date": date.today().isoformat(),
+                    }
+                    db.table("decisions").insert(needs_data_decision).execute()
+                    logger.info(f"[CRATEJOY WEBHOOK] Saved needs-data-entry decision — waiting for manual data entry")
+
+                    write_decision_to_sheet({
+                        "date": date.today().isoformat(),
+                        "customer_name": f"{first_name or ''} {last_name or ''}".strip(),
+                        "email": email,
+                        "platform": "cratejoy",
+                        "trimester": None,
+                        "order_type": event_type,
+                        "kit_sku": "—",
+                        "decision_type": "needs-data-entry",
+                        "reason": "Missing quiz data — add due date & size manually, then re-curate",
+                        "order_id": str(cj_order_id),
+                        "due_date": "",
+                        "clothing_size": "",
+                    })
+
+                # Customer has trimester → run decision engine normally
+                else:
+                    kit_decision = await assign_kit(cust_id, date.today())
+                    logger.info(f"[CRATEJOY WEBHOOK] Decision engine result: {kit_decision['decision_type']} — {kit_decision.get('kit_sku', 'none')}")
+
+                    decision = {
+                        "customer_id": cust_id,
+                        "kit_id": kit_decision.get("kit_id"),
+                        "kit_sku": kit_decision.get("kit_sku"),
+                        "decision_type": kit_decision["decision_type"],
+                        "reason": kit_decision["reason"],
+                        "status": "pending",
+                        "order_id": cj_order_id,
+                        "platform": "cratejoy",
+                        "trimester": db_trimester,
+                        "ship_date": date.today().isoformat(),
+                    }
+                    db.table("decisions").insert(decision).execute()
+                    logger.info(f"[CRATEJOY WEBHOOK] Saved decision: {kit_decision['decision_type']}, kit: {kit_decision.get('kit_sku', 'none')}")
+
+                    # ─── Write to Google Sheets ───
+                    write_decision_to_sheet({
+                        "date": date.today().isoformat(),
+                        "customer_name": f"{first_name or ''} {last_name or ''}".strip(),
+                        "email": email,
+                        "platform": "cratejoy",
+                        "trimester": db_trimester,
+                        "order_type": event_type,
+                        "kit_sku": kit_decision.get("kit_sku", "—"),
+                        "decision_type": kit_decision["decision_type"],
+                        "reason": kit_decision["reason"],
+                        "order_id": str(cj_order_id),
+                        "due_date": db_due_date or "",
+                        "clothing_size": db_clothing_size or "",
+                    })
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         if webhook_log_id:

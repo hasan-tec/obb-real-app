@@ -63,6 +63,10 @@
                         <span class="badge badge-yellow">Needs Curation</span>
                         {% elif d.decision_type == 'incomplete-data' %}
                         <span class="badge badge-red">Incomplete</span>
+                        {% elif d.decision_type == 'needs-data-entry' %}
+                        <span class="badge badge-red">Needs Data</span>
+                        {% elif d.decision_type == 'skipped' %}
+                        <span class="badge badge-dim">Skipped</span>
                         {% elif d.decision_type == 'manual-override' %}
                         <span class="badge badge-blue">Override</span>
                         {% endif %}

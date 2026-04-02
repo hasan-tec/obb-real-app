@@ -17,6 +17,35 @@
 <div class="content">
     {% if customer %}
 
+    <!-- Warning banner for missing data (Cratejoy customers without quiz data) -->
+    {% if not customer.due_date or not customer.trimester %}
+    <div style="background: var(--yellow, #f59e0b); color: #000; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; display: flex; align-items: center; gap: 10px;">
+        <span style="font-size: 20px;">⚠️</span>
+        <div>
+            <strong>Missing Quiz Data</strong> — This customer has no due date
+            {% if not customer.clothing_size %} or clothing size{% endif %}.
+            {% if customer.platform == 'cratejoy' %}Cratejoy does not capture quiz data (due date, size, gender).{% endif %}
+            <strong>Click "✏️ Edit" above to add the missing data, then click "🔄 Re-curate"</strong> to assign a kit.
+        </div>
+    </div>
+    {% endif %}
+
+    {% if customer.subscription_status == 'cancelled-expired' %}
+    <div style="background: var(--red, #ef4444); color: #fff; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; display: flex; align-items: center; gap: 10px;">
+        <span style="font-size: 20px;">🚫</span>
+        <div>
+            <strong>Subscription Cancelled & Expired</strong> — No more boxes to ship.
+        </div>
+    </div>
+    {% elif customer.subscription_status == 'cancelled-prepaid' %}
+    <div style="background: var(--blue, #3b82f6); color: #fff; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; display: flex; align-items: center; gap: 10px;">
+        <span style="font-size: 20px;">📦</span>
+        <div>
+            <strong>Cancelled but Prepaid</strong> — Customer cancelled but has prepaid boxes remaining. Continue shipping until plan expires.
+        </div>
+    </div>
+    {% endif %}
+
     <!-- Edit Customer Form (hidden by default) -->
     <div id="editCustomerForm" class="card" style="display: none; margin-bottom: 20px;">
         <div class="card-header">
@@ -164,7 +193,16 @@
                     {% for d in decisions %}
                     <tr>
                         <td>{{ d.created_at[:10] }}</td>
-                        <td><span class="badge badge-purple">{{ d.decision_type }}</span></td>
+                        <td>
+                            {% if d.decision_type == 'auto' %}<span class="badge badge-green">Auto</span>
+                            {% elif d.decision_type == 'needs-curation' %}<span class="badge badge-yellow">Needs Curation</span>
+                            {% elif d.decision_type == 'incomplete-data' %}<span class="badge badge-red">Incomplete</span>
+                            {% elif d.decision_type == 'needs-data-entry' %}<span class="badge badge-red">Needs Data</span>
+                            {% elif d.decision_type == 'skipped' %}<span class="badge badge-dim">Skipped</span>
+                            {% elif d.decision_type == 'manual-override' %}<span class="badge badge-blue">Override</span>
+                            {% else %}<span class="badge badge-purple">{{ d.decision_type }}</span>
+                            {% endif %}
+                        </td>
                         <td>{{ d.kit_sku or '—' }}</td>
                         <td>
                             {% if d.status == 'pending' %}<span class="badge badge-yellow">{{ d.status }}</span>
