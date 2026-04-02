@@ -1628,7 +1628,16 @@ async def replay_webhook(webhook_id: str):
             elapsed_ms = int((time.time() - start_time) * 1000)
             if replay_log_id:
                 db.table("webhook_logs").update({"status": "processed", "processing_time_ms": elapsed_ms}).eq("id", replay_log_id).execute()
-            db.table("webhook_logs").update({"status": "replayed", "error_message": f"Replayed successfully → {replay_log_id}"}).eq("id", webhook_id).execute()
+            # Mark original as replayed (isolated try/except — don't crash if CHECK constraint hasn't been updated yet)
+            try:
+                db.table("webhook_logs").update({"status": "replayed", "error_message": f"Replayed successfully → {replay_log_id}"}).eq("id", webhook_id).execute()
+            except Exception as e:
+                logger.warning(f"[WEBHOOK REPLAY] Could not mark original as 'replayed' (CHECK constraint?): {e}")
+                # Fallback: mark as processed with a note
+                try:
+                    db.table("webhook_logs").update({"error_message": f"Replayed → {replay_log_id}"}).eq("id", webhook_id).execute()
+                except Exception:
+                    pass
             await log_activity("webhook", f"Replayed Shopify webhook (order #{shopify_order_id})", f"Original: {webhook_id}, Replay: {replay_log_id}", "success")
             logger.info(f"[WEBHOOK REPLAY] Shopify replay complete in {elapsed_ms}ms")
             return RedirectResponse(f"/webhooks/{replay_log_id}", status_code=303)
@@ -1873,7 +1882,15 @@ async def replay_webhook(webhook_id: str):
             elapsed_ms = int((time.time() - start_time) * 1000)
             if replay_log_id:
                 db.table("webhook_logs").update({"status": "processed", "processing_time_ms": elapsed_ms}).eq("id", replay_log_id).execute()
-            db.table("webhook_logs").update({"status": "replayed", "error_message": f"Replayed successfully → {replay_log_id}"}).eq("id", webhook_id).execute()
+            # Mark original as replayed (isolated try/except — don't crash if CHECK constraint hasn't been updated yet)
+            try:
+                db.table("webhook_logs").update({"status": "replayed", "error_message": f"Replayed successfully → {replay_log_id}"}).eq("id", webhook_id).execute()
+            except Exception as e:
+                logger.warning(f"[WEBHOOK REPLAY] Could not mark original as 'replayed' (CHECK constraint?): {e}")
+                try:
+                    db.table("webhook_logs").update({"error_message": f"Replayed → {replay_log_id}"}).eq("id", webhook_id).execute()
+                except Exception:
+                    pass
             await log_activity("webhook", f"Replayed Cratejoy webhook (CJ ID: {cj_order_id})", f"Original: {webhook_id}, Replay: {replay_log_id}", "success")
             logger.info(f"[WEBHOOK REPLAY] Cratejoy replay complete in {elapsed_ms}ms")
             return RedirectResponse(f"/webhooks/{replay_log_id}", status_code=303)
