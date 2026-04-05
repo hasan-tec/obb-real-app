@@ -3123,7 +3123,7 @@ async def add_item_to_kit(
             return RedirectResponse(f"/kits/{kit_id}?msg={quote('Please select an item')}&msg_type=error", status_code=303)
 
         # Check if already linked
-        existing = db.table("kit_items").select("id").eq("kit_id", kit_id).eq("item_id", item_id).execute()
+        existing = db.table("kit_items").select("item_id").eq("kit_id", kit_id).eq("item_id", item_id).execute()
         if existing.data:
             logger.info(f"[KIT-ITEM] Item {item_id} already linked to kit {kit_id}")
             return RedirectResponse(f"/kits/{kit_id}?msg={quote('Item already in this kit')}&msg_type=error", status_code=303)
