@@ -283,7 +283,7 @@
                             {% if s.shipment_items %}
                             <div style="display:flex; flex-wrap:wrap; gap:4px;">
                                 {% for si in s.shipment_items %}
-                                {% set item = si.items %}
+                                {% set item = si['items'] %}
                                 <span class="badge badge-dim">{{ item.sku if item and item.sku else (item.name if item else si.item_id) }}</span>
                                 {% endfor %}
                             </div>
