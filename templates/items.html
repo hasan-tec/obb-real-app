@@ -8,6 +8,12 @@
     </div>
 </div>
 <div class="content">
+    {% if msg %}
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="margin-bottom: 16px;">
+        {{ msg }}
+    </div>
+    {% endif %}
+
     {% if error %}
     <div class="alert alert-error">⚠️ {{ error }}</div>
     {% endif %}
@@ -61,6 +67,7 @@
                     <th>Category</th>
                     <th>Cost</th>
                     <th>Source</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
@@ -76,6 +83,12 @@
                         {% else %}
                         <span class="badge badge-dim">OBB</span>
                         {% endif %}
+                    </td>
+                    <td>
+                        <form method="POST" action="/items/{{ i.id }}/remove" style="display:inline;"
+                            onsubmit="return confirm('Remove this item? If it exists in shipment history, deletion will be blocked.');">
+                            <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                        </form>
                     </td>
                 </tr>
                 {% endfor %}

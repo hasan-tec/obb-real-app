@@ -12,10 +12,20 @@
         <button class="btn btn-sm btn-secondary"
             onclick="document.getElementById('editCustomerForm').style.display = document.getElementById('editCustomerForm').style.display === 'none' ? 'block' : 'none'">✏️
             Edit</button>
+        <form method="POST" action="/customers/{{ customer.id }}/remove" style="display:inline;"
+            onsubmit="return confirm('Delete this customer and all their decisions + shipment history? This cannot be undone.');">
+            <button type="submit" class="btn btn-sm btn-danger">🗑 Delete</button>
+        </form>
     </div>
 </div>
 <div class="content">
     {% if customer %}
+
+    {% if msg %}
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="margin-bottom: 16px;">
+        {{ msg }}
+    </div>
+    {% endif %}
 
     <!-- Warning banner for missing data (Cratejoy customers without quiz data) -->
     {% if not customer.due_date or not customer.trimester %}
@@ -261,6 +271,7 @@
                         <th>Items</th>
                         <th>Trimester</th>
                         <th>Platform</th>
+                        <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -273,15 +284,80 @@
                             <div style="display:flex; flex-wrap:wrap; gap:4px;">
                                 {% for si in s.shipment_items %}
                                 {% set item = si.items %}
-                                <span class="badge badge-dim">{{ item.name if item else si.item_id }}</span>
+                                <span class="badge badge-dim">{{ item.sku if item and item.sku else (item.name if item else si.item_id) }}</span>
                                 {% endfor %}
                             </div>
                             {% else %}
-                            <span style="color: var(--yellow); font-size: 12px;">No items recorded</span>
+                            <span style="color: var(--yellow); font-size: 12px;">No items recorded. Edit shipment and add item SKUs.</span>
                             {% endif %}
                         </td>
                         <td>{% if s.trimester_at_ship %}T{{ s.trimester_at_ship }}{% else %}—{% endif %}</td>
                         <td>{{ s.platform or '—' }}</td>
+                        <td style="white-space: nowrap;">
+                            <button type="button" class="btn btn-sm btn-secondary"
+                                onclick="toggleShipmentEditor('{{ s.id }}')">Edit</button>
+                            <form method="POST" action="/customers/{{ customer.id }}/shipments/{{ s.id }}/remove"
+                                style="display:inline;"
+                                onsubmit="return confirm('Remove this shipment from customer history?');">
+                                <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                            </form>
+                        </td>
+                    </tr>
+                    <tr id="shipment-editor-{{ s.id }}" style="display:none; background: rgba(255,255,255,0.02);">
+                        <td colspan="6">
+                            <form method="POST" action="/customers/{{ customer.id }}/shipments/{{ s.id }}/edit"
+                                style="padding: 12px 0;">
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Kit SKU</label>
+                                        <input type="text" name="kit_sku" class="form-control" value="{{ s.kit_sku or '' }}" required>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Ship Date</label>
+                                        <input type="date" name="ship_date_str" class="form-control" value="{{ s.ship_date or '' }}">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Trimester</label>
+                                        <select name="trimester_at_ship" class="form-control">
+                                            <option value="0" {% if not s.trimester_at_ship %}selected{% endif %}>— Unknown —</option>
+                                            <option value="1" {% if s.trimester_at_ship == 1 %}selected{% endif %}>T1</option>
+                                            <option value="2" {% if s.trimester_at_ship == 2 %}selected{% endif %}>T2</option>
+                                            <option value="3" {% if s.trimester_at_ship == 3 %}selected{% endif %}>T3</option>
+                                            <option value="4" {% if s.trimester_at_ship == 4 %}selected{% endif %}>T4</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Platform</label>
+                                        <select name="platform" class="form-control">
+                                            <option value="shopify" {% if s.platform == 'shopify' %}selected{% endif %}>Shopify</option>
+                                            <option value="cratejoy" {% if s.platform == 'cratejoy' %}selected{% endif %}>Cratejoy</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Order ID</label>
+                                        <input type="text" name="order_id" class="form-control" value="{{ s.order_id or '' }}">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Notes</label>
+                                        <input type="text" name="notes" class="form-control" value="{{ s.notes or '' }}">
+                                    </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group" style="flex: 1 1 auto;">
+                                        <label>Items in Shipment</label>
+                                        <textarea name="item_refs" class="form-control" rows="3"
+                                            placeholder="Comma or newline separated item SKUs / exact names">{{ s.shipment_item_text or '' }}</textarea>
+                                    </div>
+                                </div>
+                                <div style="display:flex; gap:8px; margin-top: 8px;">
+                                    <button type="submit" class="btn btn-sm btn-primary">Save Shipment</button>
+                                    <button type="button" class="btn btn-sm btn-secondary"
+                                        onclick="toggleShipmentEditor('{{ s.id }}')">Cancel</button>
+                                </div>
+                            </form>
+                        </td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -379,4 +455,11 @@
     </div>
     {% endif %}
 </div>
+<script>
+    function toggleShipmentEditor(shipmentId) {
+        const row = document.getElementById(`shipment-editor-${shipmentId}`);
+        if (!row) return;
+        row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+    }
+</script>
 {% endblock %}

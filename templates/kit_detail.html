@@ -12,15 +12,17 @@
         <button class="btn btn-sm btn-secondary"
             onclick="document.getElementById('editKitForm').style.display = document.getElementById('editKitForm').style.display === 'none' ? 'block' : 'none'">✏️
             Edit Kit</button>
+        <form method="POST" action="/kits/{{ kit.id }}/remove" style="display:inline;"
+            onsubmit="return confirm('Remove this kit? Used kits cannot be deleted.');">
+            <button type="submit" class="btn btn-sm btn-danger">🗑 Delete Kit</button>
+        </form>
     </div>
 </div>
 <div class="content">
     {% if msg %}
-    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="
-        padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 13px;
-        {% if msg_type == 'error' %}background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid var(--red);
-        {% else %}background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid var(--green);{% endif %}
-    ">{{ msg }}</div>
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="margin-bottom: 16px;">
+        {{ msg }}
+    </div>
     {% endif %}
 
     <!-- Edit Kit Form (hidden by default) -->

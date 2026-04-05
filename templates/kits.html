@@ -8,6 +8,12 @@
     </div>
 </div>
 <div class="content">
+    {% if msg %}
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="margin-bottom: 16px;">
+        {{ msg }}
+    </div>
+    {% endif %}
+
     {% if error %}
     <div class="alert alert-error">⚠️ {{ error }}</div>
     {% endif %}
@@ -119,6 +125,7 @@
                     <th>Quantity</th>
                     <th>Age Rank</th>
                     <th>Cost</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
@@ -163,6 +170,13 @@
                     </td>
                     <td>{{ k.age_rank }}</td>
                     <td>{% if k.cost_per_kit %}${{ "%.2f" | format(k.cost_per_kit) }}{% else %}—{% endif %}</td>
+                    <td style="white-space: nowrap;">
+                        <a href="/kits/{{ k.id }}" class="btn btn-sm btn-secondary">View</a>
+                        <form method="POST" action="/kits/{{ k.id }}/remove" style="display:inline;"
+                            onsubmit="return confirm('Remove this kit? Used kits cannot be deleted.');">
+                            <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                        </form>
+                    </td>
                 </tr>
                 {% endfor %}
             </tbody>

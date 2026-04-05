@@ -14,6 +14,7 @@ import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -495,6 +496,11 @@ def load_customer_shipments_with_items(customer_id: str) -> list[dict]:
         shipment_items = db.table("shipment_items").select("item_id, items(*)").eq("shipment_id", shipment["id"]).execute()
         shipment_row = dict(shipment)
         shipment_row["shipment_items"] = shipment_items.data or []
+        shipment_row["shipment_item_text"] = ", ".join(
+            (si.get("items") or {}).get("sku") or (si.get("items") or {}).get("name") or si.get("item_id") or ""
+            for si in shipment_row["shipment_items"]
+            if (si.get("items") or {}).get("sku") or (si.get("items") or {}).get("name") or si.get("item_id")
+        )
         enriched_shipments.append(shipment_row)
 
     logger.info(f"[CUSTOMER DETAIL] Loaded {len(enriched_shipments)} shipment(s) with item history for customer {customer_id}")
@@ -2122,9 +2128,13 @@ async def customers_page(request: Request):
     try:
         db = get_supabase()
         custs = db.table("customers").select("*").order("created_at", desc=True).limit(100).execute()
+        msg = request.query_params.get("msg", "")
+        msg_type = request.query_params.get("msg_type", "success")
         return templates.TemplateResponse("customers.html", {
             "request": request,
             "customers": custs.data or [],
+            "msg": msg,
+            "msg_type": msg_type,
             "page": "customers",
         })
     except Exception as e:
@@ -2133,6 +2143,8 @@ async def customers_page(request: Request):
             "request": request,
             "customers": [],
             "error": str(e),
+            "msg": "",
+            "msg_type": "error",
             "page": "customers",
         })
 
@@ -2145,6 +2157,8 @@ async def customer_detail(request: Request, customer_id: str):
         cust = db.table("customers").select("*").eq("id", customer_id).single().execute()
         decisions = db.table("decisions").select("*").eq("customer_id", customer_id).order("created_at", desc=True).execute()
         shipments = load_customer_shipments_with_items(customer_id)
+        msg = request.query_params.get("msg", "")
+        msg_type = request.query_params.get("msg_type", "success")
 
         # Get all kits for the shipment form dropdown
         kits_list = db.table("kits").select("id, sku, trimester, is_welcome_kit").order("sku").execute()
@@ -2155,6 +2169,8 @@ async def customer_detail(request: Request, customer_id: str):
             "decisions": decisions.data or [],
             "shipments": shipments,
             "kits": kits_list.data or [],
+            "msg": msg,
+            "msg_type": msg_type,
             "page": "customers",
         })
     except Exception as e:
@@ -2189,6 +2205,8 @@ async def kits_page(request: Request):
     try:
         db = get_supabase()
         kits_data = db.table("kits").select("*").order("trimester").order("age_rank").execute()
+        msg = request.query_params.get("msg", "")
+        msg_type = request.query_params.get("msg_type", "success")
 
         # Get item counts per kit
         kit_item_counts = {}
@@ -2206,6 +2224,8 @@ async def kits_page(request: Request):
             "kits": kits_data.data or [],
             "kit_item_counts": kit_item_counts,
             "all_items": all_items.data or [],
+            "msg": msg,
+            "msg_type": msg_type,
             "page": "kits",
         })
     except Exception as e:
@@ -2216,6 +2236,8 @@ async def kits_page(request: Request):
             "kit_item_counts": {},
             "all_items": [],
             "error": str(e),
+            "msg": "",
+            "msg_type": "error",
             "page": "kits",
         })
 
@@ -2286,9 +2308,13 @@ async def items_page(request: Request):
     try:
         db = get_supabase()
         items_data = db.table("items").select("*").order("name").execute()
+        msg = request.query_params.get("msg", "")
+        msg_type = request.query_params.get("msg_type", "success")
         return templates.TemplateResponse("items.html", {
             "request": request,
             "items": items_data.data or [],
+            "msg": msg,
+            "msg_type": msg_type,
             "page": "items",
         })
     except Exception as e:
@@ -2297,6 +2323,8 @@ async def items_page(request: Request):
             "request": request,
             "items": [],
             "error": str(e),
+            "msg": "",
+            "msg_type": "error",
             "page": "items",
         })
 
@@ -2566,6 +2594,206 @@ async def add_shipment_history(
         logger.error(f"[SHIPMENT ADD] Error: {e}", exc_info=True)
         await log_activity("shipment", f"Failed to add shipment: {e}", "", "error")
     return RedirectResponse(f"/customers/{customer_id}", status_code=303)
+
+
+@app.post("/customers/{customer_id}/shipments/{shipment_id}/edit")
+async def edit_shipment_history(
+    request: Request,
+    customer_id: str,
+    shipment_id: str,
+    kit_sku: str = Form(...),
+    ship_date_str: str = Form(""),
+    trimester_at_ship: int = Form(0),
+    platform: str = Form("shopify"),
+    order_id: str = Form(""),
+    item_refs: str = Form(""),
+    notes: str = Form(""),
+):
+    """Edit a manually recorded shipment and rebuild its item history."""
+    try:
+        db = get_supabase()
+        existing = db.table("shipments").select("id, kit_sku").eq("id", shipment_id).eq("customer_id", customer_id).single().execute()
+        if not existing.data:
+            return RedirectResponse(
+                f"/customers/{customer_id}?msg={quote('Shipment not found')}&msg_type=error",
+                status_code=303,
+            )
+
+        ship_date = parse_due_date(ship_date_str) if ship_date_str.strip() else None
+        kit_sku_clean = kit_sku.strip().upper()
+        kit_id = None
+        kit_result = db.table("kits").select("id").eq("sku", kit_sku_clean).execute()
+        if kit_result.data:
+            kit_id = kit_result.data[0]["id"]
+
+        db.table("shipments").update({
+            "kit_id": kit_id,
+            "kit_sku": kit_sku_clean,
+            "ship_date": ship_date.isoformat() if ship_date else None,
+            "trimester_at_ship": trimester_at_ship if trimester_at_ship > 0 else None,
+            "platform": platform if platform else None,
+            "order_id": order_id.strip() or None,
+            "notes": notes.strip() or None,
+        }).eq("id", shipment_id).eq("customer_id", customer_id).execute()
+
+        db.table("shipment_items").delete().eq("shipment_id", shipment_id).execute()
+        item_count, unresolved_refs = populate_shipment_items(shipment_id, kit_id, item_refs)
+
+        final_notes = notes.strip()
+        if item_count == 0:
+            final_notes = (final_notes + " | WARNING: no item history recorded").strip(" |")
+        db.table("shipments").update({"notes": final_notes or None}).eq("id", shipment_id).execute()
+
+        if unresolved_refs:
+            logger.warning(f"[SHIPMENT EDIT] Unresolved manual item refs for shipment {shipment_id}: {unresolved_refs}")
+
+        logger.info(
+            f"[SHIPMENT EDIT] Updated shipment {shipment_id} for customer {customer_id}: "
+            f"kit={kit_sku_clean}, recorded_items={item_count}"
+        )
+        await log_activity(
+            "shipment",
+            f"Edited shipment {shipment_id[:8]}",
+            f"Kit: {kit_sku_clean}, Items recorded: {item_count}",
+            "success",
+        )
+
+        if unresolved_refs:
+            msg = f"Shipment updated, but some items were not matched: {', '.join(unresolved_refs[:3])}"
+            msg_type = "error"
+        elif item_count == 0:
+            msg = "Shipment updated, but no items were recorded. Duplicate checking will be incomplete."
+            msg_type = "error"
+        else:
+            msg = f"Shipment updated. {item_count} item(s) recorded."
+            msg_type = "success"
+
+        return RedirectResponse(
+            f"/customers/{customer_id}?msg={quote(msg)}&msg_type={msg_type}",
+            status_code=303,
+        )
+    except Exception as e:
+        logger.error(f"[SHIPMENT EDIT] Error: {e}", exc_info=True)
+        await log_activity("shipment", f"Failed to edit shipment: {e}", "", "error")
+        return RedirectResponse(
+            f"/customers/{customer_id}?msg={quote('Failed to edit shipment')}&msg_type=error",
+            status_code=303,
+        )
+
+
+@app.post("/customers/{customer_id}/shipments/{shipment_id}/remove")
+async def remove_shipment_history(request: Request, customer_id: str, shipment_id: str):
+    """Remove a shipment and its recorded shipment_items from customer history."""
+    try:
+        db = get_supabase()
+        shipment = db.table("shipments").select("kit_sku").eq("id", shipment_id).eq("customer_id", customer_id).single().execute()
+        if not shipment.data:
+            return RedirectResponse(
+                f"/customers/{customer_id}?msg={quote('Shipment not found')}&msg_type=error",
+                status_code=303,
+            )
+
+        kit_sku = shipment.data.get("kit_sku") or shipment_id[:8]
+        db.table("shipment_items").delete().eq("shipment_id", shipment_id).execute()
+        db.table("shipments").delete().eq("id", shipment_id).eq("customer_id", customer_id).execute()
+
+        logger.info(f"[SHIPMENT REMOVE] Removed shipment {shipment_id} (kit={kit_sku}) from customer {customer_id}")
+        await log_activity("shipment", f"Removed shipment {shipment_id[:8]}", f"Kit: {kit_sku}", "info")
+        return RedirectResponse(
+            f"/customers/{customer_id}?msg={quote(f'Removed shipment {kit_sku}')}&msg_type=success",
+            status_code=303,
+        )
+    except Exception as e:
+        logger.error(f"[SHIPMENT REMOVE] Error: {e}", exc_info=True)
+        await log_activity("shipment", f"Failed to remove shipment: {e}", "", "error")
+        return RedirectResponse(
+            f"/customers/{customer_id}?msg={quote('Failed to remove shipment')}&msg_type=error",
+            status_code=303,
+        )
+
+
+@app.post("/customers/{customer_id}/remove")
+async def remove_customer(request: Request, customer_id: str):
+    """Delete a customer and all dependent history via DB cascade."""
+    try:
+        db = get_supabase()
+        customer = db.table("customers").select("email, first_name, last_name").eq("id", customer_id).single().execute()
+        if not customer.data:
+            return RedirectResponse(f"/customers?msg={quote('Customer not found')}&msg_type=error", status_code=303)
+
+        customer_name = f"{customer.data.get('first_name', '')} {customer.data.get('last_name', '')}".strip() or customer.data.get("email")
+        db.table("customers").delete().eq("id", customer_id).execute()
+        logger.info(f"[CUSTOMER REMOVE] Deleted customer {customer_id} ({customer_name})")
+        await log_activity("customer", f"Removed customer {customer_name}", customer.data.get("email", ""), "warning")
+        return RedirectResponse(
+            f"/customers?msg={quote(f'Removed customer {customer_name}')}&msg_type=success",
+            status_code=303,
+        )
+    except Exception as e:
+        logger.error(f"[CUSTOMER REMOVE] Error: {e}", exc_info=True)
+        await log_activity("customer", f"Failed to remove customer: {e}", "", "error")
+        return RedirectResponse(f"/customers?msg={quote('Failed to remove customer')}&msg_type=error", status_code=303)
+
+
+@app.post("/items/{item_id}/remove")
+async def remove_item(request: Request, item_id: str):
+    """Delete an item only if it has never been used in shipment history."""
+    try:
+        db = get_supabase()
+        item = db.table("items").select("name, sku").eq("id", item_id).single().execute()
+        if not item.data:
+            return RedirectResponse(f"/items?msg={quote('Item not found')}&msg_type=error", status_code=303)
+
+        item_name = item.data.get("name") or item.data.get("sku") or item_id[:8]
+        shipment_refs = db.table("shipment_items").select("shipment_id").eq("item_id", item_id).limit(1).execute()
+        if shipment_refs.data:
+            return RedirectResponse(
+                f"/items?msg={quote('Cannot delete an item that exists in shipment history')}&msg_type=error",
+                status_code=303,
+            )
+
+        db.table("items").delete().eq("id", item_id).execute()
+        logger.info(f"[ITEM REMOVE] Deleted item {item_id} ({item_name})")
+        await log_activity("item", f"Removed item {item_name}", item.data.get("sku", ""), "warning")
+        return RedirectResponse(
+            f"/items?msg={quote(f'Removed item {item_name}')}&msg_type=success",
+            status_code=303,
+        )
+    except Exception as e:
+        logger.error(f"[ITEM REMOVE] Error: {e}", exc_info=True)
+        await log_activity("item", f"Failed to remove item: {e}", "", "error")
+        return RedirectResponse(f"/items?msg={quote('Failed to remove item')}&msg_type=error", status_code=303)
+
+
+@app.post("/kits/{kit_id}/remove")
+async def remove_kit(request: Request, kit_id: str):
+    """Delete a kit only if it is not already used in history or decisions."""
+    try:
+        db = get_supabase()
+        kit = db.table("kits").select("sku").eq("id", kit_id).single().execute()
+        if not kit.data:
+            return RedirectResponse(f"/kits?msg={quote('Kit not found')}&msg_type=error", status_code=303)
+
+        kit_sku = kit.data.get("sku") or kit_id[:8]
+        shipment_refs = db.table("shipments").select("id").eq("kit_id", kit_id).limit(1).execute()
+        decision_refs = db.table("decisions").select("id").eq("kit_id", kit_id).limit(1).execute()
+        if shipment_refs.data or decision_refs.data:
+            return RedirectResponse(
+                f"/kits?msg={quote('Cannot delete a kit that is already used in shipments or decisions')}&msg_type=error",
+                status_code=303,
+            )
+
+        db.table("kits").delete().eq("id", kit_id).execute()
+        logger.info(f"[KIT REMOVE] Deleted kit {kit_id} ({kit_sku})")
+        await log_activity("kit", f"Removed kit {kit_sku}", "", "warning")
+        return RedirectResponse(
+            f"/kits?msg={quote(f'Removed kit {kit_sku}')}&msg_type=success",
+            status_code=303,
+        )
+    except Exception as e:
+        logger.error(f"[KIT REMOVE] Error: {e}", exc_info=True)
+        await log_activity("kit", f"Failed to remove kit: {e}", "", "error")
+        return RedirectResponse(f"/kits?msg={quote('Failed to remove kit')}&msg_type=error", status_code=303)
 
 
 @app.get("/activity", response_class=HTMLResponse)
