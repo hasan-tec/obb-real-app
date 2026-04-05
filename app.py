@@ -617,12 +617,15 @@ async def shopify_order_webhook(request: Request):
         phone = customer_data.get("phone", "")
 
         # Extract shipping address
-        shipping = payload.get("shipping_address", {})
+        # NOTE: Must use `or {}` — when shipping_address is explicitly null in JSON,
+        # dict.get(key, default) returns None, not the default value.
+        shipping = payload.get("shipping_address") or {}
         address_line1 = shipping.get("address1", "")
         city = shipping.get("city", "")
         province = shipping.get("province", "")
         zip_code = shipping.get("zip", "")
         country = shipping.get("country_code", "US")
+        logger.info(f"[SHOPIFY WEBHOOK] shipping_address present: {bool(shipping)}")
 
         # Extract quiz data using helper (handles q_due_date, q_size, q_expecting, etc.)
         line_items = payload.get("line_items", [])
@@ -655,6 +658,23 @@ async def shopify_order_webhook(request: Request):
         if quiz["subscription_plan"]:
             is_renewal = False
             logger.info(f"[SHOPIFY WEBHOOK] Subscription plan detected: {quiz['subscription_plan']} (gift={quiz['is_gift']})")
+
+        # ─── Detect if this is a subscription-related order ───
+        # Indicators: $0 price (Recharge renewal), subscription SKU, or Recharge note attrs
+        is_recharge_renewal = (total_price == 0.0)
+        has_sub_sku = quiz["subscription_plan"] is not None
+        has_rc_attrs = bool(quiz["rc_charge_id"] or quiz["rc_subscription_ids"])
+        is_subscription_order = is_recharge_renewal or has_sub_sku or has_rc_attrs
+        logger.info(
+            f"[SHOPIFY WEBHOOK] is_subscription_order={is_subscription_order} "
+            f"(recharge_renewal={is_recharge_renewal}, sub_sku={has_sub_sku}, rc_attrs={has_rc_attrs})"
+        )
+        if not is_subscription_order:
+            logger.info(
+                f"[SHOPIFY WEBHOOK] NON-SUBSCRIPTION order — "
+                f"line item SKUs: {[i.get('sku', '') for i in line_items]}, price=${total_price}, source={source_name}. "
+                f"Will upsert customer but skip decision engine."
+            )
 
         logger.info(f"[SHOPIFY WEBHOOK] Customer: {email}, Name: {first_name} {last_name}")
         logger.info(f"[SHOPIFY WEBHOOK] Price: ${total_price}, Source: {source_name}, Is Renewal: {is_renewal}")
@@ -702,8 +722,8 @@ async def shopify_order_webhook(request: Request):
                 cust_id = result.data[0]["id"] if result.data else None
                 logger.info(f"[SHOPIFY WEBHOOK] Created new customer: {cust_id}")
 
-            # ─── Run Decision Engine ───
-            if cust_id:
+            # ─── Run Decision Engine (subscription orders only) ───
+            if cust_id and is_subscription_order:
                 kit_decision = await assign_kit(cust_id, date.today())
                 logger.info(f"[SHOPIFY WEBHOOK] Decision engine result: {kit_decision['decision_type']} — {kit_decision.get('kit_sku', 'none')}")
 
@@ -749,7 +769,8 @@ async def shopify_order_webhook(request: Request):
         await log_activity(
             "webhook",
             f"Shopify order #{shopify_order_id} processed",
-            f"Customer: {email}, Trimester: T{trimester or '?'}, Type: {'Renewal' if is_renewal else 'New'}",
+            f"Customer: {email}, Trimester: T{trimester or '?'}, "
+            f"Type: {'Renewal' if is_renewal else 'New'}, sub_order={is_subscription_order}",
             "success"
         )
 
@@ -1042,9 +1063,43 @@ async def cratejoy_order_webhook(request: Request):
 
             # ─── Fetch Cratejoy Survey Results (quiz data: due date, size, gender, daddy) ───
             if cust_id and CRATEJOY_CLIENT_ID and CRATEJOY_CLIENT_SECRET:
-                cj_sub_id = payload.get("id", "")
-                if cj_sub_id:
-                    logger.info(f"[CRATEJOY WEBHOOK] Fetching survey results for subscription {cj_sub_id}")
+                # IMPORTANT: payload.id points to different objects depending on event type:
+                #   customer_new       → payload.id = customer_id   (NOT subscription_id)
+                #   order_new          → payload.id = order_id       (NOT subscription_id)
+                #   subscription_*     → payload.id = subscription_id (correct)
+                # The survey results API requires a real subscription_id, so we resolve it carefully.
+                if event_type == "customer_new" and payload_type == "customer":
+                    # Look up subscription by customer.id
+                    cj_sub_id_for_survey = None
+                    cj_customer_id_for_lookup = str(payload.get("id", ""))
+                    logger.info(
+                        f"[CRATEJOY WEBHOOK] customer_new — will resolve subscription_id "
+                        f"for CJ customer {cj_customer_id_for_lookup}"
+                    )
+                elif payload_type == "order":
+                    # For order_new, subscription_id lives in the nested subscription object, NOT payload.id
+                    nested_sub = payload.get("subscription") or {}
+                    cj_sub_id_for_survey = str(nested_sub.get("id", "") or "")
+                    cj_customer_id_for_lookup = None
+                    if cj_sub_id_for_survey:
+                        logger.info(f"[CRATEJOY WEBHOOK] order_new — using nested subscription_id={cj_sub_id_for_survey} for survey (order_id={payload.get('id')})")
+                    else:
+                        # Fallback: look up by customer if subscription relation is missing
+                        nested_cust = payload.get("customer") or {}
+                        cj_customer_id_for_lookup = str(nested_cust.get("id", "") or "")
+                        logger.warning(
+                            f"[CRATEJOY WEBHOOK] order_new has no nested subscription.id — "
+                            f"falling back to customer lookup for customer {cj_customer_id_for_lookup}"
+                        )
+                else:
+                    # subscription_renewed / subscription_cancelled — payload.id IS the subscription_id
+                    cj_sub_id_for_survey = str(payload.get("id", "") or "")
+                    cj_customer_id_for_lookup = None
+                    logger.info(f"[CRATEJOY WEBHOOK] {event_type} — using payload id={cj_sub_id_for_survey} as subscription_id for survey")
+
+                # Only proceed if we have a customer or subscription id to work with
+                if cj_sub_id_for_survey or cj_customer_id_for_lookup:
+                    logger.info(f"[CRATEJOY WEBHOOK] Starting survey enrichment...")
                     try:
                         auth_str = base64.b64encode(f"{CRATEJOY_CLIENT_ID}:{CRATEJOY_CLIENT_SECRET}".encode()).decode()
                         cj_headers = {"Authorization": f"Basic {auth_str}", "Accept": "application/json"}
@@ -1056,48 +1111,67 @@ async def cratejoy_order_webhook(request: Request):
                         survey_past_subscriber = None
 
                         async with httpx.AsyncClient(timeout=15.0) as client:
-                            # Merchant API: GET /v1/product_survey_results/?subscription_id={id}
-                            survey_url = f"https://api.cratejoy.com/v1/product_survey_results/?subscription_id={cj_sub_id}"
-                            logger.info(f"[CRATEJOY WEBHOOK] Calling survey API: {survey_url}")
-                            survey_resp = await client.get(survey_url, headers=cj_headers)
+                            # Step 1 (customer_new only): resolve subscription_id from customer_id
+                            if cj_customer_id_for_lookup and not cj_sub_id_for_survey:
+                                sub_lookup_url = f"https://api.cratejoy.com/v1/subscriptions/?customer.id={cj_customer_id_for_lookup}&limit=1"
+                                logger.info(f"[CRATEJOY WEBHOOK] Subscription lookup for customer {cj_customer_id_for_lookup}: {sub_lookup_url}")
+                                sub_lookup_resp = await client.get(sub_lookup_url, headers=cj_headers)
+                                if sub_lookup_resp.status_code == 200:
+                                    sub_results = sub_lookup_resp.json().get("results", [])
+                                    if sub_results:
+                                        cj_sub_id_for_survey = str(sub_results[0].get("id", ""))
+                                        logger.info(f"[CRATEJOY WEBHOOK] Resolved subscription_id={cj_sub_id_for_survey} for customer {cj_customer_id_for_lookup}")
+                                    else:
+                                        logger.info(f"[CRATEJOY WEBHOOK] No subscriptions found for customer {cj_customer_id_for_lookup} — survey enrichment skipped")
+                                else:
+                                    logger.warning(
+                                        f"[CRATEJOY WEBHOOK] Subscription lookup returned {sub_lookup_resp.status_code}: "
+                                        f"{sub_lookup_resp.text[:200]}"
+                                    )
 
-                            if survey_resp.status_code == 200:
-                                survey_data = survey_resp.json()
-                                logger.info(f"[CRATEJOY WEBHOOK] Survey API response (count={survey_data.get('count', '?')}): {json.dumps(survey_data)[:1000]}")
+                            # Step 2: fetch survey results using resolved subscription_id
+                            if cj_sub_id_for_survey:
+                                survey_url = f"https://api.cratejoy.com/v1/product_survey_results/?subscription_id={cj_sub_id_for_survey}"
+                                logger.info(f"[CRATEJOY WEBHOOK] Calling survey API: {survey_url}")
+                                survey_resp = await client.get(survey_url, headers=cj_headers)
 
-                                survey_results = survey_data.get("results", [])
-                                for sr in survey_results:
-                                    answers = sr.get("answers", [])
-                                    for ans in answers:
-                                        field_name = ""
-                                        field = ans.get("field", {})
-                                        if isinstance(field, dict):
-                                            field_name = field.get("name", "").lower().strip()
-                                        value = str(ans.get("value", "")).strip()
+                                if survey_resp.status_code == 200:
+                                    survey_data = survey_resp.json()
+                                    logger.info(f"[CRATEJOY WEBHOOK] Survey API response (count={survey_data.get('count', '?')}): {json.dumps(survey_data)[:1000]}")
 
-                                        if not value:
-                                            continue
+                                    survey_results = survey_data.get("results", [])
+                                    for sr in survey_results:
+                                        answers = sr.get("answers", [])
+                                        for ans in answers:
+                                            field_name = ""
+                                            field = ans.get("field", {})
+                                            if isinstance(field, dict):
+                                                field_name = field.get("name", "").lower().strip()
+                                            value = str(ans.get("value", "")).strip()
 
-                                        logger.info(f"[CRATEJOY WEBHOOK] Survey answer: '{field_name}' = '{value}'")
+                                            if not value:
+                                                continue
 
-                                        # Match OBB's 5 survey questions by keyword matching
-                                        if "due date" in field_name:
-                                            survey_due_date = value
-                                            logger.info(f"[CRATEJOY WEBHOOK] → Due date: {value}")
-                                        elif "clothing size" in field_name:
-                                            survey_size = value
-                                            logger.info(f"[CRATEJOY WEBHOOK] → Clothing size: {value}")
-                                        elif "expecting" in field_name or "whom" in field_name:
-                                            survey_gender = value
-                                            logger.info(f"[CRATEJOY WEBHOOK] → Expecting: {value}")
-                                        elif "second parent" in field_name or "matching apparel" in field_name:
-                                            survey_daddy = value
-                                            logger.info(f"[CRATEJOY WEBHOOK] → Daddy item: {value}")
-                                        elif "received" in field_name and "oh baby box" in field_name:
-                                            survey_past_subscriber = value
-                                            logger.info(f"[CRATEJOY WEBHOOK] → Past subscriber: {value}")
-                            else:
-                                logger.warning(f"[CRATEJOY WEBHOOK] Survey API returned {survey_resp.status_code}: {survey_resp.text[:300]}")
+                                            logger.info(f"[CRATEJOY WEBHOOK] Survey answer: '{field_name}' = '{value}'")
+
+                                            # Match OBB's 5 survey questions by keyword matching
+                                            if "due date" in field_name:
+                                                survey_due_date = value
+                                                logger.info(f"[CRATEJOY WEBHOOK] → Due date: {value}")
+                                            elif "clothing size" in field_name:
+                                                survey_size = value
+                                                logger.info(f"[CRATEJOY WEBHOOK] → Clothing size: {value}")
+                                            elif "expecting" in field_name or "whom" in field_name:
+                                                survey_gender = value
+                                                logger.info(f"[CRATEJOY WEBHOOK] → Expecting: {value}")
+                                            elif "second parent" in field_name or "matching apparel" in field_name:
+                                                survey_daddy = value
+                                                logger.info(f"[CRATEJOY WEBHOOK] → Daddy item: {value}")
+                                            elif "received" in field_name and "oh baby box" in field_name:
+                                                survey_past_subscriber = value
+                                                logger.info(f"[CRATEJOY WEBHOOK] → Past subscriber: {value}")
+                                else:
+                                    logger.warning(f"[CRATEJOY WEBHOOK] Survey API returned {survey_resp.status_code}: {survey_resp.text[:300]}")
 
                         # Apply survey data to customer
                         update_from_survey = {}
@@ -1489,10 +1563,13 @@ async def replay_webhook(webhook_id: str):
 
         logger.info(f"[WEBHOOK REPLAY] Starting replay for webhook {webhook_id}, source={source}, event_type={wh.get('event_type')}, original_status={original_status}")
 
-        # ─── Only allow replay of failed/received webhooks ───
-        if original_status not in ("failed", "received"):
-            logger.warning(f"[WEBHOOK REPLAY] Cannot replay webhook with status '{original_status}' — only 'failed' or 'received' allowed")
+        # ─── Allow replay of any status (creates a new log entry — completely safe) ───
+        # Allowing 'processed' so survey enrichment fixes can be applied to already-processed webhooks
+        allowed_statuses = ("failed", "received", "processed", "replayed", "duplicate")
+        if original_status not in allowed_statuses:
+            logger.warning(f"[WEBHOOK REPLAY] Cannot replay webhook with status '{original_status}'")
             return RedirectResponse(f"/webhooks/{webhook_id}", status_code=303)
+        logger.info(f"[WEBHOOK REPLAY] Replaying webhook with original_status='{original_status}'")
 
         # ─── Create new webhook log for replay ───
         replay_event_id = f"replay_{original_event_id or webhook_id}_{int(time.time())}"
@@ -1521,12 +1598,14 @@ async def replay_webhook(webhook_id: str):
             shopify_customer_id = str(customer_data.get("id", ""))
             phone = customer_data.get("phone", "")
 
-            shipping = payload.get("shipping_address", {})
+            # Must use `or {}` — shipping_address can be explicitly null in Shopify JSON
+            shipping = payload.get("shipping_address") or {}
             address_line1 = shipping.get("address1", "")
             city = shipping.get("city", "")
             province = shipping.get("province", "")
             zip_code = shipping.get("zip", "")
             country = shipping.get("country_code", "US")
+            logger.info(f"[WEBHOOK REPLAY] shipping_address present: {bool(shipping)}")
 
             line_items = payload.get("line_items", [])
             note_attributes = payload.get("note_attributes", [])
@@ -1549,7 +1628,17 @@ async def replay_webhook(webhook_id: str):
             if quiz["subscription_plan"]:
                 is_renewal = False
 
-            logger.info(f"[WEBHOOK REPLAY] Shopify customer: {email}, order: {shopify_order_id}, renewal={is_renewal}")
+            # Non-subscription order guard (same logic as live webhook)
+            is_recharge_renewal = (total_price == 0.0)
+            has_sub_sku = quiz["subscription_plan"] is not None
+            has_rc_attrs = bool(quiz["rc_charge_id"] or quiz["rc_subscription_ids"])
+            is_subscription_order = is_recharge_renewal or has_sub_sku or has_rc_attrs
+            logger.info(
+                f"[WEBHOOK REPLAY] Shopify customer: {email}, order: {shopify_order_id}, "
+                f"renewal={is_renewal}, is_subscription_order={is_subscription_order}"
+            )
+            if not is_subscription_order:
+                logger.info(f"[WEBHOOK REPLAY] NON-SUBSCRIPTION order — SKUs: {[i.get('sku', '') for i in line_items]}, price=${total_price}. Updating customer, skipping decision engine.")
 
             if email:
                 existing_customer = db.table("customers").select("*").ilike("email", email).execute()
@@ -1590,7 +1679,7 @@ async def replay_webhook(webhook_id: str):
                     cust_id = result.data[0]["id"] if result.data else None
                     logger.info(f"[WEBHOOK REPLAY] Created new customer: {cust_id}")
 
-                if cust_id:
+                if cust_id and is_subscription_order:
                     kit_decision = await assign_kit(cust_id, date.today())
                     logger.info(f"[WEBHOOK REPLAY] Decision: {kit_decision['decision_type']} — {kit_decision.get('kit_sku', 'none')}")
 
