@@ -78,9 +78,21 @@
                         {% elif d.status == 'shipped' %}<span class="badge badge-blue">{{ d.status }}</span>
                         {% else %}<span class="badge badge-dim">{{ d.status }}</span>{% endif %}
                     </td>
-                    <td
-                        style="max-width: 250px; font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis;">
-                        {{ d.reason or '—' }}</td>
+                    <td style="max-width: 250px;">
+                        {% if d.reason and d.reason | length > 80 %}
+                        <span id="reason-short-{{ d.id }}" style="font-size:12px; color:var(--text-dim); cursor:pointer;"
+                            onclick="toggleReason('{{ d.id }}')" title="Click to expand">
+                            {{ d.reason[:80] }}… <span style="font-size:10px; color:var(--accent);">[more]</span>
+                        </span>
+                        <span id="reason-full-{{ d.id }}" style="display:none; font-size:12px; color:var(--text-dim);">
+                            {{ d.reason }}
+                            <a href="#" onclick="toggleReason('{{ d.id }}'); return false;"
+                                style="font-size:10px; color:var(--accent); margin-left:4px;">[less]</a>
+                        </span>
+                        {% else %}
+                        <span style="font-size:12px; color:var(--text-dim);">{{ d.reason or '—' }}</span>
+                        {% endif %}
+                    </td>
                     <td style="white-space: nowrap;">
                         {% if d.status == 'pending' %}
                         {% if d.kit_sku %}
@@ -117,4 +129,14 @@
         {% endif %}
     </div>
 </div>
+<script>
+    function toggleReason(id) {
+        var shortEl = document.getElementById('reason-short-' + id);
+        var fullEl  = document.getElementById('reason-full-'  + id);
+        if (!shortEl || !fullEl) return;
+        var isHidden = fullEl.style.display === 'none';
+        shortEl.style.display = isHidden ? 'none'  : 'inline';
+        fullEl.style.display  = isHidden ? 'inline' : 'none';
+    }
+</script>
 {% endblock %}

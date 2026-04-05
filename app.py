@@ -2124,15 +2124,35 @@ async def replay_webhook(webhook_id: str):
 
 @app.get("/customers", response_class=HTMLResponse)
 async def customers_page(request: Request):
-    """View all customers."""
+    """View all customers. Supports ?q= search filter on name/email."""
     try:
         db = get_supabase()
-        custs = db.table("customers").select("*").order("created_at", desc=True).limit(100).execute()
+        q = request.query_params.get("q", "").strip().lower()
         msg = request.query_params.get("msg", "")
         msg_type = request.query_params.get("msg_type", "success")
+
+        # Fetch all customers (no hard cap — Supabase returns max 1000 by default which is fine for 500 subs)
+        custs = db.table("customers").select("*").order("created_at", desc=True).limit(1000).execute()
+        all_customers = custs.data or []
+
+        # Client-side search filter on name / email
+        if q:
+            filtered = [
+                c for c in all_customers
+                if q in (c.get("email") or "").lower()
+                or q in (c.get("first_name") or "").lower()
+                or q in (c.get("last_name") or "").lower()
+                or q in f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".lower()
+            ]
+            logger.info(f"[CUSTOMERS PAGE] Search '{q}' matched {len(filtered)}/{len(all_customers)} customers")
+        else:
+            filtered = all_customers
+
         return templates.TemplateResponse("customers.html", {
             "request": request,
-            "customers": custs.data or [],
+            "customers": filtered,
+            "total_customers": len(all_customers),
+            "search_query": q,
             "msg": msg,
             "msg_type": msg_type,
             "page": "customers",
@@ -2142,6 +2162,8 @@ async def customers_page(request: Request):
         return templates.TemplateResponse("customers.html", {
             "request": request,
             "customers": [],
+            "total_customers": 0,
+            "search_query": "",
             "error": str(e),
             "msg": "",
             "msg_type": "error",
@@ -3577,6 +3599,16 @@ async def recurate_customer(request: Request, customer_id: str):
 
         email = cust.data["email"]
         logger.info(f"[RECURATE] Re-running decision engine for {email} (customer_id={customer_id})")
+
+        # Guard: reject if there are already pending decisions to avoid stacking
+        existing_pending = db.table("decisions").select("id").eq("customer_id", customer_id).eq("status", "pending").execute()
+        if existing_pending.data:
+            pending_count = len(existing_pending.data)
+            logger.warning(f"[RECURATE] {pending_count} pending decision(s) already exist for {email} — blocked stacking")
+            return RedirectResponse(
+                f"/customers/{customer_id}?msg={quote(f'{pending_count} pending decision(s) already exist. Reject or approve them first, then re-curate.')}&msg_type=error",
+                status_code=303,
+            )
 
         # Run the decision engine
         kit_decision = await assign_kit(customer_id, date.today())

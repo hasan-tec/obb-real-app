@@ -56,11 +56,17 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label>Quantity</label>
-                        <input type="number" name="quantity_available" class="form-control" value="0" min="0">
+                        <input type="number" name="quantity_available" id="kitQtyInput" class="form-control" value="0" min="0"
+                            oninput="document.getElementById('qtyZeroWarn').style.display = this.value == 0 ? 'block' : 'none'">
+                        <div id="qtyZeroWarn" style="display:block; color:var(--yellow); font-size:11px; margin-top:4px;">
+                            &#9888; Qty is 0 — this kit won’t be assigned until stock is added.
+                        </div>
                     </div>
                     <div class="form-group">
-                        <label>Age Rank (FIFO)</label>
-                        <input type="number" name="age_rank" class="form-control" value="0" min="0">
+                        <label title="Lower number = older batch = ships first (FIFO). Set 1 for oldest inventory.">Age Rank (FIFO) <span style="font-size:11px; cursor:help;">&#9432;</span></label>
+                        <input type="number" name="age_rank" class="form-control" value="0" min="0"
+                            title="Lower number = older batch = ships first (FIFO). Set 1 for oldest available inventory.">
+                        <small style="color:var(--text-dim); font-size:11px;">Lower = older batch = ships first</small>
                     </div>
                     <div class="form-group">
                         <label>Cost per Kit ($)</label>

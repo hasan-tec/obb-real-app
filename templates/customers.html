@@ -4,7 +4,7 @@
 <div class="topbar">
     <h1>Customers</h1>
     <div class="status">
-        <span>{{ customers | length }} customers</span>
+        <span id="customerCount">{{ customers | length }}{% if search_query %} of {{ total_customers }}{% endif %} customers{% if search_query %} matching &ldquo;{{ search_query }}&rdquo;{% endif %}</span>
         <button class="btn btn-sm btn-primary"
             onclick="document.getElementById('addCustomerForm').style.display = document.getElementById('addCustomerForm').style.display === 'none' ? 'block' : 'none'">+
             Add Customer</button>
@@ -187,8 +187,16 @@
     </div>
 
     <div class="card">
-        <div class="card-header">
-            <h3>All Customers</h3>
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <h3 style="margin:0;">All Customers</h3>
+            <form method="GET" action="/customers" style="display:flex; gap:8px; align-items:center;">
+                <input type="text" name="q" id="customerSearch" class="form-control" placeholder="Search name or email…"
+                    value="{{ search_query or '' }}" style="width:240px; height:32px; font-size:13px;">
+                {% if search_query %}
+                <a href="/customers" class="btn btn-sm btn-secondary" title="Clear search">✕ Clear</a>
+                {% endif %}
+                <button type="submit" class="btn btn-sm btn-primary">Search</button>
+            </form>
         </div>
         {% if customers %}
         <table>
@@ -254,7 +262,11 @@
         {% else %}
         <div class="empty-state">
             <div class="icon">👥</div>
+            {% if search_query %}
+            <p>No customers match &ldquo;{{ search_query }}&rdquo;. <a href="/customers">Clear search</a>.</p>
+            {% else %}
             <p>No customers yet. They'll appear after webhooks are processed.</p>
+            {% endif %}
         </div>
         {% endif %}
     </div>
