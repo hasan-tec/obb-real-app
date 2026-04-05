@@ -4,9 +4,9 @@
 <div class="topbar">
     <h1>Webhook Detail</h1>
     <div class="status">
-        {% if webhook and webhook.status in ('failed', 'received') %}
+        {% if webhook and webhook.status in ('failed', 'received', 'processed', 'replayed', 'duplicate') %}
         <form method="POST" action="/webhooks/{{ webhook.id }}/replay" style="display:inline;"
-            onsubmit="return confirm('Replay this webhook? It will re-process the stored payload and create a new decision.');">
+            onsubmit="return confirm('Replay this webhook? It will re-process the stored payload and create a new webhook log + decision.');">
             <button type="submit" class="btn btn-sm"
                 style="background: var(--yellow); color: #000; margin-right: 8px;">🔄 Replay</button>
         </form>
