@@ -507,6 +507,61 @@ def load_customer_shipments_with_items(customer_id: str) -> list[dict]:
     return enriched_shipments
 
 
+def sync_kit_items_to_existing_shipments(kit_id: str) -> tuple[int, int]:
+    """Backfill current kit_items into existing shipments that use the same kit SKU."""
+    db = get_supabase()
+    kit_result = db.table("kits").select("id, sku").eq("id", kit_id).single().execute()
+    if not kit_result.data:
+        logger.warning(f"[KIT->SHIPMENT SYNC] Kit {kit_id} not found")
+        return 0, 0
+
+    kit_sku = kit_result.data["sku"]
+    kit_items = db.table("kit_items").select("item_id").eq("kit_id", kit_id).execute()
+    kit_item_ids = [row["item_id"] for row in (kit_items.data or [])]
+    if not kit_item_ids:
+        logger.info(f"[KIT->SHIPMENT SYNC] Kit {kit_sku} has no items to sync")
+        return 0, 0
+
+    shipments = db.table("shipments").select("id, kit_id, notes").eq("kit_sku", kit_sku).execute()
+    synced_shipments = 0
+    inserted_items = 0
+
+    for shipment in (shipments.data or []):
+        shipment_id = shipment["id"]
+        if shipment.get("kit_id") != kit_id:
+            db.table("shipments").update({"kit_id": kit_id}).eq("id", shipment_id).execute()
+
+        existing_items = db.table("shipment_items").select("item_id").eq("shipment_id", shipment_id).execute()
+        existing_item_ids = {row["item_id"] for row in (existing_items.data or [])}
+
+        inserted_for_this_shipment = 0
+        for item_id in kit_item_ids:
+            if item_id in existing_item_ids:
+                continue
+            try:
+                db.table("shipment_items").insert({
+                    "shipment_id": shipment_id,
+                    "item_id": item_id,
+                }).execute()
+                existing_item_ids.add(item_id)
+                inserted_items += 1
+                inserted_for_this_shipment += 1
+            except Exception as item_err:
+                logger.warning(f"[KIT->SHIPMENT SYNC] Could not sync item {item_id} to shipment {shipment_id}: {item_err}")
+
+        if inserted_for_this_shipment > 0:
+            synced_shipments += 1
+            notes = shipment.get("notes") or ""
+            cleaned_notes = notes.replace(" | WARNING: no item history recorded", "").replace("WARNING: no item history recorded | ", "").replace("WARNING: no item history recorded", "").strip(" |")
+            db.table("shipments").update({"notes": cleaned_notes or None}).eq("id", shipment_id).execute()
+
+    logger.info(
+        f"[KIT->SHIPMENT SYNC] Synced kit {kit_sku} to {synced_shipments} shipment(s), "
+        f"inserted {inserted_items} missing shipment_item row(s)"
+    )
+    return synced_shipments, inserted_items
+
+
 async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
     """
     Core decision engine: Assign the best kit for a customer.
@@ -3134,14 +3189,27 @@ async def add_item_to_kit(
             "quantity": quantity,
         }).execute()
 
+        synced_shipments, inserted_items = sync_kit_items_to_existing_shipments(kit_id)
+
         # Get names for logging
         kit = db.table("kits").select("sku").eq("id", kit_id).single().execute()
         item = db.table("items").select("name").eq("id", item_id).single().execute()
         kit_sku = kit.data["sku"] if kit.data else kit_id
         item_name = item.data["name"] if item.data else item_id
-        logger.info(f"[KIT-ITEM] ✅ Added item '{item_name}' to kit {kit_sku} (qty: {quantity})")
-        await log_activity("kit", f"Added item '{item_name}' to kit {kit_sku}", f"Qty: {quantity}", "success")
-        return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Added {item_name} to kit')}&msg_type=success", status_code=303)
+        logger.info(
+            f"[KIT-ITEM] ✅ Added item '{item_name}' to kit {kit_sku} (qty: {quantity}); "
+            f"synced_shipments={synced_shipments}, inserted_items={inserted_items}"
+        )
+        await log_activity(
+            "kit",
+            f"Added item '{item_name}' to kit {kit_sku}",
+            f"Qty: {quantity}, Synced shipments: {synced_shipments}, Inserted history items: {inserted_items}",
+            "success"
+        )
+        return RedirectResponse(
+            f"/kits/{kit_id}?msg={quote(f'Added {item_name} to kit and synced {synced_shipments} shipment(s)')}&msg_type=success",
+            status_code=303,
+        )
     except Exception as e:
         logger.error(f"[KIT-ITEM] Error adding item to kit: {e}", exc_info=True)
         return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Error adding item: {str(e)[:80]}')}&msg_type=error", status_code=303)
@@ -3207,11 +3275,24 @@ async def quick_add_item_to_kit(
             "quantity": quantity,
         }).execute()
 
+        synced_shipments, inserted_items = sync_kit_items_to_existing_shipments(kit_id)
+
         kit = db.table("kits").select("sku").eq("id", kit_id).single().execute()
         kit_sku = kit.data["sku"] if kit.data else kit_id
-        logger.info(f"[KIT-ITEM QUICK] ✅ Created '{name_clean}' and added to kit {kit_sku}")
-        await log_activity("kit", f"Quick-added item '{name_clean}' to kit {kit_sku}", f"SKU: {sku_clean}, Qty: {quantity}", "success")
-        return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Created and added {name_clean}')}&msg_type=success", status_code=303)
+        logger.info(
+            f"[KIT-ITEM QUICK] ✅ Created '{name_clean}' and added to kit {kit_sku}; "
+            f"synced_shipments={synced_shipments}, inserted_items={inserted_items}"
+        )
+        await log_activity(
+            "kit",
+            f"Quick-added item '{name_clean}' to kit {kit_sku}",
+            f"SKU: {sku_clean}, Qty: {quantity}, Synced shipments: {synced_shipments}, Inserted history items: {inserted_items}",
+            "success"
+        )
+        return RedirectResponse(
+            f"/kits/{kit_id}?msg={quote(f'Created {name_clean} and synced {synced_shipments} shipment(s)')}&msg_type=success",
+            status_code=303,
+        )
     except Exception as e:
         logger.error(f"[KIT-ITEM QUICK] Error: {e}", exc_info=True)
         return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Error: {str(e)[:80]}')}&msg_type=error", status_code=303)
