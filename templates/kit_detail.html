@@ -226,7 +226,7 @@
             </thead>
             <tbody>
                 {% for ki in kit_items %}
-                {% set item = ki.items %}
+                {% set item = ki['items'] %}
                 <tr>
                     <td style="font-weight: 500;">{{ item.name if item else '—' }}</td>
                     <td style="font-family: monospace; font-size: 12px;">{{ item.sku if item and item.sku else '—' }}
