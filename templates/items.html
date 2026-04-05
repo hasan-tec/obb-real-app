@@ -84,10 +84,48 @@
                         <span class="badge badge-dim">OBB</span>
                         {% endif %}
                     </td>
-                    <td>
+                    <td style="white-space: nowrap;">
+                        <button type="button" class="btn btn-sm btn-secondary"
+                            onclick="toggleItemEditor('{{ i.id }}')">Edit</button>
                         <form method="POST" action="/items/{{ i.id }}/remove" style="display:inline;"
                             onsubmit="return confirm('Remove this item? If it exists in shipment history, deletion will be blocked.');">
                             <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr id="item-editor-{{ i.id }}" style="display:none; background: rgba(255,255,255,0.02);">
+                    <td colspan="6">
+                        <form method="POST" action="/items/{{ i.id }}/edit" style="padding: 12px 0;">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Name *</label>
+                                    <input type="text" name="name" class="form-control" value="{{ i.name }}" required>
+                                </div>
+                                <div class="form-group">
+                                    <label>SKU</label>
+                                    <input type="text" name="sku" class="form-control" value="{{ i.sku or '' }}">
+                                </div>
+                                <div class="form-group">
+                                    <label>Category</label>
+                                    <input type="text" name="category" class="form-control"
+                                        value="{{ i.category or '' }}">
+                                </div>
+                                <div class="form-group">
+                                    <label>Unit Cost ($)</label>
+                                    <input type="number" name="unit_cost" class="form-control"
+                                        value="{{ i.unit_cost or 0 }}" min="0" step="0.01">
+                                </div>
+                            </div>
+                            <label
+                                style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:13px; margin-bottom:10px;">
+                                <input type="checkbox" name="is_therabox" value="true" {% if i.is_therabox
+                                    %}checked{% endif %}> TheraBox item
+                            </label>
+                            <div style="display:flex; gap:8px;">
+                                <button type="submit" class="btn btn-sm btn-primary">✓ Save</button>
+                                <button type="button" class="btn btn-sm btn-secondary"
+                                    onclick="toggleItemEditor('{{ i.id }}')">Cancel</button>
+                            </div>
                         </form>
                     </td>
                 </tr>
@@ -102,4 +140,11 @@
         {% endif %}
     </div>
 </div>
+<script>
+    function toggleItemEditor(itemId) {
+        const row = document.getElementById(`item-editor-${itemId}`);
+        if (!row) return;
+        row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+    }
+</script>
 {% endblock %}

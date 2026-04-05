@@ -42,6 +42,18 @@
     </div>
     {% endif %}
 
+    {% if trimester_changed %}
+    <div
+        style="background: #d97706; color: #000; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; display: flex; align-items: center; gap: 10px;">
+        <span style="font-size: 20px;">🔄</span>
+        <div>
+            <strong>Trimester Updated!</strong> — Stored: T{{ customer.trimester }} &rarr; Now: T{{ live_trimester }}.
+            <strong>Click "✏️ Edit" then Save to lock the new trimester in, then "🔄 Re-curate"</strong> to get a
+            fresh kit assignment.
+        </div>
+    </div>
+    {% endif %}
+
     {% if customer.subscription_status == 'cancelled-expired' %}
     <div
         style="background: var(--red, #ef4444); color: #fff; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; display: flex; align-items: center; gap: 10px;">
@@ -174,7 +186,8 @@
         <div class="stat-card">
             <div class="label">Trimester</div>
             <div class="value" style="font-size:18px;">
-                {% if customer.trimester %}T{{ customer.trimester }}{% else %}—{% endif %}
+                {% if live_trimester %}T{{ live_trimester }}{% elif customer.trimester %}T{{ customer.trimester }}{% else %}—{% endif %}
+                {% if trimester_changed %}<span style="font-size:13px; color: var(--yellow);"> ⚠️ changed</span>{% endif %}
             </div>
             <div class="sub">Due: {{ customer.due_date or 'Not set' }}</div>
         </div>
@@ -436,6 +449,37 @@
                 <div style="margin-top: 8px;">
                     <button type="submit" class="btn btn-primary">+ Add Shipment</button>
                 </div>
+            </form>
+        </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+        <div class="card-header">
+            <h3>Override Kit Assignment</h3>
+        </div>
+        <div style="padding: 16px;">
+            <p style="font-size:12px; color: var(--text-dim); margin-bottom: 12px;">
+                Bypass the auto-engine and manually pick a kit. Creates a pending decision you still need to Approve.
+            </p>
+            <form method="POST" action="/customers/{{ customer.id }}/override-kit">
+                <div class="form-row">
+                    <div class="form-group" style="flex: 2;">
+                        <label>Kit *</label>
+                        <select name="kit_id" class="form-control" required>
+                            <option value="">— Choose a kit —</option>
+                            {% for k in kits %}
+                            <option value="{{ k.id }}">{{ k.sku }} — T{{ k.trimester }}{% if k.is_welcome_kit %}
+                                (Welcome){% endif %}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-group" style="flex: 3;">
+                        <label>Reason</label>
+                        <input type="text" name="reason" class="form-control"
+                            placeholder="e.g. Customer requested this kit specifically">
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary">⚡ Override Kit</button>
             </form>
         </div>
     </div>

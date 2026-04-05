@@ -507,61 +507,6 @@ def load_customer_shipments_with_items(customer_id: str) -> list[dict]:
     return enriched_shipments
 
 
-def sync_kit_items_to_existing_shipments(kit_id: str) -> tuple[int, int]:
-    """Backfill current kit_items into existing shipments that use the same kit SKU."""
-    db = get_supabase()
-    kit_result = db.table("kits").select("id, sku").eq("id", kit_id).single().execute()
-    if not kit_result.data:
-        logger.warning(f"[KIT->SHIPMENT SYNC] Kit {kit_id} not found")
-        return 0, 0
-
-    kit_sku = kit_result.data["sku"]
-    kit_items = db.table("kit_items").select("item_id").eq("kit_id", kit_id).execute()
-    kit_item_ids = [row["item_id"] for row in (kit_items.data or [])]
-    if not kit_item_ids:
-        logger.info(f"[KIT->SHIPMENT SYNC] Kit {kit_sku} has no items to sync")
-        return 0, 0
-
-    shipments = db.table("shipments").select("id, kit_id, notes").eq("kit_sku", kit_sku).execute()
-    synced_shipments = 0
-    inserted_items = 0
-
-    for shipment in (shipments.data or []):
-        shipment_id = shipment["id"]
-        if shipment.get("kit_id") != kit_id:
-            db.table("shipments").update({"kit_id": kit_id}).eq("id", shipment_id).execute()
-
-        existing_items = db.table("shipment_items").select("item_id").eq("shipment_id", shipment_id).execute()
-        existing_item_ids = {row["item_id"] for row in (existing_items.data or [])}
-
-        inserted_for_this_shipment = 0
-        for item_id in kit_item_ids:
-            if item_id in existing_item_ids:
-                continue
-            try:
-                db.table("shipment_items").insert({
-                    "shipment_id": shipment_id,
-                    "item_id": item_id,
-                }).execute()
-                existing_item_ids.add(item_id)
-                inserted_items += 1
-                inserted_for_this_shipment += 1
-            except Exception as item_err:
-                logger.warning(f"[KIT->SHIPMENT SYNC] Could not sync item {item_id} to shipment {shipment_id}: {item_err}")
-
-        if inserted_for_this_shipment > 0:
-            synced_shipments += 1
-            notes = shipment.get("notes") or ""
-            cleaned_notes = notes.replace(" | WARNING: no item history recorded", "").replace("WARNING: no item history recorded | ", "").replace("WARNING: no item history recorded", "").strip(" |")
-            db.table("shipments").update({"notes": cleaned_notes or None}).eq("id", shipment_id).execute()
-
-    logger.info(
-        f"[KIT->SHIPMENT SYNC] Synced kit {kit_sku} to {synced_shipments} shipment(s), "
-        f"inserted {inserted_items} missing shipment_item row(s)"
-    )
-    return synced_shipments, inserted_items
-
-
 async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
     """
     Core decision engine: Assign the best kit for a customer.
@@ -2215,7 +2160,25 @@ async def customer_detail(request: Request, customer_id: str):
         msg = request.query_params.get("msg", "")
         msg_type = request.query_params.get("msg_type", "success")
 
-        # Get all kits for the shipment form dropdown
+        # Live trimester recalculation — stored value may be stale if due date passed a boundary
+        stored_trimester = cust.data.get("trimester")
+        due_date_raw = cust.data.get("due_date")
+        live_trimester = stored_trimester
+        trimester_changed = False
+        if due_date_raw:
+            try:
+                due_dt = date.fromisoformat(str(due_date_raw))
+                live_trimester = calculate_trimester(due_dt, date.today())
+                if live_trimester != stored_trimester:
+                    trimester_changed = True
+                    logger.info(
+                        f"[CUSTOMER DETAIL] Trimester mismatch for {customer_id}: "
+                        f"stored T{stored_trimester} → live T{live_trimester} (due_date={due_date_raw})"
+                    )
+            except Exception as tri_err:
+                logger.warning(f"[CUSTOMER DETAIL] Could not recalculate trimester: {tri_err}")
+
+        # Get all kits for the shipment form dropdown and override form
         kits_list = db.table("kits").select("id, sku, trimester, is_welcome_kit").order("sku").execute()
 
         return templates.TemplateResponse("customer_detail.html", {
@@ -2224,6 +2187,8 @@ async def customer_detail(request: Request, customer_id: str):
             "decisions": decisions.data or [],
             "shipments": shipments,
             "kits": kits_list.data or [],
+            "live_trimester": live_trimester,
+            "trimester_changed": trimester_changed,
             "msg": msg,
             "msg_type": msg_type,
             "page": "customers",
@@ -3189,27 +3154,14 @@ async def add_item_to_kit(
             "quantity": quantity,
         }).execute()
 
-        synced_shipments, inserted_items = sync_kit_items_to_existing_shipments(kit_id)
-
         # Get names for logging
         kit = db.table("kits").select("sku").eq("id", kit_id).single().execute()
         item = db.table("items").select("name").eq("id", item_id).single().execute()
         kit_sku = kit.data["sku"] if kit.data else kit_id
         item_name = item.data["name"] if item.data else item_id
-        logger.info(
-            f"[KIT-ITEM] ✅ Added item '{item_name}' to kit {kit_sku} (qty: {quantity}); "
-            f"synced_shipments={synced_shipments}, inserted_items={inserted_items}"
-        )
-        await log_activity(
-            "kit",
-            f"Added item '{item_name}' to kit {kit_sku}",
-            f"Qty: {quantity}, Synced shipments: {synced_shipments}, Inserted history items: {inserted_items}",
-            "success"
-        )
-        return RedirectResponse(
-            f"/kits/{kit_id}?msg={quote(f'Added {item_name} to kit and synced {synced_shipments} shipment(s)')}&msg_type=success",
-            status_code=303,
-        )
+        logger.info(f"[KIT-ITEM] ✅ Added item '{item_name}' to kit {kit_sku} (qty: {quantity})")
+        await log_activity("kit", f"Added item '{item_name}' to kit {kit_sku}", f"Qty: {quantity}", "success")
+        return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Added {item_name} to kit')}&msg_type=success", status_code=303)
     except Exception as e:
         logger.error(f"[KIT-ITEM] Error adding item to kit: {e}", exc_info=True)
         return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Error adding item: {str(e)[:80]}')}&msg_type=error", status_code=303)
@@ -3275,24 +3227,11 @@ async def quick_add_item_to_kit(
             "quantity": quantity,
         }).execute()
 
-        synced_shipments, inserted_items = sync_kit_items_to_existing_shipments(kit_id)
-
         kit = db.table("kits").select("sku").eq("id", kit_id).single().execute()
         kit_sku = kit.data["sku"] if kit.data else kit_id
-        logger.info(
-            f"[KIT-ITEM QUICK] ✅ Created '{name_clean}' and added to kit {kit_sku}; "
-            f"synced_shipments={synced_shipments}, inserted_items={inserted_items}"
-        )
-        await log_activity(
-            "kit",
-            f"Quick-added item '{name_clean}' to kit {kit_sku}",
-            f"SKU: {sku_clean}, Qty: {quantity}, Synced shipments: {synced_shipments}, Inserted history items: {inserted_items}",
-            "success"
-        )
-        return RedirectResponse(
-            f"/kits/{kit_id}?msg={quote(f'Created {name_clean} and synced {synced_shipments} shipment(s)')}&msg_type=success",
-            status_code=303,
-        )
+        logger.info(f"[KIT-ITEM QUICK] ✅ Created '{name_clean}' and added to kit {kit_sku}")
+        await log_activity("kit", f"Quick-added item '{name_clean}' to kit {kit_sku}", f"SKU: {sku_clean}, Qty: {quantity}", "success")
+        return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Created and added {name_clean}')}&msg_type=success", status_code=303)
     except Exception as e:
         logger.error(f"[KIT-ITEM QUICK] Error: {e}", exc_info=True)
         return RedirectResponse(f"/kits/{kit_id}?msg={quote(f'Error: {str(e)[:80]}')}&msg_type=error", status_code=303)
@@ -3464,6 +3403,33 @@ async def approve_decision(request: Request, decision_id: str):
                 db.table("kits").update({"quantity_available": new_qty}).eq("id", kit_id).execute()
                 logger.info(f"[APPROVE] Kit {kit.data['sku']} stock: {kit.data['quantity_available']} → {new_qty}")
 
+        # Create a draft shipment NOW so duplicate checking works immediately.
+        # ship_date is None until staff click 📦 Ship — at that point we just stamp the date.
+        approve_ship_record = {
+            "customer_id": d["customer_id"],
+            "kit_id": d.get("kit_id"),
+            "kit_sku": d.get("kit_sku"),
+            "ship_date": None,
+            "trimester_at_ship": d.get("trimester"),
+            "platform": d.get("platform"),
+            "order_id": d.get("order_id"),
+            "notes": f"Auto-created from decision {decision_id[:8]}",
+        }
+        approve_ship_result = db.table("shipments").insert(approve_ship_record).execute()
+        approve_shipment_id = approve_ship_result.data[0]["id"] if approve_ship_result.data else None
+        logger.info(f"[APPROVE] Draft shipment {approve_shipment_id} created — items now visible to duplicate engine")
+        if d.get("kit_id") and approve_shipment_id:
+            approve_kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
+            for ki in (approve_kit_items.data or []):
+                try:
+                    db.table("shipment_items").insert({
+                        "shipment_id": approve_shipment_id,
+                        "item_id": ki["item_id"],
+                    }).execute()
+                except Exception as si_err:
+                    logger.warning(f"[APPROVE] Could not add shipment_item: {si_err}")
+            logger.info(f"[APPROVE] Populated {len(approve_kit_items.data or [])} item(s) into draft shipment")
+
         cust_email = d.get("customers", {}).get("email", decision_id[:8]) if d.get("customers") else decision_id[:8]
         cust_name = ""
         if d.get("customers"):
@@ -3535,33 +3501,39 @@ async def ship_decision(request: Request, decision_id: str):
         # Update decision status to shipped
         db.table("decisions").update({"status": "shipped"}).eq("id", decision_id).execute()
 
-        # Create shipment record
-        shipment_record = {
-            "customer_id": d["customer_id"],
-            "kit_id": d.get("kit_id"),
-            "kit_sku": d.get("kit_sku"),
-            "ship_date": date.today().isoformat(),
-            "trimester_at_ship": d.get("trimester"),
-            "platform": d.get("platform"),
-            "order_id": d.get("order_id"),
-            "notes": f"Auto-created from decision {decision_id[:8]}",
-        }
-        ship_result = db.table("shipments").insert(shipment_record).execute()
-        shipment_id = ship_result.data[0]["id"] if ship_result.data else None
-        logger.info(f"[SHIP] Created shipment {shipment_id} for decision {decision_id[:8]}")
-
-        # Populate shipment_items from kit_items
-        if d.get("kit_id") and shipment_id:
-            kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
-            for ki in (kit_items.data or []):
-                try:
-                    db.table("shipment_items").insert({
-                        "shipment_id": shipment_id,
-                        "item_id": ki["item_id"],
-                    }).execute()
-                except Exception as si_err:
-                    logger.warning(f"[SHIP] Could not add shipment_item: {si_err}")
-            logger.info(f"[SHIP] Added {len(kit_items.data or [])} items to shipment")
+        # Check if draft shipment was already created at Approve time
+        existing_ship = db.table("shipments").select("id").eq("customer_id", d["customer_id"]).ilike("notes", f"%decision {decision_id[:8]}%").execute()
+        if existing_ship.data:
+            # Already created on Approve — just stamp ship_date
+            shipment_id = existing_ship.data[0]["id"]
+            db.table("shipments").update({"ship_date": date.today().isoformat()}).eq("id", shipment_id).execute()
+            logger.info(f"[SHIP] Stamped ship_date on existing draft shipment {shipment_id}")
+        else:
+            # Backward compat: decision was approved before this fix — create shipment here
+            shipment_record = {
+                "customer_id": d["customer_id"],
+                "kit_id": d.get("kit_id"),
+                "kit_sku": d.get("kit_sku"),
+                "ship_date": date.today().isoformat(),
+                "trimester_at_ship": d.get("trimester"),
+                "platform": d.get("platform"),
+                "order_id": d.get("order_id"),
+                "notes": f"Auto-created from decision {decision_id[:8]}",
+            }
+            ship_result = db.table("shipments").insert(shipment_record).execute()
+            shipment_id = ship_result.data[0]["id"] if ship_result.data else None
+            logger.info(f"[SHIP] Created new shipment {shipment_id} for decision {decision_id[:8]}")
+            if d.get("kit_id") and shipment_id:
+                kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
+                for ki in (kit_items.data or []):
+                    try:
+                        db.table("shipment_items").insert({
+                            "shipment_id": shipment_id,
+                            "item_id": ki["item_id"],
+                        }).execute()
+                    except Exception as si_err:
+                        logger.warning(f"[SHIP] Could not add shipment_item: {si_err}")
+                logger.info(f"[SHIP] Added {len(kit_items.data or [])} items to shipment")
 
         cust_email = d.get("customers", {}).get("email", d["customer_id"][:8]) if d.get("customers") else d["customer_id"][:8]
         cust_name = ""
@@ -3687,6 +3659,112 @@ async def edit_kit(
     except Exception as e:
         logger.error(f"[KIT EDIT] Error: {e}", exc_info=True)
     return RedirectResponse(f"/kits/{kit_id}", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════
+# ITEM EDIT
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/items/{item_id}/edit")
+async def edit_item(
+    request: Request,
+    item_id: str,
+    name: str = Form(...),
+    sku: str = Form(""),
+    category: str = Form(""),
+    unit_cost: float = Form(0),
+    is_therabox: str = Form(""),
+):
+    """Edit an existing item's details."""
+    try:
+        db = get_supabase()
+        therabox = is_therabox.lower() in ("true", "on", "1", "yes") if is_therabox else False
+        name_clean = name.strip()
+        sku_clean = sku.strip().upper() or None
+        if not name_clean:
+            return RedirectResponse(f"/items?msg=Name+is+required&msg_type=error", status_code=303)
+        record = {
+            "name": name_clean,
+            "sku": sku_clean,
+            "category": category.strip() or None,
+            "unit_cost": unit_cost if unit_cost > 0 else None,
+            "is_therabox": therabox,
+        }
+        db.table("items").update(record).eq("id", item_id).execute()
+        logger.info(f"[ITEM EDIT] Updated item {item_id}: name='{name_clean}', sku={sku_clean}, therabox={therabox}")
+        await log_activity("item", f"Edited item '{name_clean}'", f"SKU: {sku_clean}, TheraBox: {therabox}", "success")
+        return RedirectResponse(f"/items?msg={quote(f'Updated {name_clean}')}&msg_type=success", status_code=303)
+    except Exception as e:
+        logger.error(f"[ITEM EDIT] Error: {e}", exc_info=True)
+        await log_activity("item", f"Failed to edit item: {e}", "", "error")
+        return RedirectResponse(f"/items?msg={quote('Failed to update item')}&msg_type=error", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════
+# MANUAL KIT OVERRIDE
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/customers/{customer_id}/override-kit")
+async def manual_override_kit(
+    request: Request,
+    customer_id: str,
+    kit_id: str = Form(...),
+    reason: str = Form(""),
+):
+    """Manually override kit assignment for a customer, bypassing the auto-engine."""
+    try:
+        db = get_supabase()
+        if not kit_id or kit_id.strip() == "":
+            return RedirectResponse(
+                f"/customers/{customer_id}?msg={quote('Please select a kit')}&msg_type=error",
+                status_code=303,
+            )
+
+        kit = db.table("kits").select("sku, trimester").eq("id", kit_id).single().execute()
+        if not kit.data:
+            return RedirectResponse(
+                f"/customers/{customer_id}?msg={quote('Kit not found')}&msg_type=error",
+                status_code=303,
+            )
+
+        cust = db.table("customers").select("email, trimester").eq("id", customer_id).single().execute()
+        if not cust.data:
+            return RedirectResponse(f"/customers?msg={quote('Customer not found')}&msg_type=error", status_code=303)
+
+        kit_sku = kit.data["sku"]
+        override_reason = reason.strip() or f"Manual override — staff selected {kit_sku}"
+
+        decision_record = {
+            "customer_id": customer_id,
+            "kit_id": kit_id,
+            "kit_sku": kit_sku,
+            "decision_type": "manual-override",
+            "reason": override_reason,
+            "status": "pending",
+            "order_id": None,
+            "platform": None,
+            "trimester": cust.data.get("trimester"),
+            "ship_date": date.today().isoformat(),
+        }
+        db.table("decisions").insert(decision_record).execute()
+        logger.info(f"[OVERRIDE] Manual override for customer {customer_id}: kit={kit_sku}, reason='{override_reason}'")
+        await log_activity(
+            "decision",
+            f"Manual kit override for {cust.data['email']}: {kit_sku}",
+            override_reason,
+            "info",
+        )
+        return RedirectResponse(
+            f"/customers/{customer_id}?msg={quote(f'Override created — {kit_sku} is now pending approval')}&msg_type=success",
+            status_code=303,
+        )
+    except Exception as e:
+        logger.error(f"[OVERRIDE] Error: {e}", exc_info=True)
+        await log_activity("decision", f"Failed to create manual override: {e}", "", "error")
+        return RedirectResponse(
+            f"/customers/{customer_id}?msg={quote('Failed to create override')}&msg_type=error",
+            status_code=303,
+        )
 
 
 if __name__ == "__main__":
