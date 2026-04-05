@@ -258,6 +258,7 @@
                     <tr>
                         <th>Date</th>
                         <th>Kit</th>
+                        <th>Items</th>
                         <th>Trimester</th>
                         <th>Platform</th>
                     </tr>
@@ -267,6 +268,18 @@
                     <tr>
                         <td>{{ s.ship_date or s.created_at[:10] }}</td>
                         <td>{{ s.kit_sku or '—' }}</td>
+                        <td>
+                            {% if s.shipment_items %}
+                            <div style="display:flex; flex-wrap:wrap; gap:4px;">
+                                {% for si in s.shipment_items %}
+                                {% set item = si.items %}
+                                <span class="badge badge-dim">{{ item.name if item else si.item_id }}</span>
+                                {% endfor %}
+                            </div>
+                            {% else %}
+                            <span style="color: var(--yellow); font-size: 12px;">No items recorded</span>
+                            {% endif %}
+                        </td>
                         <td>{% if s.trimester_at_ship %}T{{ s.trimester_at_ship }}{% else %}—{% endif %}</td>
                         <td>{{ s.platform or '—' }}</td>
                     </tr>
@@ -287,7 +300,9 @@
         </div>
         <div style="padding: 16px;">
             <p style="font-size: 12px; color: var(--text-dim); margin-bottom: 12px;">
-                Enter past kits this customer received. This builds their history for duplicate-item checking.
+                Enter past kits this customer received. If the kit already has linked items, those get copied into
+                history automatically. If not, enter the shipped item SKUs or exact item names manually so duplicate
+                checking stays accurate.
             </p>
             <form method="POST" action="/customers/{{ customer.id }}/shipments/add">
                 <div class="form-row">
@@ -333,6 +348,13 @@
                         <label>Notes</label>
                         <input type="text" name="notes" class="form-control"
                             placeholder="Optional — e.g. 'from V3 backup'">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group" style="flex: 1 1 auto;">
+                        <label>Items in Shipment</label>
+                        <textarea name="item_refs" class="form-control" rows="3"
+                            placeholder="Optional fallback — enter item SKUs or exact item names, comma or newline separated."></textarea>
                     </div>
                 </div>
                 <div style="margin-top: 8px;">

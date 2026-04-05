@@ -387,6 +387,120 @@ def parse_due_date(due_date_str: str) -> Optional[date]:
     return None
 
 
+def parse_history_item_refs(raw_value: str) -> list[str]:
+    """Split comma/newline separated item refs for manual shipment history entry."""
+    if not raw_value:
+        return []
+    refs = []
+    for chunk in re.split(r"[\n,]+", raw_value):
+        ref = chunk.strip()
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def resolve_history_item_ids(raw_value: str) -> tuple[list[str], list[str]]:
+    """Resolve manual item refs to item IDs using exact SKU or exact item name."""
+    refs = parse_history_item_refs(raw_value)
+    if not refs:
+        return [], []
+
+    db = get_supabase()
+    resolved_item_ids: list[str] = []
+    unresolved_refs: list[str] = []
+    seen_item_ids: set[str] = set()
+
+    for ref in refs:
+        item_row = None
+        sku_match = db.table("items").select("id, name, sku").eq("sku", ref.upper()).execute()
+        if sku_match.data:
+            item_row = sku_match.data[0]
+        else:
+            name_match = db.table("items").select("id, name, sku").ilike("name", ref).execute()
+            if name_match.data:
+                item_row = name_match.data[0]
+
+        if item_row:
+            item_id = item_row["id"]
+            if item_id not in seen_item_ids:
+                seen_item_ids.add(item_id)
+                resolved_item_ids.append(item_id)
+                logger.info(
+                    f"[SHIPMENT ITEMS] Resolved manual item ref '{ref}' -> "
+                    f"{item_row.get('name') or item_row.get('sku') or item_id}"
+                )
+        else:
+            unresolved_refs.append(ref)
+            logger.warning(f"[SHIPMENT ITEMS] Could not resolve manual item ref '{ref}'")
+
+    return resolved_item_ids, unresolved_refs
+
+
+def populate_shipment_items(shipment_id: Optional[str], kit_id: Optional[str], manual_item_refs: str = "") -> tuple[int, list[str]]:
+    """Populate shipment_items from kit_items and optional manual item refs."""
+    if not shipment_id:
+        logger.warning("[SHIPMENT ITEMS] Missing shipment_id, cannot populate shipment items")
+        return 0, []
+
+    db = get_supabase()
+    added_item_ids: set[str] = set()
+    unresolved_refs: list[str] = []
+
+    if kit_id:
+        kit_items = db.table("kit_items").select("item_id").eq("kit_id", kit_id).execute()
+        logger.info(f"[SHIPMENT ITEMS] Kit {kit_id} has {len(kit_items.data or [])} mapped items")
+        for kit_item in (kit_items.data or []):
+            item_id = kit_item["item_id"]
+            if item_id in added_item_ids:
+                continue
+            try:
+                db.table("shipment_items").insert({
+                    "shipment_id": shipment_id,
+                    "item_id": item_id,
+                }).execute()
+                added_item_ids.add(item_id)
+            except Exception as item_err:
+                logger.warning(f"[SHIPMENT ITEMS] Could not add mapped kit item {item_id}: {item_err}")
+
+    manual_item_ids, unresolved_refs = resolve_history_item_ids(manual_item_refs)
+    if manual_item_ids:
+        logger.info(f"[SHIPMENT ITEMS] Adding {len(manual_item_ids)} manual history item(s) to shipment {shipment_id}")
+    for item_id in manual_item_ids:
+        if item_id in added_item_ids:
+            continue
+        try:
+            db.table("shipment_items").insert({
+                "shipment_id": shipment_id,
+                "item_id": item_id,
+            }).execute()
+            added_item_ids.add(item_id)
+        except Exception as item_err:
+            logger.warning(f"[SHIPMENT ITEMS] Could not add manual history item {item_id}: {item_err}")
+
+    logger.info(
+        f"[SHIPMENT ITEMS] Shipment {shipment_id} now has {len(added_item_ids)} recorded item(s); "
+        f"unresolved refs={unresolved_refs}"
+    )
+    return len(added_item_ids), unresolved_refs
+
+
+def load_customer_shipments_with_items(customer_id: str) -> list[dict]:
+    """Load a customer's shipments plus the recorded items inside each shipment."""
+    db = get_supabase()
+    shipments = db.table("shipments").select("*").eq("customer_id", customer_id).order("created_at", desc=True).execute()
+    shipment_rows = shipments.data or []
+    enriched_shipments: list[dict] = []
+
+    for shipment in shipment_rows:
+        shipment_items = db.table("shipment_items").select("item_id, items(*)").eq("shipment_id", shipment["id"]).execute()
+        shipment_row = dict(shipment)
+        shipment_row["shipment_items"] = shipment_items.data or []
+        enriched_shipments.append(shipment_row)
+
+    logger.info(f"[CUSTOMER DETAIL] Loaded {len(enriched_shipments)} shipment(s) with item history for customer {customer_id}")
+    return enriched_shipments
+
+
 async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
     """
     Core decision engine: Assign the best kit for a customer.
@@ -2030,7 +2144,7 @@ async def customer_detail(request: Request, customer_id: str):
         db = get_supabase()
         cust = db.table("customers").select("*").eq("id", customer_id).single().execute()
         decisions = db.table("decisions").select("*").eq("customer_id", customer_id).order("created_at", desc=True).execute()
-        shipments = db.table("shipments").select("*").eq("customer_id", customer_id).order("created_at", desc=True).execute()
+        shipments = load_customer_shipments_with_items(customer_id)
 
         # Get all kits for the shipment form dropdown
         kits_list = db.table("kits").select("id, sku, trimester, is_welcome_kit").order("sku").execute()
@@ -2039,7 +2153,7 @@ async def customer_detail(request: Request, customer_id: str):
             "request": request,
             "customer": cust.data,
             "decisions": decisions.data or [],
-            "shipments": shipments.data or [],
+            "shipments": shipments,
             "kits": kits_list.data or [],
             "page": "customers",
         })
@@ -2284,6 +2398,7 @@ async def add_customer(
             ship_dates = form_data.getlist("ship_date")
             ship_trimesters = form_data.getlist("ship_trimester")
             ship_platforms = form_data.getlist("ship_platform")
+            ship_items = form_data.getlist("ship_items")
             logger.info(f"[CUSTOMER ADD] Shipment history entries: {len(ship_skus)}")
 
             for i, ship_sku in enumerate(ship_skus):
@@ -2294,6 +2409,7 @@ async def add_customer(
                     s_date = parse_due_date(ship_dates[i]) if i < len(ship_dates) and ship_dates[i].strip() else None
                     s_tri = int(ship_trimesters[i]) if i < len(ship_trimesters) and ship_trimesters[i].strip() else None
                     s_plat = ship_platforms[i] if i < len(ship_platforms) and ship_platforms[i].strip() else platform
+                    s_items = ship_items[i] if i < len(ship_items) else ""
 
                     # Try to find kit by SKU
                     kit_id = None
@@ -2312,19 +2428,22 @@ async def add_customer(
                     }).execute()
                     shipment_id = ship_result.data[0]["id"] if ship_result.data else None
 
-                    # Populate shipment_items from kit_items if kit exists
-                    if kit_id and shipment_id:
-                        kit_items = db.table("kit_items").select("item_id").eq("kit_id", kit_id).execute()
-                        for ki in (kit_items.data or []):
-                            try:
-                                db.table("shipment_items").insert({
-                                    "shipment_id": shipment_id,
-                                    "item_id": ki["item_id"],
-                                }).execute()
-                            except Exception:
-                                pass
+                    item_count, unresolved_refs = populate_shipment_items(shipment_id, kit_id, s_items)
+                    if shipment_id and item_count == 0:
+                        db.table("shipments").update({
+                            "notes": "Added during customer creation | WARNING: no item history recorded"
+                        }).eq("id", shipment_id).execute()
+                        logger.warning(
+                            f"[CUSTOMER ADD] Shipment #{i+1} for {email_clean} has no recorded items. "
+                            f"Duplicate checking will be incomplete until items are added."
+                        )
+                    if unresolved_refs:
+                        logger.warning(f"[CUSTOMER ADD] Shipment #{i+1} unresolved item refs: {unresolved_refs}")
 
-                    logger.info(f"[CUSTOMER ADD] Added shipment #{i+1}: {ship_sku_clean} for {email_clean}")
+                    logger.info(
+                        f"[CUSTOMER ADD] Added shipment #{i+1}: {ship_sku_clean} for {email_clean}; "
+                        f"recorded_items={item_count}"
+                    )
                 except Exception as ship_err:
                     logger.warning(f"[CUSTOMER ADD] Error adding shipment #{i+1}: {ship_err}")
 
@@ -2386,6 +2505,7 @@ async def add_shipment_history(
     trimester_at_ship: int = Form(0),
     platform: str = Form("shopify"),
     order_id: str = Form(""),
+    item_refs: str = Form(""),
     notes: str = Form(""),
 ):
     """Manually add a shipment to a customer's history (for historical data entry)."""
@@ -2418,24 +2538,30 @@ async def add_shipment_history(
         ship_result = db.table("shipments").insert(shipment_record).execute()
         shipment_id = ship_result.data[0]["id"] if ship_result.data else None
 
-        # If kit exists in DB, also populate shipment_items from kit_items
-        if kit_id and shipment_id:
-            kit_items = db.table("kit_items").select("item_id").eq("kit_id", kit_id).execute()
-            for ki in (kit_items.data or []):
-                try:
-                    db.table("shipment_items").insert({
-                        "shipment_id": shipment_id,
-                        "item_id": ki["item_id"],
-                    }).execute()
-                except Exception as si_err:
-                    logger.warning(f"[SHIPMENT ADD] Could not add shipment_item: {si_err}")
-            logger.info(f"[SHIPMENT ADD] Added {len(kit_items.data or [])} items to shipment from kit {kit_sku_clean}")
+        item_count, unresolved_refs = populate_shipment_items(shipment_id, kit_id, item_refs)
+        if shipment_id and item_count == 0:
+            warning_note = (notes.strip() + " | WARNING: no item history recorded").strip(" |")
+            db.table("shipments").update({"notes": warning_note}).eq("id", shipment_id).execute()
+            logger.warning(
+                f"[SHIPMENT ADD] Shipment {shipment_id} for customer {customer_id} has no recorded items. "
+                f"Duplicate checking will be incomplete until items are added."
+            )
+        if unresolved_refs:
+            logger.warning(f"[SHIPMENT ADD] Unresolved manual item refs for {kit_sku_clean}: {unresolved_refs}")
 
         # Get customer email for logging
         cust = db.table("customers").select("email").eq("id", customer_id).single().execute()
         cust_email = cust.data["email"] if cust.data else customer_id
-        logger.info(f"[SHIPMENT ADD] Added shipment for {cust_email}: {kit_sku_clean}, date={ship_date}")
-        await log_activity("shipment", f"Manual shipment added for {cust_email}", f"Kit: {kit_sku_clean}, Date: {ship_date}", "success")
+        logger.info(
+            f"[SHIPMENT ADD] Added shipment for {cust_email}: {kit_sku_clean}, date={ship_date}, "
+            f"recorded_items={item_count}"
+        )
+        await log_activity(
+            "shipment",
+            f"Manual shipment added for {cust_email}",
+            f"Kit: {kit_sku_clean}, Date: {ship_date}, Items recorded: {item_count}",
+            "success"
+        )
     except Exception as e:
         logger.error(f"[SHIPMENT ADD] Error: {e}", exc_info=True)
         await log_activity("shipment", f"Failed to add shipment: {e}", "", "error")
