@@ -9,7 +9,8 @@
 </div>
 <div class="content">
     {% if msg %}
-    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="margin-bottom: 16px;">
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}"
+        style="margin-bottom: 16px;">
         {{ msg }}
     </div>
     {% endif %}
@@ -19,20 +20,31 @@
     {% endif %}
 
     <!-- Age Rank Info Panel -->
-    <div style="background:rgba(99,179,237,0.08); border:1px solid rgba(99,179,237,0.3); border-radius:8px; margin-bottom:18px; overflow:hidden;">
-        <button onclick="var b=document.getElementById('ageRankHelp');b.style.display=b.style.display==='none'?'block':'none';this.querySelector('span').textContent=b.style.display==='none'?'▶':'▼';" style="width:100%;background:none;border:none;cursor:pointer;padding:10px 14px;display:flex;align-items:center;gap:8px;color:var(--accent);font-size:13px;font-weight:600;text-align:left;">
+    <div
+        style="background:rgba(99,179,237,0.08); border:1px solid rgba(99,179,237,0.3); border-radius:8px; margin-bottom:18px; overflow:hidden;">
+        <button
+            onclick="var b=document.getElementById('ageRankHelp');b.style.display=b.style.display==='none'?'block':'none';this.querySelector('span').textContent=b.style.display==='none'?'▶':'▼';"
+            style="width:100%;background:none;border:none;cursor:pointer;padding:10px 14px;display:flex;align-items:center;gap:8px;color:var(--accent);font-size:13px;font-weight:600;text-align:left;">
             <span>▶</span> 📖 How Age Rank works — click to expand (staff guide)
         </button>
         <div id="ageRankHelp" style="display:none;padding:0 16px 16px;border-top:1px solid rgba(99,179,237,0.2);">
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:14px;">
+            <div
+                style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:14px;">
 
                 <div>
-                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">What is Age Rank?</div>
-                    <p style="font-size:13px;color:var(--text-dim);line-height:1.6;margin:0;">Age Rank controls FIFO (oldest ships first). <strong style="color:var(--text);">Lower number = older batch = ships first.</strong> The system reads the SKU prefix (letters before the first digit) and auto-computes the rank — so you almost never need to touch it manually.</p>
+                    <div
+                        style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">
+                        What is Age Rank?</div>
+                    <p style="font-size:13px;color:var(--text-dim);line-height:1.6;margin:0;">Age Rank controls FIFO
+                        (oldest ships first). <strong style="color:var(--text);">Lower number = older batch = ships
+                            first.</strong> The system reads the SKU prefix (letters before the first digit) and
+                        auto-computes the rank — so you almost never need to touch it manually.</p>
                 </div>
 
                 <div>
-                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">SKU Prefix → Rank Formula</div>
+                    <div
+                        style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">
+                        SKU Prefix → Rank Formula</div>
                     <div style="font-size:12px;color:var(--text-dim);line-height:1.8;font-family:monospace;">
                         A=1 &nbsp; B=2 &nbsp; ... &nbsp; Z=26<br>
                         AA=27 &nbsp; AB=28 &nbsp; ... &nbsp; AZ=52<br>
@@ -40,44 +52,63 @@
                         CA=79 &nbsp; CI=87 &nbsp; CJ=88 &nbsp; CK=89<br>
                         WK=10001 &nbsp; WKA=10002 &nbsp; ... &nbsp; WKH=10009
                     </div>
-                    <div style="font-size:11px;color:var(--text-dim);margin-top:6px;">SKU digits after prefix = trimester + size (e.g. CJ<strong>21</strong> = T2, Universal)</div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:6px;">SKU digits after prefix =
+                        trimester + size (e.g. CJ<strong>21</strong> = T2, Universal)</div>
                 </div>
 
                 <div>
-                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">When Adding a Kit</div>
+                    <div
+                        style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">
+                        When Adding a Kit</div>
                     <ul style="font-size:13px;color:var(--text-dim);line-height:1.8;margin:0;padding-left:16px;">
-                        <li><strong style="color:var(--green);">Leave Age Rank at 0</strong> → system auto-calculates from SKU. Best practice.</li>
-                        <li>Enter any other number → that value is used and <span style="color:var(--yellow);">🔒 locked as MANUAL</span>. Recalculate button will skip it.</li>
+                        <li><strong style="color:var(--green);">Leave Age Rank at 0</strong> → system auto-calculates
+                            from SKU. Best practice.</li>
+                        <li>Enter any other number → that value is used and <span style="color:var(--yellow);">🔒 locked
+                                as MANUAL</span>. Recalculate button will skip it.</li>
                     </ul>
                 </div>
 
                 <div>
-                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">When Editing a Kit</div>
+                    <div
+                        style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">
+                        When Editing a Kit</div>
                     <ul style="font-size:13px;color:var(--text-dim);line-height:1.8;margin:0;padding-left:16px;">
                         <li><strong>Change SKU only</strong> → rank auto-recomputes from new SKU ✅</li>
-                        <li><strong>Change SKU + type a custom rank</strong> → your rank is kept, 🔒 locked as MANUAL</li>
+                        <li><strong>Change SKU + type a custom rank</strong> → your rank is kept, 🔒 locked as MANUAL
+                        </li>
                         <li><strong>Same SKU, set rank to 0</strong> → resets to auto from SKU ✅</li>
                         <li><strong>Same SKU, type different rank</strong> → 🔒 locked as MANUAL</li>
                     </ul>
                 </div>
 
                 <div>
-                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">↻ Recalculate Button — When to Click</div>
+                    <div
+                        style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">
+                        ↻ Recalculate Button — When to Click</div>
                     <ul style="font-size:13px;color:var(--text-dim);line-height:1.8;margin:0;padding-left:16px;">
                         <li>After a bulk import of new kits to set all their ranks at once.</li>
                         <li>If you suspect some ranks are wrong or out of sync with SKUs.</li>
-                        <li><strong style="color:var(--green);">SAFE to click any time</strong> — it <strong>never</strong> touches kits marked 🔒 MANUAL.</li>
-                        <li>You do <strong>not</strong> need to click it after every single edit — only AUTO kits get updated.</li>
+                        <li><strong style="color:var(--green);">SAFE to click any time</strong> — it
+                            <strong>never</strong> touches kits marked 🔒 MANUAL.</li>
+                        <li>You do <strong>not</strong> need to click it after every single edit — only AUTO kits get
+                            updated.</li>
                     </ul>
                 </div>
 
                 <div>
-                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">AUTO vs 🔒 MANUAL</div>
+                    <div
+                        style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">
+                        AUTO vs 🔒 MANUAL</div>
                     <div style="font-size:13px;color:var(--text-dim);line-height:1.6;">
-                        <span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);">AUTO</span>
+                        <span
+                            style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);">AUTO</span>
                         &nbsp;= system computed from SKU. Recalculate can update it.<br><br>
-                        <span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);">🔒 MANUAL</span>
-                        &nbsp;= you set it. Recalculate <strong>will not</strong> change it. To reset to auto, edit the kit and set rank to <code style="background:var(--surface2);padding:1px 4px;border-radius:3px;">0</code>.
+                        <span
+                            style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);">🔒
+                            MANUAL</span>
+                        &nbsp;= you set it. Recalculate <strong>will not</strong> change it. To reset to auto, edit the
+                        kit and set rank to <code
+                            style="background:var(--surface2);padding:1px 4px;border-radius:3px;">0</code>.
                     </div>
                 </div>
 
@@ -123,17 +154,21 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label>Quantity</label>
-                        <input type="number" name="quantity_available" id="kitQtyInput" class="form-control" value="0" min="0"
+                        <input type="number" name="quantity_available" id="kitQtyInput" class="form-control" value="0"
+                            min="0"
                             oninput="document.getElementById('qtyZeroWarn').style.display = this.value == 0 ? 'block' : 'none'">
-                        <div id="qtyZeroWarn" style="display:block; color:var(--yellow); font-size:11px; margin-top:4px;">
+                        <div id="qtyZeroWarn"
+                            style="display:block; color:var(--yellow); font-size:11px; margin-top:4px;">
                             &#9888; Qty is 0 — this kit won’t be assigned until stock is added.
                         </div>
                     </div>
                     <div class="form-group">
-                        <label title="Leave at 0 — system auto-assigns from SKU prefix (recommended)">Age Rank (FIFO) <span style="color:var(--text-dim);font-size:11px;cursor:help;">&#9432;</span></label>
+                        <label title="Leave at 0 — system auto-assigns from SKU prefix (recommended)">Age Rank (FIFO)
+                            <span style="color:var(--text-dim);font-size:11px;cursor:help;">&#9432;</span></label>
                         <input type="number" name="age_rank" class="form-control" value="0" min="0"
                             title="Leave at 0 to let the system auto-assign from SKU. Lower = older = ships first.">
-                        <small style="color:var(--green); font-size:11px;">✅ Leave at 0 — auto-assigned from SKU (recommended). Only set manually if you need to override.</small>
+                        <small style="color:var(--green); font-size:11px;">✅ Leave at 0 — auto-assigned from SKU
+                            (recommended). Only set manually if you need to override.</small>
                     </div>
                     <div class="form-group">
                         <label>Cost per Kit ($)</label>
@@ -199,7 +234,8 @@
 
         {# ── WELCOME KITS ── #}
         {% if welcome_kits %}
-        <div style="padding: 10px 16px 4px; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; color: var(--blue); text-transform: uppercase; border-bottom: 1px solid var(--border);">
+        <div
+            style="padding: 10px 16px 4px; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; color: var(--blue); text-transform: uppercase; border-bottom: 1px solid var(--border);">
             🎁 Welcome Kits — {{ welcome_kits | length }}
         </div>
         <table>
@@ -211,7 +247,8 @@
                     <th>Size</th>
                     <th>Items</th>
                     <th>Quantity</th>
-                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);" title="AUTO = computed from SKU. MANUAL = user-locked.">&#9432;</span></th>
+                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);"
+                            title="AUTO = computed from SKU. MANUAL = user-locked.">&#9432;</span></th>
                     <th>Cost</th>
                     <th>Actions</th>
                 </tr>
@@ -224,29 +261,38 @@
                     </td>
                     <td>{{ k.name or '—' }}</td>
                     <td><span class="badge badge-purple">T{{ k.trimester }}</span></td>
-                    <td>{% if k.size_variant==1 %}Universal{% elif k.size_variant==2 %}M{% elif k.size_variant==3 %}L{% elif k.size_variant==4 %}XL{% endif %}</td>
+                    <td>{% if k.size_variant==1 %}Universal{% elif k.size_variant==2 %}M{% elif k.size_variant==3 %}L{%
+                        elif k.size_variant==4 %}XL{% endif %}</td>
                     <td>
                         {% set count = kit_item_counts.get(k.id, 0) %}
-                        {% if count > 0 %}<a href="/kits/{{ k.id }}" style="color:var(--accent);">{{ count }} item{{ 's' if count != 1 }}</a>
+                        {% if count > 0 %}<a href="/kits/{{ k.id }}" style="color:var(--accent);">{{ count }} item{{ 's'
+                            if count != 1 }}</a>
                         {% else %}<span style="color:var(--text-dim);">0</span>{% endif %}
                     </td>
                     <td>
-                        {% if k.quantity_available <= 10 %}<span style="color:var(--red);font-weight:600;">{{ k.quantity_available }}</span>
-                        {% elif k.quantity_available <= 50 %}<span style="color:var(--yellow);">{{ k.quantity_available }}</span>
-                        {% else %}{{ k.quantity_available }}{% endif %}
+                        {% if k.quantity_available <= 10 %}<span style="color:var(--red);font-weight:600;">{{
+                            k.quantity_available }}</span>
+                            {% elif k.quantity_available <= 50 %}<span style="color:var(--yellow);">{{
+                                k.quantity_available }}</span>
+                                {% else %}{{ k.quantity_available }}{% endif %}
                     </td>
                     <td>
                         {{ k.age_rank }}
                         {% if k.age_rank_source == 'manual' %}
-                        <span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);" title="Manually set — backfill will not change this">&#128274; MANUAL</span>
+                        <span
+                            style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);"
+                            title="Manually set — backfill will not change this">&#128274; MANUAL</span>
                         {% else %}
-                        <span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);" title="Auto-computed from SKU prefix">AUTO</span>
+                        <span
+                            style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);"
+                            title="Auto-computed from SKU prefix">AUTO</span>
                         {% endif %}
                     </td>
                     <td>{% if k.cost_per_kit %}${{ "%.2f" | format(k.cost_per_kit) }}{% else %}—{% endif %}</td>
                     <td style="white-space:nowrap;">
                         <a href="/kits/{{ k.id }}" class="btn btn-sm btn-secondary">View</a>
-                        <form method="POST" action="/kits/{{ k.id }}/remove" style="display:inline;" onsubmit="return confirm('Remove this kit?');">
+                        <form method="POST" action="/kits/{{ k.id }}/remove" style="display:inline;"
+                            onsubmit="return confirm('Remove this kit?');">
                             <button type="submit" class="btn btn-sm btn-danger">Remove</button>
                         </form>
                     </td>
@@ -258,8 +304,10 @@
 
         {# ── REGULAR KITS ── #}
         {% if regular_kits %}
-        <div style="padding: 10px 16px 4px; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; color: var(--text-dim); text-transform: uppercase; border-bottom: 1px solid var(--border); {% if welcome_kits %}border-top: 2px solid var(--border); margin-top: 8px;{% endif %}">
-            📦 Regular Kits — {{ regular_kits | length }} &nbsp;<span style="font-weight:400;font-size:11px;">(sorted oldest → newest)</span>
+        <div
+            style="padding: 10px 16px 4px; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; color: var(--text-dim); text-transform: uppercase; border-bottom: 1px solid var(--border); {% if welcome_kits %}border-top: 2px solid var(--border); margin-top: 8px;{% endif %}">
+            📦 Regular Kits — {{ regular_kits | length }} &nbsp;<span style="font-weight:400;font-size:11px;">(sorted
+                oldest → newest)</span>
         </div>
         <table>
             <thead>
@@ -270,7 +318,8 @@
                     <th>Size</th>
                     <th>Items</th>
                     <th>Quantity</th>
-                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);" title="AUTO = computed from SKU. MANUAL = user-locked.">&#9432;</span></th>
+                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);"
+                            title="AUTO = computed from SKU. MANUAL = user-locked.">&#9432;</span></th>
                     <th>Cost</th>
                     <th>Actions</th>
                 </tr>
@@ -283,29 +332,38 @@
                     </td>
                     <td>{{ k.name or '—' }}</td>
                     <td><span class="badge badge-purple">T{{ k.trimester }}</span></td>
-                    <td>{% if k.size_variant==1 %}Universal{% elif k.size_variant==2 %}M{% elif k.size_variant==3 %}L{% elif k.size_variant==4 %}XL{% endif %}</td>
+                    <td>{% if k.size_variant==1 %}Universal{% elif k.size_variant==2 %}M{% elif k.size_variant==3 %}L{%
+                        elif k.size_variant==4 %}XL{% endif %}</td>
                     <td>
                         {% set count = kit_item_counts.get(k.id, 0) %}
-                        {% if count > 0 %}<a href="/kits/{{ k.id }}" style="color:var(--accent);">{{ count }} item{{ 's' if count != 1 }}</a>
+                        {% if count > 0 %}<a href="/kits/{{ k.id }}" style="color:var(--accent);">{{ count }} item{{ 's'
+                            if count != 1 }}</a>
                         {% else %}<span style="color:var(--text-dim);">0</span>{% endif %}
                     </td>
                     <td>
-                        {% if k.quantity_available <= 10 %}<span style="color:var(--red);font-weight:600;">{{ k.quantity_available }}</span>
-                        {% elif k.quantity_available <= 50 %}<span style="color:var(--yellow);">{{ k.quantity_available }}</span>
-                        {% else %}{{ k.quantity_available }}{% endif %}
+                        {% if k.quantity_available <= 10 %}<span style="color:var(--red);font-weight:600;">{{
+                            k.quantity_available }}</span>
+                            {% elif k.quantity_available <= 50 %}<span style="color:var(--yellow);">{{
+                                k.quantity_available }}</span>
+                                {% else %}{{ k.quantity_available }}{% endif %}
                     </td>
                     <td>
                         {{ k.age_rank }}
                         {% if k.age_rank_source == 'manual' %}
-                        <span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);" title="Manually set — backfill will not change this">&#128274; MANUAL</span>
+                        <span
+                            style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);"
+                            title="Manually set — backfill will not change this">&#128274; MANUAL</span>
                         {% else %}
-                        <span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);" title="Auto-computed from SKU prefix">AUTO</span>
+                        <span
+                            style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);"
+                            title="Auto-computed from SKU prefix">AUTO</span>
                         {% endif %}
                     </td>
                     <td>{% if k.cost_per_kit %}${{ "%.2f" | format(k.cost_per_kit) }}{% else %}—{% endif %}</td>
                     <td style="white-space:nowrap;">
                         <a href="/kits/{{ k.id }}" class="btn btn-sm btn-secondary">View</a>
-                        <form method="POST" action="/kits/{{ k.id }}/remove" style="display:inline;" onsubmit="return confirm('Remove this kit?');">
+                        <form method="POST" action="/kits/{{ k.id }}/remove" style="display:inline;"
+                            onsubmit="return confirm('Remove this kit?');">
                             <button type="submit" class="btn btn-sm btn-danger">Remove</button>
                         </form>
                     </td>
@@ -319,26 +377,26 @@
     </div>
 </div>
 <script>
-async function recalcRanks(btn) {
-    if (!confirm('Recalculate age ranks for all AUTO kits from SKU?\nManually locked kits will NOT be changed.')) return;
-    btn.disabled = true;
-    btn.textContent = 'Recalculating...';
-    try {
-        const res = await fetch('/api/backfill-age-ranks', { method: 'POST' });
-        const data = await res.json();
-        if (data.status === 'ok') {
-            alert(`Done!\n✅ Updated: ${data.updated} kits\n🔒 Skipped (manual): ${data.skipped_manual_overrides}\n⚠️ Unresolved: ${data.unresolved}`);
-            location.reload();
-        } else {
-            alert('Error: ' + data.message);
+    async function recalcRanks(btn) {
+        if (!confirm('Recalculate age ranks for all AUTO kits from SKU?\nManually locked kits will NOT be changed.')) return;
+        btn.disabled = true;
+        btn.textContent = 'Recalculating...';
+        try {
+            const res = await fetch('/api/backfill-age-ranks', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                alert(`Done!\n✅ Updated: ${data.updated} kits\n🔒 Skipped (manual): ${data.skipped_manual_overrides}\n⚠️ Unresolved: ${data.unresolved}`);
+                location.reload();
+            } else {
+                alert('Error: ' + data.message);
+                btn.disabled = false;
+                btn.textContent = '↻ Recalculate Age Ranks';
+            }
+        } catch (e) {
+            alert('Request failed: ' + e);
             btn.disabled = false;
             btn.textContent = '↻ Recalculate Age Ranks';
         }
-    } catch (e) {
-        alert('Request failed: ' + e);
-        btn.disabled = false;
-        btn.textContent = '↻ Recalculate Age Ranks';
     }
-}
 </script>
 {% endblock %}
