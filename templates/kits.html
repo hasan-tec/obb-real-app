@@ -18,6 +18,73 @@
     <div class="alert alert-error">⚠️ {{ error }}</div>
     {% endif %}
 
+    <!-- Age Rank Info Panel -->
+    <div style="background:rgba(99,179,237,0.08); border:1px solid rgba(99,179,237,0.3); border-radius:8px; margin-bottom:18px; overflow:hidden;">
+        <button onclick="var b=document.getElementById('ageRankHelp');b.style.display=b.style.display==='none'?'block':'none';this.querySelector('span').textContent=b.style.display==='none'?'▶':'▼';" style="width:100%;background:none;border:none;cursor:pointer;padding:10px 14px;display:flex;align-items:center;gap:8px;color:var(--accent);font-size:13px;font-weight:600;text-align:left;">
+            <span>▶</span> 📖 How Age Rank works — click to expand (staff guide)
+        </button>
+        <div id="ageRankHelp" style="display:none;padding:0 16px 16px;border-top:1px solid rgba(99,179,237,0.2);">
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:14px;">
+
+                <div>
+                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">What is Age Rank?</div>
+                    <p style="font-size:13px;color:var(--text-dim);line-height:1.6;margin:0;">Age Rank controls FIFO (oldest ships first). <strong style="color:var(--text);">Lower number = older batch = ships first.</strong> The system reads the SKU prefix (letters before the first digit) and auto-computes the rank — so you almost never need to touch it manually.</p>
+                </div>
+
+                <div>
+                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">SKU Prefix → Rank Formula</div>
+                    <div style="font-size:12px;color:var(--text-dim);line-height:1.8;font-family:monospace;">
+                        A=1 &nbsp; B=2 &nbsp; ... &nbsp; Z=26<br>
+                        AA=27 &nbsp; AB=28 &nbsp; ... &nbsp; AZ=52<br>
+                        BA=53 &nbsp; BB=54 &nbsp; ... &nbsp; BT=72 &nbsp; BV=74<br>
+                        CA=79 &nbsp; CI=87 &nbsp; CJ=88 &nbsp; CK=89<br>
+                        WK=10001 &nbsp; WKA=10002 &nbsp; ... &nbsp; WKH=10009
+                    </div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:6px;">SKU digits after prefix = trimester + size (e.g. CJ<strong>21</strong> = T2, Universal)</div>
+                </div>
+
+                <div>
+                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">When Adding a Kit</div>
+                    <ul style="font-size:13px;color:var(--text-dim);line-height:1.8;margin:0;padding-left:16px;">
+                        <li><strong style="color:var(--green);">Leave Age Rank at 0</strong> → system auto-calculates from SKU. Best practice.</li>
+                        <li>Enter any other number → that value is used and <span style="color:var(--yellow);">🔒 locked as MANUAL</span>. Recalculate button will skip it.</li>
+                    </ul>
+                </div>
+
+                <div>
+                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">When Editing a Kit</div>
+                    <ul style="font-size:13px;color:var(--text-dim);line-height:1.8;margin:0;padding-left:16px;">
+                        <li><strong>Change SKU only</strong> → rank auto-recomputes from new SKU ✅</li>
+                        <li><strong>Change SKU + type a custom rank</strong> → your rank is kept, 🔒 locked as MANUAL</li>
+                        <li><strong>Same SKU, set rank to 0</strong> → resets to auto from SKU ✅</li>
+                        <li><strong>Same SKU, type different rank</strong> → 🔒 locked as MANUAL</li>
+                    </ul>
+                </div>
+
+                <div>
+                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">↻ Recalculate Button — When to Click</div>
+                    <ul style="font-size:13px;color:var(--text-dim);line-height:1.8;margin:0;padding-left:16px;">
+                        <li>After a bulk import of new kits to set all their ranks at once.</li>
+                        <li>If you suspect some ranks are wrong or out of sync with SKUs.</li>
+                        <li><strong style="color:var(--green);">SAFE to click any time</strong> — it <strong>never</strong> touches kits marked 🔒 MANUAL.</li>
+                        <li>You do <strong>not</strong> need to click it after every single edit — only AUTO kits get updated.</li>
+                    </ul>
+                </div>
+
+                <div>
+                    <div style="font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin-bottom:8px;">AUTO vs 🔒 MANUAL</div>
+                    <div style="font-size:13px;color:var(--text-dim);line-height:1.6;">
+                        <span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);">AUTO</span>
+                        &nbsp;= system computed from SKU. Recalculate can update it.<br><br>
+                        <span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);">🔒 MANUAL</span>
+                        &nbsp;= you set it. Recalculate <strong>will not</strong> change it. To reset to auto, edit the kit and set rank to <code style="background:var(--surface2);padding:1px 4px;border-radius:3px;">0</code>.
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
     <!-- Add Kit Form -->
     <div class="card" style="margin-bottom: 20px;">
         <div class="card-header">
@@ -63,10 +130,10 @@
                         </div>
                     </div>
                     <div class="form-group">
-                        <label title="Leave at 0 to auto-set from SKU alphabetical order (AA=oldest, CK=newer etc.)">Age Rank (FIFO) <span style="font-size:11px; cursor:help;">&#9432;</span></label>
+                        <label title="Leave at 0 — system auto-assigns from SKU prefix (recommended)">Age Rank (FIFO) <span style="color:var(--text-dim);font-size:11px;cursor:help;">&#9432;</span></label>
                         <input type="number" name="age_rank" class="form-control" value="0" min="0"
-                            title="Leave at 0 to auto-set from SKU. Lower = older batch = ships first (FIFO).">
-                        <small style="color:var(--text-dim); font-size:11px;">0 = auto from SKU prefix (AA oldest → CK newest)</small>
+                            title="Leave at 0 to let the system auto-assign from SKU. Lower = older = ships first.">
+                        <small style="color:var(--green); font-size:11px;">✅ Leave at 0 — auto-assigned from SKU (recommended). Only set manually if you need to override.</small>
                     </div>
                     <div class="form-group">
                         <label>Cost per Kit ($)</label>

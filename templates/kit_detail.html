@@ -34,7 +34,7 @@
             <form method="POST" action="/kits/{{ kit.id }}/edit">
                 <div class="form-row">
                     <div class="form-group">
-                        <label>SKU <span style="color:var(--text-dim);font-size:12px;">(Age rank auto-set from SKU)</span></label>
+                        <label>SKU <span style="color:var(--text-dim);font-size:11px;">— changing SKU resets age rank to auto (unless you also type a custom rank below)</span></label>
                         <input type="text" name="sku" class="form-control" value="{{ kit.sku }}"
                             style="font-family:monospace; text-transform:uppercase;" required>
                     </div>
@@ -68,8 +68,21 @@
                             value="{{ kit.quantity_available }}" min="0">
                     </div>
                     <div class="form-group">
-                        <label>Age Rank (FIFO) <span style="color:var(--text-dim);font-size:11px;">0 = auto from SKU</span></label>
+                        <label>Age Rank (FIFO)
+                            {% if kit.age_rank_source == 'manual' %}
+                            <span style="margin-left:6px;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);">🔒 MANUAL</span>
+                            {% else %}
+                            <span style="margin-left:6px;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);">AUTO</span>
+                            {% endif %}
+                        </label>
                         <input type="number" name="age_rank" class="form-control" value="{{ kit.age_rank }}" min="0">
+                        <div style="font-size:11px;margin-top:5px;line-height:1.7;color:var(--text-dim);">
+                            <strong style="color:var(--text);">Rules:</strong><br>
+                            • Set to <code style="background:var(--surface2);padding:0 3px;border-radius:2px;">0</code> → system auto-recomputes from SKU and marks AUTO.<br>
+                            • Change SKU only → rank auto-recomputes from the new SKU (your current rank value is ignored).<br>
+                            • Change SKU <em>and</em> type a custom rank → your rank is kept, marked 🔒 MANUAL. Recalculate will skip it.<br>
+                            • Same SKU, type different rank → 🔒 MANUAL. To unlock, set back to <code style="background:var(--surface2);padding:0 3px;border-radius:2px;">0</code>.
+                        </div>
                     </div>
                     <div class="form-group">
                         <label>Cost per Kit ($)</label>
