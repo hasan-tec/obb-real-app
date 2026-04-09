@@ -122,7 +122,19 @@
                 &#8635; Recalculate Age Ranks
             </button>
         </div>
-        {% if kits %}
+
+        {% if not welcome_kits and not regular_kits %}
+        <div class="empty-state">
+            <div class="icon">📦</div>
+            <p>No kits yet. Add kits using the form above.</p>
+        </div>
+        {% else %}
+
+        {# ── WELCOME KITS ── #}
+        {% if welcome_kits %}
+        <div style="padding: 10px 16px 4px; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; color: var(--blue); text-transform: uppercase; border-bottom: 1px solid var(--border);">
+            🎁 Welcome Kits — {{ welcome_kits | length }}
+        </div>
         <table>
             <thead>
                 <tr>
@@ -130,53 +142,31 @@
                     <th>Name</th>
                     <th>Trimester</th>
                     <th>Size</th>
-                    <th>Type</th>
                     <th>Items</th>
                     <th>Quantity</th>
-                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);" title="AUTO = computed from SKU. MANUAL = user-locked, not changed by recalculate.">&#9432;</span></th>
+                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);" title="AUTO = computed from SKU. MANUAL = user-locked.">&#9432;</span></th>
                     <th>Cost</th>
                     <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
-                {% for k in kits %}
+                {% for k in welcome_kits %}
                 <tr>
-                    <td style="font-weight: 600; font-family: monospace;">
-                        <a href="/kits/{{ k.id }}" style="color: var(--accent);">{{ k.sku }}</a>
+                    <td style="font-weight:600; font-family:monospace;">
+                        <a href="/kits/{{ k.id }}" style="color:var(--accent);">{{ k.sku }}</a>
                     </td>
                     <td>{{ k.name or '—' }}</td>
                     <td><span class="badge badge-purple">T{{ k.trimester }}</span></td>
-                    <td>
-                        {% if k.size_variant == 1 %}Universal
-                        {% elif k.size_variant == 2 %}M
-                        {% elif k.size_variant == 3 %}L
-                        {% elif k.size_variant == 4 %}XL
-                        {% endif %}
-                    </td>
-                    <td>
-                        {% if k.is_welcome_kit %}
-                        <span class="badge badge-blue">Welcome</span>
-                        {% else %}
-                        <span class="badge badge-dim">Regular</span>
-                        {% endif %}
-                    </td>
+                    <td>{% if k.size_variant==1 %}Universal{% elif k.size_variant==2 %}M{% elif k.size_variant==3 %}L{% elif k.size_variant==4 %}XL{% endif %}</td>
                     <td>
                         {% set count = kit_item_counts.get(k.id, 0) %}
-                        {% if count > 0 %}
-                        <a href="/kits/{{ k.id }}" style="color: var(--accent);">{{ count }} item{{ 's' if count != 1
-                            }}</a>
-                        {% else %}
-                        <span style="color: var(--text-dim);">0</span>
-                        {% endif %}
+                        {% if count > 0 %}<a href="/kits/{{ k.id }}" style="color:var(--accent);">{{ count }} item{{ 's' if count != 1 }}</a>
+                        {% else %}<span style="color:var(--text-dim);">0</span>{% endif %}
                     </td>
                     <td>
-                        {% if k.quantity_available <= 10 %} <span style="color: var(--red); font-weight: 600;">{{
-                            k.quantity_available }}</span>
-                            {% elif k.quantity_available <= 50 %} <span style="color: var(--yellow);">{{
-                                k.quantity_available }}</span>
-                                {% else %}
-                                {{ k.quantity_available }}
-                                {% endif %}
+                        {% if k.quantity_available <= 10 %}<span style="color:var(--red);font-weight:600;">{{ k.quantity_available }}</span>
+                        {% elif k.quantity_available <= 50 %}<span style="color:var(--yellow);">{{ k.quantity_available }}</span>
+                        {% else %}{{ k.quantity_available }}{% endif %}
                     </td>
                     <td>
                         {{ k.age_rank }}
@@ -187,10 +177,9 @@
                         {% endif %}
                     </td>
                     <td>{% if k.cost_per_kit %}${{ "%.2f" | format(k.cost_per_kit) }}{% else %}—{% endif %}</td>
-                    <td style="white-space: nowrap;">
+                    <td style="white-space:nowrap;">
                         <a href="/kits/{{ k.id }}" class="btn btn-sm btn-secondary">View</a>
-                        <form method="POST" action="/kits/{{ k.id }}/remove" style="display:inline;"
-                            onsubmit="return confirm('Remove this kit? Used kits cannot be deleted.');">
+                        <form method="POST" action="/kits/{{ k.id }}/remove" style="display:inline;" onsubmit="return confirm('Remove this kit?');">
                             <button type="submit" class="btn btn-sm btn-danger">Remove</button>
                         </form>
                     </td>
@@ -198,11 +187,67 @@
                 {% endfor %}
             </tbody>
         </table>
-        {% else %}
-        <div class="empty-state">
-            <div class="icon">📦</div>
-            <p>No kits yet. Add kits using the form above.</p>
+        {% endif %}
+
+        {# ── REGULAR KITS ── #}
+        {% if regular_kits %}
+        <div style="padding: 10px 16px 4px; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; color: var(--text-dim); text-transform: uppercase; border-bottom: 1px solid var(--border); {% if welcome_kits %}border-top: 2px solid var(--border); margin-top: 8px;{% endif %}">
+            📦 Regular Kits — {{ regular_kits | length }} &nbsp;<span style="font-weight:400;font-size:11px;">(sorted oldest → newest)</span>
         </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>SKU</th>
+                    <th>Name</th>
+                    <th>Trimester</th>
+                    <th>Size</th>
+                    <th>Items</th>
+                    <th>Quantity</th>
+                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);" title="AUTO = computed from SKU. MANUAL = user-locked.">&#9432;</span></th>
+                    <th>Cost</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for k in regular_kits %}
+                <tr>
+                    <td style="font-weight:600; font-family:monospace;">
+                        <a href="/kits/{{ k.id }}" style="color:var(--accent);">{{ k.sku }}</a>
+                    </td>
+                    <td>{{ k.name or '—' }}</td>
+                    <td><span class="badge badge-purple">T{{ k.trimester }}</span></td>
+                    <td>{% if k.size_variant==1 %}Universal{% elif k.size_variant==2 %}M{% elif k.size_variant==3 %}L{% elif k.size_variant==4 %}XL{% endif %}</td>
+                    <td>
+                        {% set count = kit_item_counts.get(k.id, 0) %}
+                        {% if count > 0 %}<a href="/kits/{{ k.id }}" style="color:var(--accent);">{{ count }} item{{ 's' if count != 1 }}</a>
+                        {% else %}<span style="color:var(--text-dim);">0</span>{% endif %}
+                    </td>
+                    <td>
+                        {% if k.quantity_available <= 10 %}<span style="color:var(--red);font-weight:600;">{{ k.quantity_available }}</span>
+                        {% elif k.quantity_available <= 50 %}<span style="color:var(--yellow);">{{ k.quantity_available }}</span>
+                        {% else %}{{ k.quantity_available }}{% endif %}
+                    </td>
+                    <td>
+                        {{ k.age_rank }}
+                        {% if k.age_rank_source == 'manual' %}
+                        <span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);" title="Manually set — backfill will not change this">&#128274; MANUAL</span>
+                        {% else %}
+                        <span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);" title="Auto-computed from SKU prefix">AUTO</span>
+                        {% endif %}
+                    </td>
+                    <td>{% if k.cost_per_kit %}${{ "%.2f" | format(k.cost_per_kit) }}{% else %}—{% endif %}</td>
+                    <td style="white-space:nowrap;">
+                        <a href="/kits/{{ k.id }}" class="btn btn-sm btn-secondary">View</a>
+                        <form method="POST" action="/kits/{{ k.id }}/remove" style="display:inline;" onsubmit="return confirm('Remove this kit?');">
+                            <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+
         {% endif %}
     </div>
 </div>
