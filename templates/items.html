@@ -9,7 +9,8 @@
 </div>
 <div class="content">
     {% if msg %}
-    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="margin-bottom: 16px;">
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}"
+        style="margin-bottom: 16px;">
         {{ msg }}
     </div>
     {% endif %}
@@ -118,8 +119,8 @@
                             </div>
                             <label
                                 style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:13px; margin-bottom:10px;">
-                                <input type="checkbox" name="is_therabox" value="true" {% if i.is_therabox
-                                    %}checked{% endif %}> TheraBox item
+                                <input type="checkbox" name="is_therabox" value="true" {% if i.is_therabox %}checked{%
+                                    endif %}> TheraBox item
                             </label>
                             <div style="display:flex; gap:8px;">
                                 <button type="submit" class="btn btn-sm btn-primary">✓ Save</button>
