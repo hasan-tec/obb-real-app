@@ -2380,7 +2380,7 @@ async def add_kit(
         if age_rank == 0:
             age_rank = compute_age_rank_from_sku(sku_clean)
             logger.info(f"[KITS] Auto-computed age_rank={age_rank} from SKU '{sku_clean}'")
-        logger.info(f"[KITS] Adding kit: sku={sku_clean}, T{trimester}, size={size_variant}, welcome={welcome}, qty={quantity_available}, age_rank={age_rank}")
+        logger.info(f"[KITS] Adding kit: sku={sku_clean}, T{trimester}, size={size_variant}, welcome={welcome}, qty={quantity_available}, age_rank={age_rank} (source=auto)")
         kit_result = db.table("kits").insert({
             "sku": sku_clean,
             "name": name.strip() or None,
@@ -2389,6 +2389,7 @@ async def add_kit(
             "is_welcome_kit": welcome,
             "quantity_available": quantity_available,
             "age_rank": age_rank,
+            "age_rank_source": "auto",
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
         }).execute()
         kit_id = kit_result.data[0]["id"] if kit_result.data else None
@@ -3027,13 +3028,13 @@ async def api_fix_gsheet_headers():
 @app.post("/api/backfill-age-ranks")
 async def api_backfill_age_ranks():
     """
-    One-time utility: compute age_rank from SKU for every kit that still has age_rank=0.
-    Safe to re-run — only updates kits where age_rank is currently 0.
-    Kits with a manually set age_rank (non-zero) are left untouched.
+    Compute age_rank from SKU for every kit that is NOT manually overridden.
+    Safe to re-run — only skips kits where age_rank_source='manual' (user explicitly set).
+    All other kits (auto or unknown) get recomputed.
     """
     try:
         db = get_supabase()
-        kits_result = db.table("kits").select("id, sku, age_rank").execute()
+        kits_result = db.table("kits").select("id, sku, age_rank, age_rank_source").execute()
         all_kits = kits_result.data or []
         logger.info(f"[BACKFILL] Starting age_rank backfill for {len(all_kits)} total kits")
 
@@ -3044,23 +3045,23 @@ async def api_backfill_age_ranks():
         for kit in all_kits:
             kit_id = kit["id"]
             sku = kit["sku"]
-            current_rank = kit.get("age_rank") or 0
+            source = kit.get("age_rank_source") or "auto"
 
-            # Don't overwrite manually set values
-            if current_rank != 0:
+            # Only skip kits the user has manually locked
+            if source == "manual":
                 skipped_manual.append(sku)
-                logger.info(f"[BACKFILL] Skipping {sku} — already has age_rank={current_rank}")
+                logger.info(f"[BACKFILL] Skipping {sku} — age_rank_source=manual (user override preserved)")
                 continue
 
             computed = compute_age_rank_from_sku(sku)
             if computed == 0:
                 skipped_unresolved.append(sku)
-                logger.warning(f"[BACKFILL] Could not compute age_rank for SKU '{sku}' — leaving at 0")
+                logger.warning(f"[BACKFILL] Could not compute age_rank for SKU '{sku}' — leaving as-is")
                 continue
 
-            db.table("kits").update({"age_rank": computed}).eq("id", kit_id).execute()
+            db.table("kits").update({"age_rank": computed, "age_rank_source": "auto"}).eq("id", kit_id).execute()
             updated.append({"sku": sku, "age_rank": computed})
-            logger.info(f"[BACKFILL] ✅ {sku} → age_rank={computed}")
+            logger.info(f"[BACKFILL] ✅ {sku} → age_rank={computed} (source=auto)")
 
         logger.info(
             f"[BACKFILL] Done. Updated={len(updated)}, "
@@ -3069,13 +3070,13 @@ async def api_backfill_age_ranks():
         await log_activity(
             "kit",
             f"Age rank backfill: {len(updated)} updated",
-            f"Skipped (manual): {len(skipped_manual)}, Unresolved: {len(skipped_unresolved)}",
+            f"Skipped manual overrides: {len(skipped_manual)}, Unresolved: {len(skipped_unresolved)}",
             "success",
         )
         return JSONResponse({
             "status": "ok",
             "updated": len(updated),
-            "skipped_already_set": len(skipped_manual),
+            "skipped_manual_overrides": len(skipped_manual),
             "unresolved": len(skipped_unresolved),
             "details": updated,
             "unresolved_skus": skipped_unresolved,
@@ -3822,10 +3823,21 @@ async def edit_kit(
         current_sku = current.data["sku"] if current.data else ""
         sku_clean = sku.strip().upper() if sku and sku.strip() else current_sku
 
-        # Auto-compute age_rank from SKU when not manually set (age_rank == 0)
+        # Compute auto rank for comparison
+        auto_rank = compute_age_rank_from_sku(sku_clean)
         if age_rank == 0:
-            age_rank = compute_age_rank_from_sku(sku_clean)
+            # User left it blank/zero — use auto
+            age_rank = auto_rank
+            age_rank_source = "auto"
             logger.info(f"[KIT EDIT] Auto-computed age_rank={age_rank} from SKU '{sku_clean}'")
+        elif age_rank == auto_rank:
+            # User typed the same value as computed — still auto
+            age_rank_source = "auto"
+            logger.info(f"[KIT EDIT] age_rank={age_rank} matches auto-computed — source=auto")
+        else:
+            # User typed a different value — mark as manual override (locked from backfill)
+            age_rank_source = "manual"
+            logger.info(f"[KIT EDIT] age_rank={age_rank} differs from auto={auto_rank} — source=manual (locked)")
 
         record = {
             "sku": sku_clean,
@@ -3835,11 +3847,12 @@ async def edit_kit(
             "is_welcome_kit": welcome,
             "quantity_available": quantity_available,
             "age_rank": age_rank,
+            "age_rank_source": age_rank_source,
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
         }
         db.table("kits").update(record).eq("id", kit_id).execute()
-        logger.info(f"[KIT EDIT] Updated kit {sku_clean}: T{trimester}, qty={quantity_available}, welcome={welcome}, age_rank={age_rank}")
-        await log_activity("kit", f"Edited kit {sku_clean}", f"T{trimester}, Qty: {quantity_available}, Age Rank: {age_rank}", "success")
+        logger.info(f"[KIT EDIT] Updated kit {sku_clean}: T{trimester}, qty={quantity_available}, welcome={welcome}, age_rank={age_rank}, source={age_rank_source}")
+        await log_activity("kit", f"Edited kit {sku_clean}", f"T{trimester}, Qty: {quantity_available}, Age Rank: {age_rank} ({age_rank_source})", "success")
     except Exception as e:
         logger.error(f"[KIT EDIT] Error: {e}", exc_info=True)
     return RedirectResponse(f"/kits/{kit_id}", status_code=303)

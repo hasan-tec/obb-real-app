@@ -115,8 +115,12 @@
 
     <!-- Kits Table -->
     <div class="card">
-        <div class="card-header">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
             <h3>All Kits</h3>
+            <button id="recalcBtn" onclick="recalcRanks(this)" class="btn btn-sm btn-secondary"
+                title="Recompute age ranks from SKU for all kits not manually locked">
+                &#8635; Recalculate Age Ranks
+            </button>
         </div>
         {% if kits %}
         <table>
@@ -129,7 +133,7 @@
                     <th>Type</th>
                     <th>Items</th>
                     <th>Quantity</th>
-                    <th>Age Rank</th>
+                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);" title="AUTO = computed from SKU. MANUAL = user-locked, not changed by recalculate.">&#9432;</span></th>
                     <th>Cost</th>
                     <th>Actions</th>
                 </tr>
@@ -174,7 +178,14 @@
                                 {{ k.quantity_available }}
                                 {% endif %}
                     </td>
-                    <td>{{ k.age_rank }}</td>
+                    <td>
+                        {{ k.age_rank }}
+                        {% if k.age_rank_source == 'manual' %}
+                        <span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(255,193,7,0.15);color:var(--yellow);border:1px solid var(--yellow);" title="Manually set — backfill will not change this">&#128274; MANUAL</span>
+                        {% else %}
+                        <span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(0,200,100,0.1);color:var(--green);border:1px solid var(--green);" title="Auto-computed from SKU prefix">AUTO</span>
+                        {% endif %}
+                    </td>
                     <td>{% if k.cost_per_kit %}${{ "%.2f" | format(k.cost_per_kit) }}{% else %}—{% endif %}</td>
                     <td style="white-space: nowrap;">
                         <a href="/kits/{{ k.id }}" class="btn btn-sm btn-secondary">View</a>
@@ -195,4 +206,27 @@
         {% endif %}
     </div>
 </div>
+<script>
+async function recalcRanks(btn) {
+    if (!confirm('Recalculate age ranks for all AUTO kits from SKU?\nManually locked kits will NOT be changed.')) return;
+    btn.disabled = true;
+    btn.textContent = 'Recalculating...';
+    try {
+        const res = await fetch('/api/backfill-age-ranks', { method: 'POST' });
+        const data = await res.json();
+        if (data.status === 'ok') {
+            alert(`Done!\n✅ Updated: ${data.updated} kits\n🔒 Skipped (manual): ${data.skipped_manual_overrides}\n⚠️ Unresolved: ${data.unresolved}`);
+            location.reload();
+        } else {
+            alert('Error: ' + data.message);
+            btn.disabled = false;
+            btn.textContent = '↻ Recalculate Age Ranks';
+        }
+    } catch (e) {
+        alert('Request failed: ' + e);
+        btn.disabled = false;
+        btn.textContent = '↻ Recalculate Age Ranks';
+    }
+}
+</script>
 {% endblock %}
