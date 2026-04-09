@@ -2321,7 +2321,7 @@ async def kits_page(request: Request):
     """View and manage kits inventory."""
     try:
         db = get_supabase()
-        kits_data = db.table("kits").select("*").order("trimester").order("age_rank").execute()
+        kits_data = db.table("kits").select("*").execute()
         msg = request.query_params.get("msg", "")
         msg_type = request.query_params.get("msg_type", "success")
 
@@ -2333,12 +2333,26 @@ async def kits_page(request: Request):
                 kid = ki["kit_id"]
                 kit_item_counts[kid] = kit_item_counts.get(kid, 0) + 1
 
+        # Split into welcome kits and regular kits, each sorted trimester → age_rank
+        all_kits = kits_data.data or []
+        welcome_kits = sorted(
+            [k for k in all_kits if k.get("is_welcome_kit")],
+            key=lambda k: (k.get("trimester", 0), k.get("age_rank", 0))
+        )
+        regular_kits = sorted(
+            [k for k in all_kits if not k.get("is_welcome_kit")],
+            key=lambda k: (k.get("trimester", 0), k.get("age_rank", 0))
+        )
+        logger.info(f"[KITS PAGE] {len(welcome_kits)} welcome kits, {len(regular_kits)} regular kits")
+
         # Get all items for the kit creation form
         all_items = db.table("items").select("*").order("name").execute()
 
         return templates.TemplateResponse("kits.html", {
             "request": request,
-            "kits": kits_data.data or [],
+            "kits": all_kits,           # kept for backwards compat
+            "welcome_kits": welcome_kits,
+            "regular_kits": regular_kits,
             "kit_item_counts": kit_item_counts,
             "all_items": all_items.data or [],
             "msg": msg,
@@ -2350,6 +2364,8 @@ async def kits_page(request: Request):
         return templates.TemplateResponse("kits.html", {
             "request": request,
             "kits": [],
+            "welcome_kits": [],
+            "regular_kits": [],
             "kit_item_counts": {},
             "all_items": [],
             "error": str(e),
@@ -3818,26 +3834,42 @@ async def edit_kit(
         db = get_supabase()
         welcome = is_welcome_kit.lower() in ("true", "on", "1", "yes") if is_welcome_kit else False
 
-        # Fetch current SKU so we can log accurately and fall back if blank
-        current = db.table("kits").select("sku").eq("id", kit_id).single().execute()
+        # Fetch current SKU + source so we can detect changes
+        current = db.table("kits").select("sku, age_rank_source").eq("id", kit_id).single().execute()
         current_sku = current.data["sku"] if current.data else ""
+        current_source = current.data.get("age_rank_source") or "auto" if current.data else "auto"
         sku_clean = sku.strip().upper() if sku and sku.strip() else current_sku
+        sku_changed = sku_clean != current_sku
 
-        # Compute auto rank for comparison
+        # Age rank source logic:
+        # 1. SKU changed → always recompute from new SKU, reset to auto
+        # 2. SKU same, age_rank==0 → compute from SKU, auto
+        # 3. SKU same, age_rank matches formula → auto
+        # 4. SKU same, age_rank differs from formula → manual (user explicitly overrode)
         auto_rank = compute_age_rank_from_sku(sku_clean)
-        if age_rank == 0:
-            # User left it blank/zero — use auto
+
+        if sku_changed:
+            # SKU changed — check if staff also explicitly set a different age rank
+            if age_rank != 0 and age_rank != auto_rank:
+                # Staff changed SKU AND typed a custom rank → respect it as manual
+                age_rank_source = "manual"
+                logger.info(f"[KIT EDIT] SKU changed {current_sku}→{sku_clean} AND age_rank={age_rank} differs from formula={auto_rank} — source=manual (staff override kept)")
+            else:
+                # Staff changed SKU but left age_rank matching formula (or 0) → recompute auto
+                age_rank = auto_rank if auto_rank != 0 else age_rank
+                age_rank_source = "auto"
+                logger.info(f"[KIT EDIT] SKU changed {current_sku}→{sku_clean}: recomputed age_rank={age_rank} (source=auto)")
+        elif age_rank == 0:
             age_rank = auto_rank
             age_rank_source = "auto"
-            logger.info(f"[KIT EDIT] Auto-computed age_rank={age_rank} from SKU '{sku_clean}'")
+            logger.info(f"[KIT EDIT] age_rank=0 submitted, auto-computed={age_rank} from SKU '{sku_clean}'")
         elif age_rank == auto_rank:
-            # User typed the same value as computed — still auto
             age_rank_source = "auto"
-            logger.info(f"[KIT EDIT] age_rank={age_rank} matches auto-computed — source=auto")
+            logger.info(f"[KIT EDIT] age_rank={age_rank} matches formula — source=auto")
         else:
-            # User typed a different value — mark as manual override (locked from backfill)
+            # Value differs from formula AND SKU didn't change — this is an explicit manual override
             age_rank_source = "manual"
-            logger.info(f"[KIT EDIT] age_rank={age_rank} differs from auto={auto_rank} — source=manual (locked)")
+            logger.info(f"[KIT EDIT] age_rank={age_rank} differs from auto={auto_rank} — source=manual (locked from backfill)")
 
         record = {
             "sku": sku_clean,
