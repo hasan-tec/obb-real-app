@@ -388,6 +388,81 @@ def parse_due_date(due_date_str: str) -> Optional[date]:
     return None
 
 
+def compute_age_rank_from_sku(sku: str) -> int:
+    """
+    Auto-compute FIFO age rank from kit SKU prefix.
+
+    Rules (from OBB naming convention):
+      - Strip leading 'RW-' (reworked kit marker) before parsing
+      - Extract alpha prefix = all letters before the first digit
+      - Welcome kits (prefix starts with 'WK'):
+          'WK'  alone       → 10001 (oldest WK)
+          'WKA'             → 10002
+          'WKB'             → 10003
+          ...
+          'WKH'             → 10009
+      - Regular kits (alphabetical batches):
+          Single letter A-Z → rank 1-26
+          Double letters AA-ZZ:
+            rank = (pos_of_first_letter) * 26 + (pos_of_second_letter)
+            AA=27, AB=28 ... AZ=52, BA=53 ... CK=89
+      - Returns 0 if the prefix can't be parsed (keeps manual override).
+    """
+    if not sku:
+        return 0
+
+    clean = sku.strip().upper()
+
+    # Strip reworked prefix
+    if clean.startswith("RW-"):
+        clean = clean[3:]
+    elif clean.startswith("RW"):
+        clean = clean[2:]
+
+    # Extract alpha prefix (letters before first digit)
+    prefix = ""
+    for ch in clean:
+        if ch.isalpha():
+            prefix += ch
+        else:
+            break
+
+    if not prefix:
+        logger.warning(f"[AGE_RANK] Could not extract alpha prefix from SKU '{sku}' — returning 0")
+        return 0
+
+    # Welcome kits: WK, WKA … WKZ
+    if prefix.startswith("WK"):
+        suffix = prefix[2:]  # everything after 'WK'
+        if suffix == "":
+            return 10001
+        if len(suffix) == 1 and suffix.isalpha():
+            return 10001 + (ord(suffix) - ord("A") + 1)
+        # Long WK prefix — fall through to 0
+        logger.warning(f"[AGE_RANK] Unrecognised WK prefix '{prefix}' for SKU '{sku}'")
+        return 0
+
+    # BP special T1 box — treat as regular double-letter
+    # Regular batches: single or double letters
+    if len(prefix) == 1:
+        return ord(prefix[0]) - ord("A") + 1  # A=1 … Z=26
+
+    if len(prefix) == 2:
+        first = ord(prefix[0]) - ord("A") + 1
+        second = ord(prefix[1]) - ord("A") + 1
+        return first * 26 + second  # AA=27, BT=72, CK=89
+
+    # Triple-letter and beyond (future-proofing)
+    if len(prefix) == 3:
+        a = ord(prefix[0]) - ord("A") + 1
+        b = ord(prefix[1]) - ord("A") + 1
+        c = ord(prefix[2]) - ord("A") + 1
+        return a * 676 + b * 26 + c
+
+    logger.warning(f"[AGE_RANK] Prefix '{prefix}' too long for SKU '{sku}' — returning 0")
+    return 0
+
+
 def parse_history_item_refs(raw_value: str) -> list[str]:
     """Split comma/newline separated item refs for manual shipment history entry."""
     if not raw_value:
@@ -2301,6 +2376,10 @@ async def add_kit(
         db = get_supabase()
         welcome = is_welcome_kit.lower() in ("true", "on", "1", "yes") if is_welcome_kit else False
         sku_clean = sku.strip().upper()
+        # Auto-compute age_rank from SKU when not manually set (age_rank == 0)
+        if age_rank == 0:
+            age_rank = compute_age_rank_from_sku(sku_clean)
+            logger.info(f"[KITS] Auto-computed age_rank={age_rank} from SKU '{sku_clean}'")
         logger.info(f"[KITS] Adding kit: sku={sku_clean}, T{trimester}, size={size_variant}, welcome={welcome}, qty={quantity_available}, age_rank={age_rank}")
         kit_result = db.table("kits").insert({
             "sku": sku_clean,
@@ -2942,6 +3021,68 @@ async def api_fix_gsheet_headers():
         await log_activity("gsheets", "Fixed Google Sheet headers", "Updated to 12-column format", "success")
         return JSONResponse({"status": "ok", "message": "Headers updated successfully"})
     return JSONResponse({"status": "error", "message": "Failed to update headers — check logs"}, status_code=500)
+
+
+# ─── API: Backfill age ranks from SKU ───
+@app.post("/api/backfill-age-ranks")
+async def api_backfill_age_ranks():
+    """
+    One-time utility: compute age_rank from SKU for every kit that still has age_rank=0.
+    Safe to re-run — only updates kits where age_rank is currently 0.
+    Kits with a manually set age_rank (non-zero) are left untouched.
+    """
+    try:
+        db = get_supabase()
+        kits_result = db.table("kits").select("id, sku, age_rank").execute()
+        all_kits = kits_result.data or []
+        logger.info(f"[BACKFILL] Starting age_rank backfill for {len(all_kits)} total kits")
+
+        updated = []
+        skipped_manual = []
+        skipped_unresolved = []
+
+        for kit in all_kits:
+            kit_id = kit["id"]
+            sku = kit["sku"]
+            current_rank = kit.get("age_rank") or 0
+
+            # Don't overwrite manually set values
+            if current_rank != 0:
+                skipped_manual.append(sku)
+                logger.info(f"[BACKFILL] Skipping {sku} — already has age_rank={current_rank}")
+                continue
+
+            computed = compute_age_rank_from_sku(sku)
+            if computed == 0:
+                skipped_unresolved.append(sku)
+                logger.warning(f"[BACKFILL] Could not compute age_rank for SKU '{sku}' — leaving at 0")
+                continue
+
+            db.table("kits").update({"age_rank": computed}).eq("id", kit_id).execute()
+            updated.append({"sku": sku, "age_rank": computed})
+            logger.info(f"[BACKFILL] ✅ {sku} → age_rank={computed}")
+
+        logger.info(
+            f"[BACKFILL] Done. Updated={len(updated)}, "
+            f"SkippedManual={len(skipped_manual)}, Unresolved={len(skipped_unresolved)}"
+        )
+        await log_activity(
+            "kit",
+            f"Age rank backfill: {len(updated)} updated",
+            f"Skipped (manual): {len(skipped_manual)}, Unresolved: {len(skipped_unresolved)}",
+            "success",
+        )
+        return JSONResponse({
+            "status": "ok",
+            "updated": len(updated),
+            "skipped_already_set": len(skipped_manual),
+            "unresolved": len(skipped_unresolved),
+            "details": updated,
+            "unresolved_skus": skipped_unresolved,
+        })
+    except Exception as e:
+        logger.error(f"[BACKFILL] Error during age_rank backfill: {e}", exc_info=True)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 # ─── API: Test webhook (manual trigger for testing) ───
@@ -3662,6 +3803,7 @@ async def recurate_customer(request: Request, customer_id: str):
 async def edit_kit(
     request: Request,
     kit_id: str,
+    sku: str = Form(None),
     name: str = Form(""),
     trimester: int = Form(...),
     size_variant: int = Form(1),
@@ -3670,11 +3812,23 @@ async def edit_kit(
     age_rank: int = Form(0),
     cost_per_kit: float = Form(0),
 ):
-    """Edit an existing kit's details."""
+    """Edit an existing kit's details, including SKU."""
     try:
         db = get_supabase()
         welcome = is_welcome_kit.lower() in ("true", "on", "1", "yes") if is_welcome_kit else False
+
+        # Fetch current SKU so we can log accurately and fall back if blank
+        current = db.table("kits").select("sku").eq("id", kit_id).single().execute()
+        current_sku = current.data["sku"] if current.data else ""
+        sku_clean = sku.strip().upper() if sku and sku.strip() else current_sku
+
+        # Auto-compute age_rank from SKU when not manually set (age_rank == 0)
+        if age_rank == 0:
+            age_rank = compute_age_rank_from_sku(sku_clean)
+            logger.info(f"[KIT EDIT] Auto-computed age_rank={age_rank} from SKU '{sku_clean}'")
+
         record = {
+            "sku": sku_clean,
             "name": name.strip() or None,
             "trimester": trimester,
             "size_variant": size_variant,
@@ -3684,10 +3838,8 @@ async def edit_kit(
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
         }
         db.table("kits").update(record).eq("id", kit_id).execute()
-        kit = db.table("kits").select("sku").eq("id", kit_id).single().execute()
-        sku = kit.data["sku"] if kit.data else kit_id[:8]
-        logger.info(f"[KIT EDIT] Updated kit {sku}: T{trimester}, qty={quantity_available}, welcome={welcome}")
-        await log_activity("kit", f"Edited kit {sku}", f"T{trimester}, Qty: {quantity_available}", "success")
+        logger.info(f"[KIT EDIT] Updated kit {sku_clean}: T{trimester}, qty={quantity_available}, welcome={welcome}, age_rank={age_rank}")
+        await log_activity("kit", f"Edited kit {sku_clean}", f"T{trimester}, Qty: {quantity_available}, Age Rank: {age_rank}", "success")
     except Exception as e:
         logger.error(f"[KIT EDIT] Error: {e}", exc_info=True)
     return RedirectResponse(f"/kits/{kit_id}", status_code=303)

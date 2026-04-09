@@ -63,10 +63,10 @@
                         </div>
                     </div>
                     <div class="form-group">
-                        <label title="Lower number = older batch = ships first (FIFO). Set 1 for oldest inventory.">Age Rank (FIFO) <span style="font-size:11px; cursor:help;">&#9432;</span></label>
+                        <label title="Leave at 0 to auto-set from SKU alphabetical order (AA=oldest, CK=newer etc.)">Age Rank (FIFO) <span style="font-size:11px; cursor:help;">&#9432;</span></label>
                         <input type="number" name="age_rank" class="form-control" value="0" min="0"
-                            title="Lower number = older batch = ships first (FIFO). Set 1 for oldest available inventory.">
-                        <small style="color:var(--text-dim); font-size:11px;">Lower = older batch = ships first</small>
+                            title="Leave at 0 to auto-set from SKU. Lower = older batch = ships first (FIFO).">
+                        <small style="color:var(--text-dim); font-size:11px;">0 = auto from SKU prefix (AA oldest → CK newest)</small>
                     </div>
                     <div class="form-group">
                         <label>Cost per Kit ($)</label>
