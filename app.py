@@ -2321,6 +2321,7 @@ async def customer_detail(request: Request, customer_id: str):
             "decisions": decisions.data or [],
             "shipments": shipments,
             "kits": kits_list.data or [],
+            "stored_trimester": stored_trimester,
             "live_trimester": live_trimester,
             "trimester_changed": trimester_changed,
             "msg": msg,
