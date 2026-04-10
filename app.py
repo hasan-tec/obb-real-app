@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi import FastAPI, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -3773,7 +3773,7 @@ async def ship_decision(request: Request, decision_id: str):
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/customers/{customer_id}/recurate")
-async def recurate_customer(request: Request, customer_id: str):
+async def recurate_customer(request: Request, customer_id: str, background_tasks: BackgroundTasks):
     """
     Re-run the decision engine for a customer.
     Useful when:
@@ -3805,6 +3805,15 @@ async def recurate_customer(request: Request, customer_id: str):
         kit_decision = await assign_kit(customer_id, date.today())
         logger.info(f"[RECURATE] Result: {kit_decision['decision_type']} — Kit: {kit_decision.get('kit_sku', 'none')}")
 
+        # Early return for incomplete-data — do NOT insert a dangling pending decision
+        if kit_decision["decision_type"] == "incomplete-data":
+            reason = kit_decision.get("reason", "Missing customer data")
+            logger.warning(f"[RECURATE] Skipping insert — incomplete-data for {email}: {reason}")
+            return RedirectResponse(
+                f"/customers/{customer_id}?msg={quote(f'Cannot curate: {reason}. Edit the customer to add missing data first.')}&msg_type=warning",
+                status_code=303,
+            )
+
         # Save new decision
         trimester = cust.data.get("trimester")
         decision_record = {
@@ -3820,9 +3829,10 @@ async def recurate_customer(request: Request, customer_id: str):
             "ship_date": date.today().isoformat(),
         }
         db.table("decisions").insert(decision_record).execute()
+        logger.info(f"[RECURATE] Decision inserted for {email} ({kit_decision['decision_type']})")
 
-        # Write to Google Sheets
-        write_decision_to_sheet({
+        # Write to Google Sheets in background — non-blocking so Heroku H12 never fires
+        sheet_payload = {
             "date": date.today().isoformat(),
             "customer_name": f"{cust.data.get('first_name', '')} {cust.data.get('last_name', '')}".strip(),
             "email": email,
@@ -3835,13 +3845,23 @@ async def recurate_customer(request: Request, customer_id: str):
             "order_id": "",
             "due_date": cust.data.get("due_date", "") or "",
             "clothing_size": cust.data.get("clothing_size", "") or "",
-        })
+        }
+        def _write_sheet_safe(payload: dict):
+            try:
+                write_decision_to_sheet(payload)
+                logger.info(f"[RECURATE] Google Sheets write succeeded for {email}")
+            except Exception as sheet_err:
+                logger.error(f"[RECURATE] Google Sheets write failed (non-fatal, decision already saved): {sheet_err}")
+        background_tasks.add_task(_write_sheet_safe, sheet_payload)
 
         await log_activity("decision", f"Re-curated {email}: {kit_decision['decision_type']}",
                           f"Kit: {kit_decision.get('kit_sku', '—')}, T{trimester}", "success")
     except Exception as e:
         logger.error(f"[RECURATE] Error: {e}", exc_info=True)
-        await log_activity("decision", f"Failed to re-curate: {e}", "", "error")
+        try:
+            await log_activity("decision", f"Failed to re-curate: {e}", "", "error")
+        except Exception as log_err:
+            logger.error(f"[RECURATE] log_activity also failed: {log_err}")
     return RedirectResponse(f"/customers/{customer_id}", status_code=303)
 
 
