@@ -2302,6 +2302,13 @@ async def customer_detail(request: Request, customer_id: str):
                         f"[CUSTOMER DETAIL] Trimester mismatch for {customer_id}: "
                         f"stored T{stored_trimester} → live T{live_trimester} (due_date={due_date_raw})"
                     )
+                    # Auto-save immediately — no need for user to Edit→Save
+                    try:
+                        db.table("customers").update({"trimester": live_trimester}).eq("id", customer_id).execute()
+                        cust.data["trimester"] = live_trimester
+                        logger.info(f"[CUSTOMER DETAIL] Auto-saved trimester T{live_trimester} for {customer_id}")
+                    except Exception as save_err:
+                        logger.error(f"[CUSTOMER DETAIL] Failed to auto-save trimester: {save_err}")
             except Exception as tri_err:
                 logger.warning(f"[CUSTOMER DETAIL] Could not recalculate trimester: {tri_err}")
 
@@ -3051,6 +3058,48 @@ async def settings_page(request: Request):
 
 
 # ─── Health check ───
+# ─── Bulk recalculate trimesters for all customers ───
+@app.post("/api/recalculate-all-trimesters")
+async def api_recalculate_all_trimesters():
+    """
+    Bulk recalculate and persist trimester for every customer that has a due_date.
+    Updates only customers whose stored trimester differs from the live calculated value.
+    """
+    try:
+        db = get_supabase()
+        today = date.today()
+        result = db.table("customers").select("id, due_date, trimester").not_.is_("due_date", "null").execute()
+        customers = result.data or []
+        updated = 0
+        skipped = 0
+        errors = 0
+        logger.info(f"[RECALC TRIMESTER] Starting bulk recalculation for {len(customers)} customers")
+        for c in customers:
+            try:
+                due_dt = date.fromisoformat(str(c["due_date"]))
+                new_t = calculate_trimester(due_dt, today)
+                if new_t != c.get("trimester"):
+                    db.table("customers").update({"trimester": new_t}).eq("id", c["id"]).execute()
+                    logger.info(f"[RECALC TRIMESTER] {c['id']}: T{c.get('trimester')} → T{new_t}")
+                    updated += 1
+                else:
+                    skipped += 1
+            except Exception as row_err:
+                logger.error(f"[RECALC TRIMESTER] Error on customer {c.get('id')}: {row_err}")
+                errors += 1
+        logger.info(f"[RECALC TRIMESTER] Done. updated={updated}, skipped={skipped}, errors={errors}")
+        await log_activity(
+            "admin",
+            f"Bulk trimester recalculation: {updated} updated",
+            f"updated={updated}, skipped={skipped}, errors={errors}",
+            "success" if errors == 0 else "warning"
+        )
+        return JSONResponse({"status": "ok", "updated": updated, "skipped": skipped, "errors": errors})
+    except Exception as e:
+        logger.error(f"[RECALC TRIMESTER] Fatal error: {e}", exc_info=True)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""

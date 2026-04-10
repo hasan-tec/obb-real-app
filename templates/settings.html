@@ -87,6 +87,9 @@
             <h3>Quick Actions</h3>
         </div>
         <div style="padding: 16px; display: flex; gap: 12px; flex-wrap: wrap;">
+            <button class="btn btn-primary" onclick="recalculateAllTrimesters()">
+                🔄 Recalculate All Trimesters
+            </button>
             <button class="btn btn-primary" onclick="registerCratejoyWebhooks()">
                 🔗 Register Cratejoy Webhooks
             </button>
@@ -183,6 +186,24 @@
 </div>
 
 <script>
+    async function recalculateAllTrimesters() {
+        const resultDiv = document.getElementById('action-result');
+        const resultText = document.getElementById('action-result-text');
+        resultDiv.style.display = 'block';
+        resultText.textContent = 'Recalculating trimesters for all customers — this may take a few seconds...';
+        try {
+            const res = await fetch('/api/recalculate-all-trimesters', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                resultText.textContent = `Done! Updated: ${data.updated} | Already correct: ${data.skipped} | Errors: ${data.errors}`;
+            } else {
+                resultText.textContent = 'Error: ' + (data.message || JSON.stringify(data));
+            }
+        } catch (e) {
+            resultText.textContent = 'Error: ' + e.message;
+        }
+    }
+
     async function registerCratejoyWebhooks() {
         const resultDiv = document.getElementById('action-result');
         const resultText = document.getElementById('action-result-text');
