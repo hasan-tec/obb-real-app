@@ -3065,8 +3065,26 @@ def _do_recalculate_trimesters():
     try:
         db = get_supabase()
         today = date.today()
-        result = db.table("customers").select("id, due_date, trimester").not_.is_("due_date", "null").limit(10000).execute()
-        customers = result.data or []
+
+        # Paginate to bypass Supabase's 1000-row default max
+        all_customers = []
+        page_size = 1000
+        offset = 0
+        while True:
+            batch = (
+                db.table("customers")
+                .select("id, due_date, trimester")
+                .not_.is_("due_date", "null")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            ).data or []
+            all_customers.extend(batch)
+            logger.info(f"[RECALC TRIMESTER] Fetched page offset={offset}: {len(batch)} rows")
+            if len(batch) < page_size:
+                break
+            offset += page_size
+
+        customers = all_customers
         updated = 0
         skipped = 0
         errors = 0
