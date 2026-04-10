@@ -54,9 +54,11 @@
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Size Variant</label>
+                        <label>Size Variant
+                            <span style="color:var(--text-dim);font-size:11px;"> (SKU 2nd digit: 1=S, 2=M, 3=L, 4=XL)</span>
+                        </label>
                         <select name="size_variant" class="form-control">
-                            <option value="1" {% if kit.size_variant==1 %}selected{% endif %}>Universal</option>
+                            <option value="1" {% if kit.size_variant==1 %}selected{% endif %}>S (Small)</option>
                             <option value="2" {% if kit.size_variant==2 %}selected{% endif %}>M</option>
                             <option value="3" {% if kit.size_variant==3 %}selected{% endif %}>L</option>
                             <option value="4" {% if kit.size_variant==4 %}selected{% endif %}>XL</option>
@@ -98,12 +100,24 @@
                         <input type="number" name="cost_per_kit" class="form-control"
                             value="{{ kit.cost_per_kit or 0 }}" min="0" step="0.01">
                     </div>
-                    <div class="form-group" style="display:flex; align-items:end;">
+                    <div class="form-group" style="display:flex; align-items:end; gap:16px; flex-wrap:wrap;">
                         <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
                             <input type="checkbox" name="is_welcome_kit" value="true" {% if kit.is_welcome_kit
                                 %}checked{% endif %}>
                             Welcome Kit
                         </label>
+                        <label style="display:flex; align-items:center; gap:6px; cursor:pointer;" title="Check if this kit has no sized items — all items are one-size-fits-all. Universal kits go to ALL customers regardless of clothing size.">
+                            <input type="checkbox" name="is_universal" value="true" {% if kit.is_universal %}checked{% endif %}>
+                            ✅ Universal (no sized item)
+                        </label>
+                    </div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:8px;line-height:1.7;padding:8px 10px;background:rgba(99,179,237,0.06);border-radius:6px;border:1px solid rgba(99,179,237,0.2);">
+                        <strong style="color:var(--accent);">📏 Size guide:</strong>
+                        <strong>✅ Universal checked</strong> → kit ships to ALL customers (no sized item in box, e.g. CK21).
+                        &nbsp;|&nbsp;
+                        <strong>☐ Universal unchecked</strong> → sized kit; engine matches by Size Variant:
+                        <span style="font-family:monospace;">1=S &nbsp; 2=M &nbsp; 3=L &nbsp; 4=XL</span>
+                        (e.g. BW21=S, BW22=M, BW23=L, BW24=XL when belly brace is included).
                     </div>
                 </div>
                 <div style="margin-top: 8px;">
@@ -128,7 +142,8 @@
         <div class="stat-card">
             <div class="label">Size</div>
             <div class="value" style="font-size:20px;">
-                {% if kit.size_variant == 1 %}Universal
+                {% if kit.is_universal %}Universal
+                {% elif kit.size_variant == 1 %}S
                 {% elif kit.size_variant == 2 %}M
                 {% elif kit.size_variant == 3 %}L
                 {% elif kit.size_variant == 4 %}XL

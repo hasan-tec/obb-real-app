@@ -289,6 +289,8 @@ def normalize_clothing_size(raw_size: str) -> Optional[str]:
         "m": "M", "med": "M", "medium": "M",
         "l": "L", "lg": "L", "lrg": "L", "large": "L",
         "xl": "XL", "x-large": "XL", "xlarge": "XL", "x-lg": "XL",
+        # XXL maps to XL — OBB groups XXL+XL into the same kit variant (per spreadsheet data)
+        "xxl": "XL", "2xl": "XL", "xx-large": "XL", "xxlarge": "XL",
     }
     result = size_map.get(s)
     if not result:
@@ -392,13 +394,19 @@ def compute_age_rank_from_sku(sku: str) -> int:
     """
     Auto-compute FIFO age rank from kit SKU prefix.
 
-    Rules (from OBB naming convention):
-      - Strip leading 'RW-' (reworked kit marker) before parsing
-      - Extract alpha prefix = all letters before the first digit
+    Handles both old format (CK41) and VeraCore format (OBB-CK-41 KITS).
+
+    Cleaning steps:
+      1. Strip leading 'RW-' or 'RW' (reworked kit marker)
+      2. Strip leading 'OBB-' (VeraCore prefix)
+      3. Strip trailing ' KITS' or ' KIT' suffix
+      4. Remove internal dashes (WK-C1 → WKC1)
+      5. Extract alpha prefix = all letters before the first digit
+
+    Rank rules:
       - Welcome kits (prefix starts with 'WK'):
           'WK'  alone       → 10001 (oldest WK)
           'WKA'             → 10002
-          'WKB'             → 10003
           ...
           'WKH'             → 10009
       - Regular kits (alphabetical batches):
@@ -418,6 +426,19 @@ def compute_age_rank_from_sku(sku: str) -> int:
         clean = clean[3:]
     elif clean.startswith("RW"):
         clean = clean[2:]
+
+    # Strip VeraCore prefix and suffix (OBB-WK-C1 KITS → WKC1)
+    if clean.startswith("OBB-"):
+        clean = clean[4:]
+        logger.debug(f"[AGE_RANK] Stripped OBB- prefix → '{clean}'")
+    # Strip trailing ' KITS' or ' KIT' suffix
+    if clean.endswith(" KITS"):
+        clean = clean[:-5]
+    elif clean.endswith(" KIT"):
+        clean = clean[:-4]
+    # Remove internal dashes (WK-C1 → WKC1)
+    clean = clean.replace("-", "")
+    logger.debug(f"[AGE_RANK] Cleaned SKU: '{sku}' → '{clean}'")
 
     # Extract alpha prefix (letters before first digit)
     prefix = ""
@@ -609,7 +630,10 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
         return {"decision_type": "incomplete-data", "reason": "No trimester — missing due date", "kit_id": None, "kit_sku": None}
 
     clothing_size = cust.get("clothing_size")
-    logger.info(f"[DECISION ENGINE] Customer: {cust.get('email')}, T{trimester}, Size: {clothing_size or 'universal'}")
+    # Re-normalize at engine time — guards against old/raw DB values (e.g. "xxl", "med", "lrg")
+    if clothing_size:
+        clothing_size = normalize_clothing_size(clothing_size) or clothing_size
+    logger.info(f"[DECISION ENGINE] Customer: {cust.get('email')}, T{trimester}, Size: {clothing_size or 'unknown (no size on record)'}")
 
     # 2. Get customer's item history from past shipments
     shipments = db.table("shipments").select("id, kit_sku").eq("customer_id", customer_id).execute()
@@ -660,13 +684,19 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
             "kit_sku": None,
         }
 
-    # 4. Filter by size variant (1=universal, 2=S/M, 3=L, 4=XL)
+    # 4. Filter by size variant
+    # is_universal=True  → kit has no sized items, goes to ALL customers regardless of size
+    # is_universal=False → kit has a sized item; match customer's size
+    # size_to_variant: S=1, M=2, L=3, XL=4 (matches SKU second digit convention)
     if clothing_size:
-        size_to_variant = {"S": 2, "M": 2, "L": 3, "XL": 4}
+        size_to_variant = {"S": 1, "M": 2, "L": 3, "XL": 4}
         customer_variant = size_to_variant.get(clothing_size, 1)
-        filtered = [k for k in available_kits if k["size_variant"] == 1 or k["size_variant"] == customer_variant]
+        filtered = [k for k in available_kits if k.get("is_universal") or k["size_variant"] == customer_variant]
+        logger.info(f"[DECISION ENGINE] Size filter: clothing_size={clothing_size}, customer_variant={customer_variant}")
     else:
-        filtered = [k for k in available_kits if k["size_variant"] == 1]
+        # No size info → only universal kits
+        filtered = [k for k in available_kits if k.get("is_universal")]
+        logger.info(f"[DECISION ENGINE] No size on record → universal kits only")
 
     logger.info(f"[DECISION ENGINE] After size filter: {len(filtered)} kits (customer size: {clothing_size or 'universal-only'})")
 
@@ -728,7 +758,7 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
         "reason": (
             f"Assigned {chosen['sku']} — age rank {chosen['age_rank']}, "
             f"{'welcome' if chosen.get('is_welcome_kit') else 'regular'} kit for T{trimester}, "
-            f"size: {'universal' if chosen['size_variant'] == 1 else clothing_size}. "
+            f"size: {'universal' if chosen.get('is_universal') else clothing_size}. "
             f"{len(valid_kits)} valid kit(s), {len(filtered)} checked."
         ),
         "kit_id": chosen["id"],
@@ -2383,6 +2413,7 @@ async def add_kit(
     trimester: int = Form(...),
     size_variant: int = Form(1),
     is_welcome_kit: str = Form(""),
+    is_universal: str = Form(""),
     quantity_available: int = Form(0),
     age_rank: int = Form(0),
     cost_per_kit: float = Form(0),
@@ -2391,18 +2422,20 @@ async def add_kit(
     try:
         db = get_supabase()
         welcome = is_welcome_kit.lower() in ("true", "on", "1", "yes") if is_welcome_kit else False
+        universal = is_universal.lower() in ("true", "on", "1", "yes") if is_universal else False
         sku_clean = sku.strip().upper()
         # Auto-compute age_rank from SKU when not manually set (age_rank == 0)
         if age_rank == 0:
             age_rank = compute_age_rank_from_sku(sku_clean)
             logger.info(f"[KITS] Auto-computed age_rank={age_rank} from SKU '{sku_clean}'")
-        logger.info(f"[KITS] Adding kit: sku={sku_clean}, T{trimester}, size={size_variant}, welcome={welcome}, qty={quantity_available}, age_rank={age_rank} (source=auto)")
+        logger.info(f"[KITS] Adding kit: sku={sku_clean}, T{trimester}, size={size_variant}, universal={universal}, welcome={welcome}, qty={quantity_available}, age_rank={age_rank} (source=auto)")
         kit_result = db.table("kits").insert({
             "sku": sku_clean,
             "name": name.strip() or None,
             "trimester": trimester,
             "size_variant": size_variant,
             "is_welcome_kit": welcome,
+            "is_universal": universal,
             "quantity_available": quantity_available,
             "age_rank": age_rank,
             "age_rank_source": "auto",
@@ -3825,6 +3858,7 @@ async def edit_kit(
     trimester: int = Form(...),
     size_variant: int = Form(1),
     is_welcome_kit: str = Form(""),
+    is_universal: str = Form(""),
     quantity_available: int = Form(0),
     age_rank: int = Form(0),
     cost_per_kit: float = Form(0),
@@ -3833,6 +3867,7 @@ async def edit_kit(
     try:
         db = get_supabase()
         welcome = is_welcome_kit.lower() in ("true", "on", "1", "yes") if is_welcome_kit else False
+        universal = is_universal.lower() in ("true", "on", "1", "yes") if is_universal else False
 
         # Fetch current SKU + source so we can detect changes
         current = db.table("kits").select("sku, age_rank_source").eq("id", kit_id).single().execute()
@@ -3877,13 +3912,14 @@ async def edit_kit(
             "trimester": trimester,
             "size_variant": size_variant,
             "is_welcome_kit": welcome,
+            "is_universal": universal,
             "quantity_available": quantity_available,
             "age_rank": age_rank,
             "age_rank_source": age_rank_source,
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
         }
         db.table("kits").update(record).eq("id", kit_id).execute()
-        logger.info(f"[KIT EDIT] Updated kit {sku_clean}: T{trimester}, qty={quantity_available}, welcome={welcome}, age_rank={age_rank}, source={age_rank_source}")
+        logger.info(f"[KIT EDIT] Updated kit {sku_clean}: T{trimester}, qty={quantity_available}, welcome={welcome}, universal={universal}, age_rank={age_rank}, source={age_rank_source}")
         await log_activity("kit", f"Edited kit {sku_clean}", f"T{trimester}, Qty: {quantity_available}, Age Rank: {age_rank} ({age_rank_source})", "success")
     except Exception as e:
         logger.error(f"[KIT EDIT] Error: {e}", exc_info=True)
