@@ -194,8 +194,8 @@
         try {
             const res = await fetch('/api/recalculate-all-trimesters', { method: 'POST' });
             const data = await res.json();
-            if (data.status === 'ok') {
-                resultText.textContent = `Done! Updated: ${data.updated} | Already correct: ${data.skipped} | Errors: ${data.errors}`;
+            if (res.status === 202 || data.status === 'ok') {
+                resultText.textContent = data.message || 'Running in background — check Activity log for results.';
             } else {
                 resultText.textContent = 'Error: ' + (data.message || JSON.stringify(data));
             }

@@ -3059,12 +3059,8 @@ async def settings_page(request: Request):
 
 # ─── Health check ───
 # ─── Bulk recalculate trimesters for all customers ───
-@app.post("/api/recalculate-all-trimesters")
-async def api_recalculate_all_trimesters():
-    """
-    Bulk recalculate and persist trimester for every customer that has a due_date.
-    Updates only customers whose stored trimester differs from the live calculated value.
-    """
+def _do_recalculate_trimesters():
+    """Background worker — runs after the 202 response is sent to avoid H12 timeout."""
     try:
         db = get_supabase()
         today = date.today()
@@ -3088,16 +3084,26 @@ async def api_recalculate_all_trimesters():
                 logger.error(f"[RECALC TRIMESTER] Error on customer {c.get('id')}: {row_err}")
                 errors += 1
         logger.info(f"[RECALC TRIMESTER] Done. updated={updated}, skipped={skipped}, errors={errors}")
-        await log_activity(
-            "admin",
-            f"Bulk trimester recalculation: {updated} updated",
-            f"updated={updated}, skipped={skipped}, errors={errors}",
-            "success" if errors == 0 else "warning"
-        )
-        return JSONResponse({"status": "ok", "updated": updated, "skipped": skipped, "errors": errors})
+        db.table("activity_log").insert({
+            "type": "admin",
+            "summary": f"Bulk trimester recalculation: {updated} updated",
+            "detail": f"updated={updated}, skipped={skipped}, errors={errors}",
+            "result": "success" if errors == 0 else "warning",
+        }).execute()
     except Exception as e:
         logger.error(f"[RECALC TRIMESTER] Fatal error: {e}", exc_info=True)
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.post("/api/recalculate-all-trimesters")
+async def api_recalculate_all_trimesters(background_tasks: BackgroundTasks):
+    """
+    Kick off bulk trimester recalculation in the background.
+    Returns 202 immediately so Heroku doesn't H12-timeout on 900+ customers.
+    Check Activity log for results when done.
+    """
+    background_tasks.add_task(_do_recalculate_trimesters)
+    logger.info("[RECALC TRIMESTER] Job queued in background")
+    return JSONResponse({"status": "ok", "message": "Running in background — check Activity log for results in ~30 seconds."}, status_code=202)
 
 
 @app.get("/health")
