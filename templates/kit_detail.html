@@ -55,7 +55,8 @@
                     </div>
                     <div class="form-group">
                         <label>Size Variant
-                            <span style="color:var(--text-dim);font-size:11px;"> (SKU 2nd digit: 1=S, 2=M, 3=L, 4=XL)</span>
+                            <span style="color:var(--text-dim);font-size:11px;"> (SKU 2nd digit: 1=S, 2=M, 3=L,
+                                4=XL)</span>
                         </label>
                         <select name="size_variant" class="form-control">
                             <option value="1" {% if kit.size_variant==1 %}selected{% endif %}>S (Small)</option>
@@ -106,14 +107,18 @@
                                 %}checked{% endif %}>
                             Welcome Kit
                         </label>
-                        <label style="display:flex; align-items:center; gap:6px; cursor:pointer;" title="Check if this kit has no sized items — all items are one-size-fits-all. Universal kits go to ALL customers regardless of clothing size.">
-                            <input type="checkbox" name="is_universal" value="true" {% if kit.is_universal %}checked{% endif %}>
+                        <label style="display:flex; align-items:center; gap:6px; cursor:pointer;"
+                            title="Check if this kit has no sized items — all items are one-size-fits-all. Universal kits go to ALL customers regardless of clothing size.">
+                            <input type="checkbox" name="is_universal" value="true" {% if kit.is_universal %}checked{%
+                                endif %}>
                             ✅ Universal (no sized item)
                         </label>
                     </div>
-                    <div style="font-size:11px;color:var(--text-dim);margin-top:8px;line-height:1.7;padding:8px 10px;background:rgba(99,179,237,0.06);border-radius:6px;border:1px solid rgba(99,179,237,0.2);">
+                    <div
+                        style="font-size:11px;color:var(--text-dim);margin-top:8px;line-height:1.7;padding:8px 10px;background:rgba(99,179,237,0.06);border-radius:6px;border:1px solid rgba(99,179,237,0.2);">
                         <strong style="color:var(--accent);">📏 Size guide:</strong>
-                        <strong>✅ Universal checked</strong> → kit ships to ALL customers (no sized item in box, e.g. CK21).
+                        <strong>✅ Universal checked</strong> → kit ships to ALL customers (no sized item in box, e.g.
+                        CK21).
                         &nbsp;|&nbsp;
                         <strong>☐ Universal unchecked</strong> → sized kit; engine matches by Size Variant:
                         <span style="font-family:monospace;">1=S &nbsp; 2=M &nbsp; 3=L &nbsp; 4=XL</span>
