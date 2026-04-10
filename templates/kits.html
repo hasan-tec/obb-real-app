@@ -208,9 +208,9 @@
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Size Variant</label>
+                        <label>Size Variant <span style="color:var(--text-dim);font-size:11px;">(SKU 2nd digit: 1=S, 2=M, 3=L, 4=XL)</span></label>
                         <select name="size_variant" class="form-control">
-                            <option value="1">1 — Universal</option>
+                            <option value="1">1 — S (Small)</option>
                             <option value="2">2 — M</option>
                             <option value="3">3 — L</option>
                             <option value="4">4 — XL</option>
@@ -240,11 +240,22 @@
                         <label>Cost per Kit ($)</label>
                         <input type="number" name="cost_per_kit" class="form-control" value="0" min="0" step="0.01">
                     </div>
-                    <div class="form-group" style="display:flex; align-items:end;">
+                    <div class="form-group" style="display:flex; align-items:end; gap:16px; flex-wrap:wrap;">
                         <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
                             <input type="checkbox" name="is_welcome_kit" value="true">
                             Welcome Kit
                         </label>
+                        <label style="display:flex; align-items:center; gap:6px; cursor:pointer;"
+                            title="Check if this kit has no sized items — all customers get it regardless of size. Uncheck when the kit contains a wearable (belly brace, shirt, socks).">
+                            <input type="checkbox" name="is_universal" value="true" checked>
+                            ✅ Universal (no sized item)
+                        </label>
+                    </div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:4px;padding:6px 10px;background:rgba(99,179,237,0.06);border-radius:6px;border:1px solid rgba(99,179,237,0.2);">
+                        <strong style="color:var(--accent);">📏</strong>
+                        <strong>✅ Universal checked</strong> → all customers get this kit (most monthly kits like CK21, CJ31…).
+                        &nbsp;|&nbsp;
+                        <strong>☐ Unchecked</strong> → engine matches by Size Variant digit (1=S, 2=M, 3=L, 4=XL).
                     </div>
                 </div>
 

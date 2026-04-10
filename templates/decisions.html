@@ -21,7 +21,7 @@
 <div class="topbar">
     <h1>Kit Decisions</h1>
     <div class="status">
-        <span>{{ decisions | length }} decisions{% if filter_qs %} (filtered){% endif %}</span>
+        <span>{{ decisions | length }}{% if any_filter_active %} of {{ total_decisions }}{% endif %} decisions{% if filter_qs %} (filtered){% endif %}</span>
     </div>
 </div>
 
@@ -100,6 +100,8 @@
             <form method="POST" action="/decisions/export-sheet" style="display:inline;">
                 <input type="hidden" name="status"      value="{{ filters.status or 'approved' }}">
                 <input type="hidden" name="trimester"   value="{{ filters.trimester or '' }}">
+                <input type="hidden" name="type"        value="{{ filters.type or '' }}">
+                <input type="hidden" name="platform"    value="{{ filters.platform or '' }}">
                 <input type="hidden" name="month"       value="{{ filters.month or '' }}">
                 <input type="hidden" name="redirect_qs" value="{{ filter_qs or '' }}">
                 <button type="submit" class="btn btn-sm" style="background:var(--green);color:white;border:none;" title="Push to Google Sheets">
@@ -138,7 +140,7 @@
                         <input type="checkbox" id="selectAll" title="Select / deselect all" style="cursor:pointer;">
                     </th>
                     {{ sort_th('Date',      'created_at') }}
-                    <th>Customer</th>
+                    {{ sort_th('Customer', 'customer_name') }}
                     <th>Platform</th>
                     {{ sort_th('Trimester', 'trimester') }}
                     {{ sort_th('Type',      'decision_type') }}
