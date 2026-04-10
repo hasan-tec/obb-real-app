@@ -3065,7 +3065,7 @@ def _do_recalculate_trimesters():
     try:
         db = get_supabase()
         today = date.today()
-        result = db.table("customers").select("id, due_date, trimester").not_.is_("due_date", "null").execute()
+        result = db.table("customers").select("id, due_date, trimester").not_.is_("due_date", "null").limit(10000).execute()
         customers = result.data or []
         updated = 0
         skipped = 0
