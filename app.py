@@ -11,13 +11,15 @@ import hashlib
 import base64
 import time
 import logging
+import csv
+import io
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, Form, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -66,6 +68,11 @@ CRATEJOY_CLIENT_SECRET = os.getenv("CRATEJOY_CLIENT_SECRET", "")
 
 # ─── App config ───
 BASE_URL = os.getenv("BASE_URL", "https://obb-real-d4e16a8bb2ff.herokuapp.com")
+
+# ─── Sort whitelists (prevent SQL injection via sort params) ───
+ALLOWED_SORTS_DECISIONS = {"created_at", "trimester", "decision_type", "kit_sku", "status"}
+ALLOWED_SORTS_CUSTOMERS = {"first_name", "email", "trimester", "due_date", "clothing_size", "subscription_status", "created_at"}
+ALLOWED_SORTS_KITS = {"sku", "trimester", "size_variant", "quantity_available", "age_rank", "name"}
 
 # ─── Google Sheets config ───
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
@@ -2229,18 +2236,59 @@ async def replay_webhook(webhook_id: str):
 
 @app.get("/customers", response_class=HTMLResponse)
 async def customers_page(request: Request):
-    """View all customers. Supports ?q= search filter on name/email."""
+    """View all customers. Supports filtering by trimester, platform, status, size, ?q= text search, and sorting."""
     try:
         db = get_supabase()
         q = request.query_params.get("q", "").strip().lower()
         msg = request.query_params.get("msg", "")
         msg_type = request.query_params.get("msg_type", "success")
 
-        # Fetch all customers (no hard cap — Supabase returns max 1000 by default which is fine for 500 subs)
-        custs = db.table("customers").select("*").order("created_at", desc=True).limit(1000).execute()
-        all_customers = custs.data or []
+        # Parse server-side filters
+        f_trimester = request.query_params.get("trimester", "").strip()
+        f_platform  = request.query_params.get("platform", "").strip()
+        f_status    = request.query_params.get("status", "").strip()
+        f_size      = request.query_params.get("size", "").strip()
 
-        # Client-side search filter on name / email
+        # Parse sort params (whitelist to prevent SQL injection)
+        sort     = request.query_params.get("sort", "created_at")
+        sort_dir = request.query_params.get("dir", "desc")
+        if sort not in ALLOWED_SORTS_CUSTOMERS:
+            sort     = "created_at"
+            sort_dir = "desc"
+        desc_order = (sort_dir == "desc")
+
+        # True total count from DB (unfiltered) — not capped by 1000
+        count_result    = db.table("customers").select("id", count="exact").execute()
+        total_customers = count_result.count or 0
+        logger.info(f"[CUSTOMERS PAGE] True DB total: {total_customers}")
+
+        # Paginate all matching records to bypass Supabase 1000-row server cap
+        all_customers: list = []
+        offset    = 0
+        PAGE_SIZE = 1000
+        while True:
+            q_obj = db.table("customers").select("*")
+            if f_trimester:
+                try:
+                    q_obj = q_obj.eq("trimester", int(f_trimester))
+                except ValueError:
+                    pass
+            if f_platform:
+                q_obj = q_obj.eq("platform", f_platform)
+            if f_status:
+                q_obj = q_obj.eq("subscription_status", f_status)
+            if f_size:
+                q_obj = q_obj.eq("clothing_size", f_size)
+            batch      = q_obj.order(sort, desc=desc_order).range(offset, offset + PAGE_SIZE - 1).execute()
+            batch_data = batch.data or []
+            all_customers.extend(batch_data)
+            logger.debug(f"[CUSTOMERS PAGE] Batch offset={offset}, fetched={len(batch_data)}")
+            if len(batch_data) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+        logger.info(f"[CUSTOMERS PAGE] After server filters: {len(all_customers)} customers")
+
+        # Client-side text search on top of server-side filters
         if q:
             filtered = [
                 c for c in all_customers
@@ -2249,30 +2297,82 @@ async def customers_page(request: Request):
                 or q in (c.get("last_name") or "").lower()
                 or q in f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".lower()
             ]
-            logger.info(f"[CUSTOMERS PAGE] Search '{q}' matched {len(filtered)}/{len(all_customers)} customers")
+            logger.info(f"[CUSTOMERS PAGE] Text search '{q}' matched {len(filtered)}/{len(all_customers)}")
         else:
             filtered = all_customers
 
+        # Active vs Past split
+        # Active: status active/cancelled-prepaid/paused AND due_date within last 150 days (or no due_date)
+        # Past: everything else (expired, or due_date > 5 months ago — baby definitely born + all kits shipped)
+        today  = date.today()
+        cutoff = today - timedelta(days=150)
+        active_customers: list = []
+        past_customers:   list = []
+        for c in filtered:
+            dd_raw = c.get("due_date")
+            s      = c.get("subscription_status", "")
+            dd     = None
+            if dd_raw:
+                try:
+                    dd = date.fromisoformat(str(dd_raw))
+                except Exception:
+                    pass
+            is_active = s in ("active", "cancelled-prepaid", "paused") and (dd is None or dd >= cutoff)
+            if is_active:
+                active_customers.append(c)
+            else:
+                past_customers.append(c)
+        logger.info(f"[CUSTOMERS PAGE] Active={len(active_customers)}, Past={len(past_customers)}")
+
+        # Build filter query string for sort links
+        filter_qs_parts = []
+        if f_trimester: filter_qs_parts.append(f"trimester={f_trimester}")
+        if f_platform:  filter_qs_parts.append(f"platform={f_platform}")
+        if f_status:    filter_qs_parts.append(f"status={f_status}")
+        if f_size:      filter_qs_parts.append(f"size={f_size}")
+        if q:           filter_qs_parts.append(f"q={q}")
+        filter_qs         = "&".join(filter_qs_parts)
+        any_filter_active = bool(f_trimester or f_platform or f_status or f_size or q)
+
         return templates.TemplateResponse("customers.html", {
-            "request": request,
-            "customers": filtered,
-            "total_customers": len(all_customers),
-            "search_query": q,
-            "msg": msg,
-            "msg_type": msg_type,
-            "page": "customers",
+            "request":          request,
+            "customers":        filtered,
+            "active_customers": active_customers,
+            "past_customers":   past_customers,
+            "total_customers":  total_customers,
+            "search_query":     q,
+            "msg":              msg,
+            "msg_type":         msg_type,
+            "page":             "customers",
+            "filters": {
+                "trimester": f_trimester,
+                "platform":  f_platform,
+                "status":    f_status,
+                "size":      f_size,
+            },
+            "sort":             sort,
+            "sort_dir":         sort_dir,
+            "filter_qs":        filter_qs,
+            "any_filter_active": any_filter_active,
         })
     except Exception as e:
         logger.error(f"[CUSTOMERS PAGE] Error: {e}", exc_info=True)
         return templates.TemplateResponse("customers.html", {
-            "request": request,
-            "customers": [],
-            "total_customers": 0,
-            "search_query": "",
-            "error": str(e),
-            "msg": "",
-            "msg_type": "error",
-            "page": "customers",
+            "request":          request,
+            "customers":        [],
+            "active_customers": [],
+            "past_customers":   [],
+            "total_customers":  0,
+            "search_query":     "",
+            "error":            str(e),
+            "msg":              "",
+            "msg_type":         "error",
+            "page":             "customers",
+            "filters":          {},
+            "sort":             "created_at",
+            "sort_dir":         "desc",
+            "filter_qs":        "",
+            "any_filter_active": False,
         })
 
 
@@ -2335,22 +2435,111 @@ async def customer_detail(request: Request, customer_id: str):
 
 @app.get("/decisions", response_class=HTMLResponse)
 async def decisions_page(request: Request):
-    """View all kit assignment decisions."""
+    """View kit assignment decisions. Supports filtering by trimester, status, type, platform, month, and sorting."""
     try:
         db = get_supabase()
-        decs = db.table("decisions").select("*, customers(email, first_name, last_name)").order("created_at", desc=True).limit(100).execute()
+        msg      = request.query_params.get("msg", "")
+        msg_type = request.query_params.get("msg_type", "success")
+
+        # Parse filters
+        f_trimester = request.query_params.get("trimester", "").strip()
+        f_status    = request.query_params.get("status", "").strip()
+        f_type      = request.query_params.get("type", "").strip()
+        f_platform  = request.query_params.get("platform", "").strip()
+        f_month     = request.query_params.get("month", "").strip()
+        q           = request.query_params.get("q", "").strip().lower()
+
+        # Parse sort (whitelist)
+        sort     = request.query_params.get("sort", "created_at")
+        sort_dir = request.query_params.get("dir", "desc")
+        if sort not in ALLOWED_SORTS_DECISIONS:
+            sort     = "created_at"
+            sort_dir = "desc"
+        desc_order = (sort_dir == "desc")
+
+        # Build Supabase query with server-side filters
+        q_obj = db.table("decisions").select("*, customers(email, first_name, last_name)")
+        if f_trimester:
+            try:
+                q_obj = q_obj.eq("trimester", int(f_trimester))
+            except ValueError:
+                pass
+        if f_status:
+            q_obj = q_obj.eq("status", f_status)
+        if f_type:
+            q_obj = q_obj.eq("decision_type", f_type)
+        if f_platform:
+            q_obj = q_obj.eq("platform", f_platform)
+        if f_month:
+            try:
+                y, m    = int(f_month[:4]), int(f_month[5:7])
+                start_dt = f"{y}-{m:02d}-01"
+                m += 1
+                if m > 12:
+                    m = 1
+                    y += 1
+                end_dt  = f"{y}-{m:02d}-01"
+                q_obj   = q_obj.gte("created_at", start_dt).lt("created_at", end_dt)
+            except Exception as me:
+                logger.warning(f"[DECISIONS PAGE] Invalid month param '{f_month}': {me}")
+
+        decs_result = q_obj.order(sort, desc=desc_order).limit(500).execute()
+        decisions   = decs_result.data or []
+        logger.info(f"[DECISIONS PAGE] Fetched {len(decisions)} decisions (t={f_trimester}, s={f_status}, type={f_type}, platform={f_platform}, month={f_month})")
+
+        # Client-side text search on customer name/email/kit_sku
+        if q:
+            decisions = [
+                d for d in decisions
+                if (d.get("customers") and (
+                    q in (d["customers"].get("email") or "").lower()
+                    or q in (d["customers"].get("first_name") or "").lower()
+                    or q in (d["customers"].get("last_name") or "").lower()
+                ))
+                or q in (d.get("kit_sku") or "").lower()
+            ]
+            logger.info(f"[DECISIONS PAGE] Text search '{q}' → {len(decisions)} decisions")
+
+        # Build filter query string for sort links and export URLs
+        filter_qs_parts = []
+        if f_trimester: filter_qs_parts.append(f"trimester={f_trimester}")
+        if f_status:    filter_qs_parts.append(f"status={f_status}")
+        if f_type:      filter_qs_parts.append(f"type={f_type}")
+        if f_platform:  filter_qs_parts.append(f"platform={f_platform}")
+        if f_month:     filter_qs_parts.append(f"month={f_month}")
+        if q:           filter_qs_parts.append(f"q={q}")
+        filter_qs = "&".join(filter_qs_parts)
+
         return templates.TemplateResponse("decisions.html", {
-            "request": request,
-            "decisions": decs.data or [],
-            "page": "decisions",
+            "request":   request,
+            "decisions": decisions,
+            "msg":       msg,
+            "msg_type":  msg_type,
+            "page":      "decisions",
+            "filters": {
+                "trimester": f_trimester,
+                "status":    f_status,
+                "type":      f_type,
+                "platform":  f_platform,
+                "month":     f_month,
+            },
+            "sort":      sort,
+            "sort_dir":  sort_dir,
+            "filter_qs": filter_qs,
         })
     except Exception as e:
         logger.error(f"[DECISIONS PAGE] Error: {e}", exc_info=True)
         return templates.TemplateResponse("decisions.html", {
-            "request": request,
+            "request":   request,
             "decisions": [],
-            "error": str(e),
-            "page": "decisions",
+            "error":     str(e),
+            "msg":       "",
+            "msg_type":  "error",
+            "page":      "decisions",
+            "filters":   {},
+            "sort":      "created_at",
+            "sort_dir":  "desc",
+            "filter_qs": "",
         })
 
 
@@ -2371,17 +2560,36 @@ async def kits_page(request: Request):
                 kid = ki["kit_id"]
                 kit_item_counts[kid] = kit_item_counts.get(kid, 0) + 1
 
-        # Split into welcome kits and regular kits, each sorted trimester → age_rank
+        # Parse sort params for kits (Python sort — all kits fit in memory)
+        kits_sort     = request.query_params.get("sort", "age_rank")
+        kits_sort_dir = request.query_params.get("dir", "asc")
+        if kits_sort not in ALLOWED_SORTS_KITS:
+            kits_sort     = "age_rank"
+            kits_sort_dir = "asc"
+        kits_desc = (kits_sort_dir == "desc")
+
+        def _kits_sort_key(k):
+            val = k.get(kits_sort)
+            if val is None:
+                return "" if kits_sort in ("sku", "name") else 0
+            return val
+
+        # Split into welcome kits and regular kits, sorted by selected column
         all_kits = kits_data.data or []
-        welcome_kits = sorted(
-            [k for k in all_kits if k.get("is_welcome_kit")],
-            key=lambda k: (k.get("trimester", 0), k.get("age_rank", 0))
-        )
-        regular_kits = sorted(
-            [k for k in all_kits if not k.get("is_welcome_kit")],
-            key=lambda k: (k.get("trimester", 0), k.get("age_rank", 0))
-        )
-        logger.info(f"[KITS PAGE] {len(welcome_kits)} welcome kits, {len(regular_kits)} regular kits")
+        try:
+            welcome_kits = sorted(
+                [k for k in all_kits if k.get("is_welcome_kit")],
+                key=_kits_sort_key, reverse=kits_desc
+            )
+            regular_kits = sorted(
+                [k for k in all_kits if not k.get("is_welcome_kit")],
+                key=_kits_sort_key, reverse=kits_desc
+            )
+        except TypeError:
+            # Fallback for mixed-type values
+            welcome_kits = sorted([k for k in all_kits if k.get("is_welcome_kit")],     key=lambda k: (k.get("trimester", 0), k.get("age_rank", 0)))
+            regular_kits = sorted([k for k in all_kits if not k.get("is_welcome_kit")], key=lambda k: (k.get("trimester", 0), k.get("age_rank", 0)))
+        logger.info(f"[KITS PAGE] {len(welcome_kits)} welcome kits, {len(regular_kits)} regular kits, sort={kits_sort} {kits_sort_dir}")
 
         # Get all items for the kit creation form
         all_items = db.table("items").select("*").order("name").execute()
@@ -2396,6 +2604,8 @@ async def kits_page(request: Request):
             "msg": msg,
             "msg_type": msg_type,
             "page": "kits",
+            "sort": kits_sort,
+            "sort_dir": kits_sort_dir,
         })
     except Exception as e:
         logger.error(f"[KITS PAGE] Error: {e}", exc_info=True)
@@ -2410,6 +2620,8 @@ async def kits_page(request: Request):
             "msg": "",
             "msg_type": "error",
             "page": "kits",
+            "sort": "age_rank",
+            "sort_dir": "asc",
         })
 
 
@@ -4124,6 +4336,301 @@ async def manual_override_kit(
             f"/customers/{customer_id}?msg={quote('Failed to create override')}&msg_type=error",
             status_code=303,
         )
+
+
+
+
+# ═══════════════════════════════════════════════════════════
+# BULK DECISION ACTIONS
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/decisions/bulk-action")
+async def bulk_decision_action(request: Request):
+    """Bulk approve or ship multiple decisions at once."""
+    try:
+        db          = get_supabase()
+        form        = await request.form()
+        action      = form.get("action", "").strip()
+        decision_ids = form.getlist("decision_ids")
+        redirect_qs = form.get("redirect_qs", "")
+        logger.info(f"[BULK ACTION] action={action}, count={len(decision_ids)}, ids={decision_ids[:5]}")
+
+        if action not in ("approve", "ship"):
+            logger.warning(f"[BULK ACTION] Invalid action: '{action}'")
+            sep = "&" if redirect_qs else ""
+            return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=Invalid+action&msg_type=error", status_code=303)
+
+        if not decision_ids:
+            sep = "&" if redirect_qs else ""
+            return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=No+decisions+selected&msg_type=error", status_code=303)
+
+        success = failed = skipped = 0
+
+        for did in decision_ids:
+            try:
+                decision = db.table("decisions").select("*, customers(email, first_name, last_name)").eq("id", did).single().execute()
+                if not decision.data:
+                    logger.warning(f"[BULK ACTION] Decision {did} not found")
+                    failed += 1
+                    continue
+
+                d              = decision.data
+                current_status = d.get("status")
+
+                if action == "approve":
+                    if current_status != "pending":
+                        logger.debug(f"[BULK ACTION] Skip approve on {did[:8]} — status={current_status}")
+                        skipped += 1
+                        continue
+                    db.table("decisions").update({"status": "approved"}).eq("id", did).execute()
+                    # Decrement kit stock
+                    kit_id = d.get("kit_id")
+                    if kit_id:
+                        kit = db.table("kits").select("sku, quantity_available").eq("id", kit_id).single().execute()
+                        if kit.data:
+                            new_qty = max(0, kit.data["quantity_available"] - 1)
+                            db.table("kits").update({"quantity_available": new_qty}).eq("id", kit_id).execute()
+                            logger.debug(f"[BULK ACTION] Kit {kit.data['sku']} stock → {new_qty}")
+                    # Create draft shipment + shipment_items
+                    draft_ship = {
+                        "customer_id":      d["customer_id"],
+                        "kit_id":           d.get("kit_id"),
+                        "kit_sku":          d.get("kit_sku"),
+                        "ship_date":        None,
+                        "trimester_at_ship": d.get("trimester"),
+                        "platform":         d.get("platform"),
+                        "order_id":         d.get("order_id"),
+                        "notes":            f"Bulk-approved from decision {did[:8]}",
+                    }
+                    ship_result = db.table("shipments").insert(draft_ship).execute()
+                    ship_id     = ship_result.data[0]["id"] if ship_result.data else None
+                    if kit_id and ship_id:
+                        kit_items = db.table("kit_items").select("item_id").eq("kit_id", kit_id).execute()
+                        for ki in (kit_items.data or []):
+                            try:
+                                db.table("shipment_items").insert({"shipment_id": ship_id, "item_id": ki["item_id"]}).execute()
+                            except Exception:
+                                pass
+                    logger.info(f"[BULK ACTION] Approved {did[:8]}, draft shipment={ship_id[:8] if ship_id else '?'}")
+                    success += 1
+
+                elif action == "ship":
+                    if current_status not in ("pending", "approved"):
+                        logger.debug(f"[BULK ACTION] Skip ship on {did[:8]} — status={current_status}")
+                        skipped += 1
+                        continue
+                    # Decrement stock if still pending
+                    if current_status == "pending" and d.get("kit_id"):
+                        kit = db.table("kits").select("sku, quantity_available").eq("id", d["kit_id"]).single().execute()
+                        if kit.data:
+                            new_qty = max(0, kit.data["quantity_available"] - 1)
+                            db.table("kits").update({"quantity_available": new_qty}).eq("id", d["kit_id"]).execute()
+                    db.table("decisions").update({"status": "shipped"}).eq("id", did).execute()
+                    # Stamp ship_date on existing draft shipment or create new
+                    existing = db.table("shipments").select("id").eq("customer_id", d["customer_id"]).ilike("notes", f"%decision {did[:8]}%").execute()
+                    if existing.data:
+                        db.table("shipments").update({"ship_date": date.today().isoformat()}).eq("id", existing.data[0]["id"]).execute()
+                    else:
+                        db.table("shipments").insert({
+                            "customer_id":      d["customer_id"],
+                            "kit_id":           d.get("kit_id"),
+                            "kit_sku":          d.get("kit_sku"),
+                            "ship_date":        date.today().isoformat(),
+                            "trimester_at_ship": d.get("trimester"),
+                            "platform":         d.get("platform"),
+                            "order_id":         d.get("order_id"),
+                            "notes":            f"Bulk-shipped from decision {did[:8]}",
+                        }).execute()
+                    logger.info(f"[BULK ACTION] Shipped {did[:8]}")
+                    success += 1
+
+            except Exception as row_err:
+                logger.error(f"[BULK ACTION] Error on decision {did}: {row_err}", exc_info=True)
+                failed += 1
+
+        await log_activity(
+            "decision",
+            f"Bulk {action}: {success} succeeded, {skipped} skipped, {failed} failed",
+            f"{len(decision_ids)} total selected",
+            "success" if failed == 0 else "warning",
+        )
+        parts = [f"{success} {action}d"]
+        if skipped: parts.append(f"{skipped} skipped")
+        if failed:  parts.append(f"{failed} failed")
+        result_msg  = quote(f"Bulk {action}: " + ", ".join(parts))
+        result_type = "success" if failed == 0 else "warning"
+        sep         = "&" if redirect_qs else ""
+        return RedirectResponse(
+            f"/decisions?{redirect_qs}{sep}msg={result_msg}&msg_type={result_type}",
+            status_code=303,
+        )
+    except Exception as e:
+        logger.error(f"[BULK ACTION] Fatal error: {e}", exc_info=True)
+        return RedirectResponse(f"/decisions?msg={quote('Bulk action failed: ' + str(e))}&msg_type=error", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════
+# PIRATE SHIP CSV EXPORT + GOOGLE SHEET EXPORT
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/decisions/export-csv")
+async def export_decisions_csv(request: Request):
+    """Export filtered decisions as a downloadable Pirate Ship CSV."""
+    try:
+        db = get_supabase()
+
+        # Re-apply same filter params as decisions page
+        f_trimester = request.query_params.get("trimester", "").strip()
+        f_status    = request.query_params.get("status", "approved").strip()  # default: approved only
+        f_type      = request.query_params.get("type", "").strip()
+        f_platform  = request.query_params.get("platform", "").strip()
+        f_month     = request.query_params.get("month", "").strip()
+
+        q_obj = db.table("decisions").select("*, customers(*)")
+        if f_trimester:
+            try:
+                q_obj = q_obj.eq("trimester", int(f_trimester))
+            except ValueError:
+                pass
+        if f_status:
+            q_obj = q_obj.eq("status", f_status)
+        if f_type:
+            q_obj = q_obj.eq("decision_type", f_type)
+        if f_platform:
+            q_obj = q_obj.eq("platform", f_platform)
+        if f_month:
+            try:
+                y, m     = int(f_month[:4]), int(f_month[5:7])
+                start_dt = f"{y}-{m:02d}-01"
+                m += 1
+                if m > 12:
+                    m = 1; y += 1
+                end_dt  = f"{y}-{m:02d}-01"
+                q_obj   = q_obj.gte("created_at", start_dt).lt("created_at", end_dt)
+            except Exception as me:
+                logger.warning(f"[EXPORT CSV] Invalid month '{f_month}': {me}")
+
+        rows = q_obj.order("created_at", desc=True).limit(2000).execute().data or []
+        logger.info(f"[EXPORT CSV] Exporting {len(rows)} decisions (status={f_status})")
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Name", "Email", "Address Line 1", "Address Line 2",
+            "City", "State", "Zip", "Country", "Phone",
+            "Order Number", "Kit SKU", "Trimester",
+        ])
+        for d in rows:
+            c    = d.get("customers") or {}
+            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+            writer.writerow([
+                name,
+                c.get("email", ""),
+                c.get("address_line1", ""),
+                c.get("address_line2") or "",
+                c.get("city", ""),
+                c.get("province", ""),
+                c.get("zip") or c.get("zip_code", ""),
+                c.get("country") or "US",
+                c.get("phone") or "",
+                d.get("order_id", ""),
+                d.get("kit_sku", ""),
+                f"T{d.get('trimester', '')}",
+            ])
+
+        output.seek(0)
+        filename = f"pirateship_export_{date.today().isoformat()}.csv"
+        await log_activity("export", f"Pirate Ship CSV export: {len(rows)} rows", f"status={f_status}", "success")
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except Exception as e:
+        logger.error(f"[EXPORT CSV] Error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/decisions/export-sheet")
+async def export_decisions_sheet(request: Request, background_tasks: BackgroundTasks):
+    """Push filtered decisions to Google Sheets in Pirate Ship format."""
+    try:
+        db          = get_supabase()
+        form        = await request.form()
+        f_status    = form.get("status", "approved")
+        f_trimester = form.get("trimester", "")
+        f_month     = form.get("month", "")
+        redirect_qs = form.get("redirect_qs", "")
+
+        q_obj = db.table("decisions").select("*, customers(*)")
+        if f_status:
+            q_obj = q_obj.eq("status", f_status)
+        if f_trimester:
+            try:
+                q_obj = q_obj.eq("trimester", int(f_trimester))
+            except ValueError:
+                pass
+        if f_month:
+            try:
+                y, m     = int(f_month[:4]), int(f_month[5:7])
+                start_dt = f"{y}-{m:02d}-01"
+                m += 1
+                if m > 12:
+                    m = 1; y += 1
+                end_dt  = f"{y}-{m:02d}-01"
+                q_obj   = q_obj.gte("created_at", start_dt).lt("created_at", end_dt)
+            except Exception:
+                pass
+
+        rows = q_obj.order("created_at", desc=True).limit(2000).execute().data or []
+        logger.info(f"[EXPORT SHEET] Queued {len(rows)} rows for Google Sheet push")
+
+        def _push_to_sheet(rows_data: list):
+            try:
+                ws          = get_gsheet()
+                tab_name    = f"PS Export {date.today().isoformat()}"
+                spreadsheet = ws.spreadsheet
+                try:
+                    export_ws = spreadsheet.worksheet(tab_name)
+                    export_ws.clear()
+                except Exception:
+                    export_ws = spreadsheet.add_worksheet(title=tab_name, rows=len(rows_data) + 5, cols=12)
+                header = [
+                    "Name", "Email", "Address Line 1", "Address Line 2",
+                    "City", "State", "Zip", "Country", "Phone",
+                    "Order Number", "Kit SKU", "Trimester",
+                ]
+                sheet_rows = [header]
+                for d in rows_data:
+                    c    = d.get("customers") or {}
+                    name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+                    sheet_rows.append([
+                        name,
+                        c.get("email", ""),
+                        c.get("address_line1", ""),
+                        c.get("address_line2") or "",
+                        c.get("city", ""),
+                        c.get("province", ""),
+                        c.get("zip") or c.get("zip_code", ""),
+                        c.get("country") or "US",
+                        c.get("phone") or "",
+                        d.get("order_id", ""),
+                        d.get("kit_sku", ""),
+                        f"T{d.get('trimester', '')}",
+                    ])
+                export_ws.update(sheet_rows)
+                logger.info(f"[EXPORT SHEET] Pushed {len(rows_data)} rows to tab '{tab_name}'")
+            except Exception as se:
+                logger.error(f"[EXPORT SHEET] Background push failed: {se}", exc_info=True)
+
+        background_tasks.add_task(_push_to_sheet, rows)
+        await log_activity("export", f"Google Sheet export queued: {len(rows)} rows", f"status={f_status}", "success")
+        sep         = "&" if redirect_qs else ""
+        result_msg  = quote(f"Sheet export queued — {len(rows)} rows pushing to Google Sheets")
+        return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg={result_msg}&msg_type=success", status_code=303)
+    except Exception as e:
+        logger.error(f"[EXPORT SHEET] Error: {e}", exc_info=True)
+        return RedirectResponse(f"/decisions?msg={quote('Sheet export failed: ' + str(e))}&msg_type=error", status_code=303)
 
 
 if __name__ == "__main__":

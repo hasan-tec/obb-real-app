@@ -1,6 +1,23 @@
 {% extends "base.html" %}
 {% block title %}Kits — OBB Engine{% endblock %}
 {% block content %}
+
+{# ─── Sort-header macro ─── #}
+{% macro sort_th(label, col) %}
+{% set next_dir = ('asc' if sort_dir == 'desc' else 'desc') if sort == col else 'asc' %}
+<th>
+    <a href="?sort={{ col }}&dir={{ next_dir }}"
+       style="color:var(--text);text-decoration:none;display:flex;align-items:center;gap:4px;white-space:nowrap;">
+        {{ label }}
+        {% if sort == col %}
+            <span style="color:var(--accent);font-size:11px;">{{ '▲' if sort_dir == 'asc' else '▼' }}</span>
+        {% else %}
+            <span style="color:var(--border);font-size:10px;">⇅</span>
+        {% endif %}
+    </a>
+</th>
+{% endmacro %}
+
 <div class="topbar">
     <h1>Kits Inventory</h1>
     <div class="status">
@@ -290,14 +307,13 @@
         <table>
             <thead>
                 <tr>
-                    <th>SKU</th>
+                    {{ sort_th('SKU',      'sku') }}
                     <th>Name</th>
-                    <th>Trimester</th>
-                    <th>Size</th>
+                    {{ sort_th('Trimester','trimester') }}
+                    {{ sort_th('Size',     'size_variant') }}
                     <th>Items</th>
-                    <th>Quantity</th>
-                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);"
-                            title="AUTO = computed from SKU. MANUAL = user-locked.">&#9432;</span></th>
+                    {{ sort_th('Quantity', 'quantity_available') }}
+                    {{ sort_th('Age Rank', 'age_rank') }}
                     <th>Cost</th>
                     <th>Actions</th>
                 </tr>
@@ -367,14 +383,13 @@
         <table>
             <thead>
                 <tr>
-                    <th>SKU</th>
+                    {{ sort_th('SKU',      'sku') }}
                     <th>Name</th>
-                    <th>Trimester</th>
-                    <th>Size</th>
+                    {{ sort_th('Trimester','trimester') }}
+                    {{ sort_th('Size',     'size_variant') }}
                     <th>Items</th>
-                    <th>Quantity</th>
-                    <th>Age Rank <span style="font-size:10px;color:var(--text-dim);"
-                            title="AUTO = computed from SKU. MANUAL = user-locked.">&#9432;</span></th>
+                    {{ sort_th('Quantity', 'quantity_available') }}
+                    {{ sort_th('Age Rank', 'age_rank') }}
                     <th>Cost</th>
                     <th>Actions</th>
                 </tr>

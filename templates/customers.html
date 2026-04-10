@@ -1,10 +1,29 @@
 {% extends "base.html" %}
 {% block title %}Customers — OBB Engine{% endblock %}
 {% block content %}
+
+{# ─── Sort-header macro ─── #}
+{% macro sort_th(label, col) %}
+{% set next_dir = ('asc' if sort_dir == 'desc' else 'desc') if sort == col else ('desc' if col == 'created_at' else 'asc') %}
+<th>
+    <a href="?sort={{ col }}&dir={{ next_dir }}{% if filter_qs %}&{{ filter_qs }}{% endif %}"
+       style="color:var(--text);text-decoration:none;display:flex;align-items:center;gap:4px;white-space:nowrap;">
+        {{ label }}
+        {% if sort == col %}
+            <span style="color:var(--accent);font-size:11px;">{{ '▲' if sort_dir == 'asc' else '▼' }}</span>
+        {% else %}
+            <span style="color:var(--border);font-size:10px;">⇅</span>
+        {% endif %}
+    </a>
+</th>
+{% endmacro %}
+
 <div class="topbar">
     <h1>Customers</h1>
     <div class="status">
-        <span id="customerCount">{{ customers | length }}{% if search_query %} of {{ total_customers }}{% endif %} customers{% if search_query %} matching &ldquo;{{ search_query }}&rdquo;{% endif %}</span>
+        <span id="customerCount">
+            {{ customers | length }}{% if any_filter_active %} of {{ total_customers }}{% endif %} customers{% if search_query %} matching &ldquo;{{ search_query }}&rdquo;{% endif %}
+        </span>
         <button class="btn btn-sm btn-primary"
             onclick="document.getElementById('addCustomerForm').style.display = document.getElementById('addCustomerForm').style.display === 'none' ? 'block' : 'none'">+
             Add Customer</button>
@@ -189,69 +208,110 @@
     <div class="card">
         <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
             <h3 style="margin:0;">All Customers</h3>
-            <form method="GET" action="/customers" style="display:flex; gap:8px; align-items:center;">
-                <input type="text" name="q" id="customerSearch" class="form-control" placeholder="Search name or email…"
-                    value="{{ search_query or '' }}" style="width:240px; height:32px; font-size:13px;">
-                {% if search_query %}
-                <a href="/customers" class="btn btn-sm btn-secondary" title="Clear search">✕ Clear</a>
-                {% endif %}
-                <button type="submit" class="btn btn-sm btn-primary">Search</button>
+        </div>
+
+        <!-- ── Filter Bar ── -->
+        <div style="padding:12px 16px;border-bottom:1px solid var(--border);background:var(--surface);">
+            <form method="GET" action="/customers" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+                <div style="display:flex;flex-direction:column;gap:3px;">
+                    <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Trimester</label>
+                    <select name="trimester" class="form-control" style="height:32px;font-size:13px;min-width:80px;">
+                        <option value="">All</option>
+                        <option value="1" {% if filters.trimester == '1' %}selected{% endif %}>T1</option>
+                        <option value="2" {% if filters.trimester == '2' %}selected{% endif %}>T2</option>
+                        <option value="3" {% if filters.trimester == '3' %}selected{% endif %}>T3</option>
+                        <option value="4" {% if filters.trimester == '4' %}selected{% endif %}>T4</option>
+                    </select>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:3px;">
+                    <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Platform</label>
+                    <select name="platform" class="form-control" style="height:32px;font-size:13px;min-width:100px;">
+                        <option value="">All</option>
+                        <option value="shopify"  {% if filters.platform == 'shopify'  %}selected{% endif %}>Shopify</option>
+                        <option value="cratejoy" {% if filters.platform == 'cratejoy' %}selected{% endif %}>Cratejoy</option>
+                        <option value="both"     {% if filters.platform == 'both'     %}selected{% endif %}>Both</option>
+                    </select>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:3px;">
+                    <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Status</label>
+                    <select name="status" class="form-control" style="height:32px;font-size:13px;min-width:140px;">
+                        <option value="">All</option>
+                        <option value="active"             {% if filters.status == 'active'             %}selected{% endif %}>Active</option>
+                        <option value="cancelled-prepaid"  {% if filters.status == 'cancelled-prepaid'  %}selected{% endif %}>Cancelled (Prepaid)</option>
+                        <option value="cancelled-expired"  {% if filters.status == 'cancelled-expired'  %}selected{% endif %}>Cancelled (Expired)</option>
+                        <option value="paused"             {% if filters.status == 'paused'             %}selected{% endif %}>Paused</option>
+                    </select>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:3px;">
+                    <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Size</label>
+                    <select name="size" class="form-control" style="height:32px;font-size:13px;min-width:80px;">
+                        <option value="">All</option>
+                        <option value="S"  {% if filters.size == 'S'  %}selected{% endif %}>S</option>
+                        <option value="M"  {% if filters.size == 'M'  %}selected{% endif %}>M</option>
+                        <option value="L"  {% if filters.size == 'L'  %}selected{% endif %}>L</option>
+                        <option value="XL" {% if filters.size == 'XL' %}selected{% endif %}>XL</option>
+                    </select>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:3px;">
+                    <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Search</label>
+                    <input type="text" name="q" value="{{ search_query or '' }}" placeholder="name or email…"
+                           class="form-control" style="height:32px;font-size:13px;min-width:200px;">
+                </div>
+                <div style="display:flex;gap:8px;align-items:flex-end;">
+                    <button type="submit" class="btn btn-sm btn-primary" style="height:32px;">Filter</button>
+                    {% if any_filter_active %}
+                    <a href="/customers" class="btn btn-sm" style="height:32px;line-height:22px;background:var(--surface2);border:1px solid var(--border);">Clear</a>
+                    {% endif %}
+                </div>
             </form>
         </div>
+
         {% if customers %}
+        {# ── Active Subscribers section ── #}
+        {% if active_customers %}
+        <div style="padding:8px 16px 4px;font-size:12px;font-weight:700;letter-spacing:.06em;color:var(--green);text-transform:uppercase;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;">
+            🟢 Active Subscribers — {{ active_customers | length }}
+        </div>
         <table>
             <thead>
                 <tr>
-                    <th>Name</th>
-                    <th>Email</th>
+                    {{ sort_th('Name',     'first_name') }}
+                    {{ sort_th('Email',    'email') }}
                     <th>Platform</th>
-                    <th>Trimester</th>
-                    <th>Due Date</th>
-                    <th>Size</th>
-                    <th>Status</th>
+                    {{ sort_th('Trimester','trimester') }}
+                    {{ sort_th('Due Date', 'due_date') }}
+                    {{ sort_th('Size',     'clothing_size') }}
+                    {{ sort_th('Status',   'subscription_status') }}
                     <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
-                {% for c in customers %}
+                {% for c in active_customers %}
                 <tr>
                     <td>{{ c.first_name or '' }} {{ c.last_name or '' }}</td>
-                    <td style="font-size: 12px;">{{ c.email }}</td>
+                    <td style="font-size:12px;">{{ c.email }}</td>
                     <td>
-                        {% if c.platform == 'shopify' %}
-                        <span class="badge badge-green">Shopify</span>
-                        {% elif c.platform == 'cratejoy' %}
-                        <span class="badge badge-blue">Cratejoy</span>
-                        {% elif c.platform == 'both' %}
-                        <span class="badge badge-purple">Both</span>
-                        {% else %}
-                        <span class="badge badge-dim">{{ c.platform or '—' }}</span>
-                        {% endif %}
+                        {% if c.platform == 'shopify' %}<span class="badge badge-green">Shopify</span>
+                        {% elif c.platform == 'cratejoy' %}<span class="badge badge-blue">Cratejoy</span>
+                        {% elif c.platform == 'both' %}<span class="badge badge-purple">Both</span>
+                        {% else %}<span class="badge badge-dim">{{ c.platform or '—' }}</span>{% endif %}
                     </td>
                     <td>
-                        {% if c.trimester %}
-                        <span class="badge badge-purple">T{{ c.trimester }}</span>
-                        {% else %}
-                        <span class="badge badge-dim">—</span>
-                        {% endif %}
+                        {% if c.trimester %}<span class="badge badge-purple">T{{ c.trimester }}</span>
+                        {% else %}<span class="badge badge-dim">—</span>{% endif %}
                     </td>
                     <td>{{ c.due_date or '—' }}</td>
                     <td>{{ c.clothing_size or '—' }}</td>
                     <td>
-                        {% if c.subscription_status == 'active' %}
-                        <span class="badge badge-green">Active</span>
-                        {% elif c.subscription_status == 'cancelled-prepaid' %}
-                        <span class="badge badge-yellow">Prepaid</span>
-                        {% elif c.subscription_status == 'paused' %}
-                        <span class="badge badge-yellow">Paused</span>
-                        {% else %}
-                        <span class="badge badge-red">{{ c.subscription_status or '—' }}</span>
-                        {% endif %}
+                        {% if c.subscription_status == 'active' %}<span class="badge badge-green">Active</span>
+                        {% elif c.subscription_status == 'cancelled-prepaid' %}<span class="badge badge-yellow">Prepaid</span>
+                        {% elif c.subscription_status == 'paused' %}<span class="badge badge-yellow">Paused</span>
+                        {% else %}<span class="badge badge-red">{{ c.subscription_status or '—' }}</span>{% endif %}
                     </td>
-                    <td style="white-space: nowrap;">
+                    <td style="white-space:nowrap;">
                         <a href="/customers/{{ c.id }}" class="btn btn-sm btn-secondary">View</a>
                         <form method="POST" action="/customers/{{ c.id }}/remove" style="display:inline;"
-                            onsubmit="return confirm('Delete this customer and all their shipment history?');">
+                              onsubmit="return confirm('Delete this customer and all their shipment history?');">
                             <button type="submit" class="btn btn-sm btn-danger">Remove</button>
                         </form>
                     </td>
@@ -259,6 +319,74 @@
                 {% endfor %}
             </tbody>
         </table>
+        {% endif %}
+
+        {# ── Past / Completed section ── #}
+        {% if past_customers %}
+        <div style="padding:8px 16px 4px;font-size:12px;font-weight:700;letter-spacing:.06em;color:var(--text-dim);text-transform:uppercase;border-bottom:1px solid var(--border);border-top:2px solid var(--border);margin-top:{% if active_customers %}8px{% else %}0{% endif %};display:flex;align-items:center;gap:8px;">
+            ⚫ Past Customers — {{ past_customers | length }}
+            <span style="font-size:10px;font-weight:400;color:var(--text-dim);">(due date &gt; 5 months ago, expired, or paused with old due date)</span>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    {{ sort_th('Name',     'first_name') }}
+                    {{ sort_th('Email',    'email') }}
+                    <th>Platform</th>
+                    {{ sort_th('Trimester','trimester') }}
+                    {{ sort_th('Due Date', 'due_date') }}
+                    {{ sort_th('Size',     'clothing_size') }}
+                    {{ sort_th('Status',   'subscription_status') }}
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for c in past_customers %}
+                <tr style="opacity:0.75;">
+                    <td>{{ c.first_name or '' }} {{ c.last_name or '' }}</td>
+                    <td style="font-size:12px;">{{ c.email }}</td>
+                    <td>
+                        {% if c.platform == 'shopify' %}<span class="badge badge-green">Shopify</span>
+                        {% elif c.platform == 'cratejoy' %}<span class="badge badge-blue">Cratejoy</span>
+                        {% elif c.platform == 'both' %}<span class="badge badge-purple">Both</span>
+                        {% else %}<span class="badge badge-dim">{{ c.platform or '—' }}</span>{% endif %}
+                    </td>
+                    <td>
+                        {% if c.trimester %}<span class="badge badge-purple">T{{ c.trimester }}</span>
+                        {% else %}<span class="badge badge-dim">—</span>{% endif %}
+                    </td>
+                    <td>{{ c.due_date or '—' }}</td>
+                    <td>{{ c.clothing_size or '—' }}</td>
+                    <td>
+                        {% if c.subscription_status == 'active' %}<span class="badge badge-green">Active</span>
+                        {% elif c.subscription_status == 'cancelled-prepaid' %}<span class="badge badge-yellow">Prepaid</span>
+                        {% elif c.subscription_status == 'paused' %}<span class="badge badge-yellow">Paused</span>
+                        {% else %}<span class="badge badge-red">{{ c.subscription_status or '—' }}</span>{% endif %}
+                    </td>
+                    <td style="white-space:nowrap;">
+                        <a href="/customers/{{ c.id }}" class="btn btn-sm btn-secondary">View</a>
+                        <form method="POST" action="/customers/{{ c.id }}/remove" style="display:inline;"
+                              onsubmit="return confirm('Delete this customer and all their shipment history?');">
+                            <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+
+        {% if not active_customers and not past_customers %}
+        <div class="empty-state">
+            <div class="icon">👥</div>
+            {% if any_filter_active %}
+            <p>No customers match these filters. <a href="/customers">Clear filters</a>.</p>
+            {% else %}
+            <p>No customers yet. They'll appear after webhooks are processed.</p>
+            {% endif %}
+        </div>
+        {% endif %}
+
         {% else %}
         <div class="empty-state">
             <div class="icon">👥</div>
