@@ -1,0 +1,577 @@
+{% extends "base.html" %}
+{% block title %}Monthly Curation Report{% endblock %}
+{% block content %}
+
+{% if msg %}
+<div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}">{{ msg }}</div>
+{% endif %}
+
+<!-- ═══ Generate Report Form ═══ -->
+{% if not report %}
+<div class="card" style="margin-bottom: 24px;">
+    <div class="card-header">
+        <h3>Generate Monthly Curation Report</h3>
+    </div>
+    <div style="padding: 20px;">
+        <div
+            style="border-left: 3px solid var(--yellow); background: rgba(255,193,7,0.08); padding: 14px 18px; border-radius: 6px; margin-bottom: 20px;">
+            <strong style="color: var(--yellow);">⚡ How It Works</strong>
+            <p style="margin: 6px 0 0; color: var(--text-dim); font-size: 0.9em;">
+                This report analyzes ALL renewal customers, projects their trimesters for the target ship date,
+                checks existing kit coverage, and generates DO NOT USE / CAN USE item lists per trimester.
+                It also calculates recommended build quantities for the warehouse.
+            </p>
+        </div>
+        <form method="POST" action="/curation-report/generate"
+            onsubmit="this.querySelector('button[type=submit]').disabled=true; this.querySelector('button[type=submit]').textContent='Generating...';">
+            <div class="form-row"
+                style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 16px; align-items: end;">
+                <div class="form-group">
+                    <label>Report Month</label>
+                    <input type="month" name="report_month" value="{{ default_month }}" required
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <div class="form-group">
+                    <label>Ship Day</label>
+                    <input type="number" name="ship_day" value="14" min="1" max="28"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <div class="form-group">
+                    <label>Warehouse Minimum</label>
+                    <input type="number" name="warehouse_min" value="100" min="1"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <div class="form-group">
+                    <label>Lookback (months)</label>
+                    <input type="number" name="lookback_months" value="4" min="1" max="12"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <div class="form-group">
+                    <label
+                        title="Only show customers whose last shipment was within this many months. Set 0 to include all.">Active
+                        Since (months)</label>
+                    <input type="number" name="recency_months" value="3" min="0" max="24"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;"
+                        title="0 = no filter (include all history). 3 = only customers who shipped in last 3 months.">
+                </div>
+                <button type="submit" class="btn btn-primary" style="height: 38px;">
+                    📊 Generate Report
+                </button>
+            </div>
+            <div style="margin-top: 10px;">
+                <label
+                    style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text-dim); font-size: 0.9em;">
+                    <input type="checkbox" name="include_paused" value="1" style="accent-color: var(--accent);">
+                    Include paused subscriptions
+                </label>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Previous Runs -->
+{% if previous_runs %}
+<div class="card">
+    <div class="card-header">
+        <h3>Previous Reports</h3>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>Report Month</th>
+                <th>Ship Date</th>
+                <th>Generated</th>
+                <th>Total Customers</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for run in previous_runs %}
+            <tr>
+                <td><strong>{{ run.report_month }}</strong></td>
+                <td>{{ run.ship_date }}</td>
+                <td>{{ run.generated_at[:10] if run.generated_at else '—' }}</td>
+                <td>{{ run.summary_json.total_renewal_customers if run.summary_json else '—' }}</td>
+                <td>
+                    {% if run.status == 'completed' %}
+                    <span class="badge badge-green">Completed</span>
+                    {% elif run.status == 'running' %}
+                    <span class="badge badge-yellow">Running</span>
+                    {% elif run.status == 'error' %}
+                    <span class="badge badge-red">Error</span>
+                    {% else %}
+                    <span class="badge">{{ run.status }}</span>
+                    {% endif %}
+                </td>
+                <td style="white-space: nowrap;">
+                    <a href="/curation-report/{{ run.id }}" class="btn" style="font-size: 0.85em;">View →</a>
+                    <form method="POST" action="/curation-report/{{ run.id }}/delete" style="display:inline;"
+                        onsubmit="return confirm('Delete this report? This cannot be undone.');">
+                        <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="empty-state">
+    <div class="icon">📊</div>
+    <p>No curation reports generated yet</p>
+    <p style="color: var(--text-dim); font-size: 0.9em;">Use the form above to generate your first monthly curation
+        report.</p>
+</div>
+{% endif %}
+
+{% endif %}
+
+<!-- ═══ Report View ═══ -->
+{% if report %}
+<div style="margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+    <a href="/curation-report" class="btn">← Back to Reports</a>
+    <div style="display: flex; gap: 8px; align-items: center;">
+        <form method="POST" action="/curation-report/{{ run_id }}/export-sheet" style="display: inline;">
+            <button type="submit" class="btn btn-primary" style="font-size: 0.9em;">📊 Export to Google Sheets</button>
+        </form>
+        <span style="color: var(--text-dim); font-size: 0.9em;">Report ID: {{ run_id }}</span>
+    </div>
+</div>
+
+<!-- ── Executive Overview ── -->
+<div class="card" style="margin-bottom: 24px;">
+    <div class="card-header">
+        <h3>{{ report.executive.report_month }} — Monthly Curation Report</h3>
+        <span style="color: var(--text-dim); font-size: 0.85em;">
+            Ship date: {{ report.executive.ship_date }} &nbsp;|&nbsp;
+            Generated: {{ report.executive.generated_at }} &nbsp;|&nbsp;
+            Lookback: {{ report.executive.lookback_months }} months ({{ report.executive.lookback_window }})
+            &nbsp;|&nbsp;
+            Active since: {% if report.executive.recency_months %}last {{ report.executive.recency_months }} months{%
+            else %}all history{% endif %}
+        </span>
+    </div>
+    <div style="padding: 20px;">
+        <div class="stat-grid">
+            <div class="stat-card">
+                <div class="label">Total Renewal</div>
+                <div class="value">{{ report.executive.total_renewal_customers }}</div>
+                <div class="sub">customers shipping</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">New Customers</div>
+                <div class="value">{{ report.executive.total_new_customers }}</div>
+                <div class="sub">welcome kit track</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Warehouse Min</div>
+                <div class="value">{{ report.executive.warehouse_minimum }}</div>
+                <div class="sub">units per kit build</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Trimesters Active</div>
+                <div class="value">{{ report.executive.trimesters | length }}</div>
+                <div class="sub">T1 / T2 / T3 / T4</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ── Per-Trimester Summary Cards ── -->
+<div class="stat-grid" style="margin-bottom: 24px;">
+    {% for tri in [1, 2, 3, 4] %}
+    {% set ex = report.executive.trimesters[tri|string] or report.executive.trimesters[tri] %}
+    {% if ex %}
+    <div class="stat-card"
+        style="border-left: 3px solid {% if ex.needs_new_curation > 0 %}var(--yellow){% else %}var(--green){% endif %};">
+        <div class="label">Trimester {{ tri }}</div>
+        <div class="value">{{ ex.projected_customers }}</div>
+        <div class="sub" style="margin-top: 8px;">
+            <span style="color: var(--green);">✓ {{ ex.covered_by_existing }} covered</span> &nbsp;
+            {% if ex.needs_new_curation > 0 %}
+            <span style="color: var(--yellow);">⚠ {{ ex.needs_new_curation }} need new</span>
+            {% endif %}
+        </div>
+        <div class="sub" style="margin-top: 4px; font-size: 0.8em;">
+            Build: {{ ex.recommended_build_qty }} units
+            {% if ex.expected_leftover > 0 %}({{ ex.expected_leftover }} leftover){% endif %}
+        </div>
+        <div class="sub" style="margin-top: 4px; font-size: 0.8em; color: var(--text-dim);">
+            🚫 {{ ex.do_not_use_count }} blocked &nbsp; ✅ {{ ex.can_use_count }} available
+        </div>
+    </div>
+    {% endif %}
+    {% endfor %}
+</div>
+
+<!-- ── Trimester Tabs ── -->
+<div style="display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">
+    {% for tri in [1, 2, 3, 4] %}
+    <button class="btn trimester-tab {% if loop.first %}btn-primary{% endif %}" data-tri="{{ tri }}"
+        onclick="switchTrimester({{ tri }})" style="font-size: 0.9em;">
+        T{{ tri }}
+        {% set ex = report.executive.trimesters[tri|string] or report.executive.trimesters[tri] %}
+        {% if ex %}({{ ex.projected_customers }}){% endif %}
+    </button>
+    {% endfor %}
+</div>
+
+<!-- ── Trimester Detail Panels ── -->
+{% for tri in [1, 2, 3, 4] %}
+{% set tr = report.trimester_reports[tri|string] or report.trimester_reports[tri] %}
+<div class="trimester-panel" id="tri-panel-{{ tri }}" style="{% if not loop.first %}display:none;{% endif %}">
+
+    {% if tr %}
+    <!-- Inventory Status -->
+    {% if tr.inventory_status %}
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>📦 T{{ tri }} Existing Kit Queue (FIFO)</h3>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Kit SKU</th>
+                    <th>Stock</th>
+                    <th>Age Rank</th>
+                    <th>Size</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for kit in tr.inventory_status %}
+                <tr>
+                    <td><strong>{{ kit.sku }}</strong></td>
+                    <td>{{ kit.quantity_available }}</td>
+                    <td>{{ kit.age_rank }}</td>
+                    <td>
+                        {% if kit.is_universal %}
+                        <span class="badge badge-blue">Universal</span>
+                        {% elif kit.size_variant == 1 %}S
+                        {% elif kit.size_variant == 2 %}M
+                        {% elif kit.size_variant == 3 %}L
+                        {% elif kit.size_variant == 4 %}XL
+                        {% else %}Variant {{ kit.size_variant }}
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    <!-- DO NOT USE Table -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>🚫 DO NOT USE — T{{ tri }}</h3>
+            <span class="badge badge-red">{{ tr.do_not_use | length }} items</span>
+        </div>
+        {% if tr.do_not_use %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Item</th>
+                    <th>SKU</th>
+                    <th>Category</th>
+                    <th>Blocked By</th>
+                    <th>Blocked %</th>
+                    <th>Risk</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in tr.do_not_use %}
+                <tr>
+                    <td><strong>{{ item.name }}</strong></td>
+                    <td style="color: var(--text-dim); font-size: 0.9em;">{{ item.sku }}</td>
+                    <td>{{ item.category or '—' }}</td>
+                    <td>{{ item.blocked_count }} / {{ item.group_size }}</td>
+                    <td>
+                        <strong
+                            style="color: {% if item.blocked_pct >= 60 %}var(--red){% else %}var(--yellow){% endif %};">
+                            {{ item.blocked_pct }}%
+                        </strong>
+                    </td>
+                    <td>
+                        {% if item.risk_level == 'HIGH' %}
+                        <span class="badge badge-red">HIGH</span>
+                        {% else %}
+                        <span class="badge badge-yellow">MEDIUM</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state" style="padding: 20px;">
+            <p style="color: var(--green);">✓ No high-risk items — all items are safe to use for T{{ tri }}</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- CAN USE Table -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>✅ CAN USE — T{{ tri }}</h3>
+            <span class="badge badge-green">{{ tr.can_use | length }} items</span>
+        </div>
+        {% if tr.can_use %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Item</th>
+                    <th>SKU</th>
+                    <th>Category</th>
+                    <th>Cost</th>
+                    <th>Blocked %</th>
+                    <th>Safety</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in tr.can_use %}
+                <tr>
+                    <td><strong>{{ item.name }}</strong></td>
+                    <td style="color: var(--text-dim); font-size: 0.9em;">{{ item.sku }}</td>
+                    <td>{{ item.category or '—' }}</td>
+                    <td>{% if item.unit_cost %}${{ "%.2f" | format(item.unit_cost) }}{% else %}—{% endif %}</td>
+                    <td>{{ item.blocked_pct }}%</td>
+                    <td><span class="badge badge-green">LOW</span></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state" style="padding: 20px;">
+            <p style="color: var(--red);">⚠ No safe items available for T{{ tri }} — all items are in the DO NOT USE
+                list</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Build Quantities -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>🏗️ Build Quantity — T{{ tri }}</h3>
+        </div>
+        <div style="padding: 20px;">
+            <div class="stat-grid" style="grid-template-columns: repeat(5, 1fr);">
+                <div class="stat-card">
+                    <div class="label">Projected</div>
+                    <div class="value">{{ tr.build_qty.projected_customers }}</div>
+                    <div class="sub">customers</div>
+                </div>
+                <div class="stat-card">
+                    <div class="label">Covered</div>
+                    <div class="value" style="color: var(--green);">{{ tr.build_qty.covered_by_existing }}</div>
+                    <div class="sub">existing kits</div>
+                </div>
+                <div class="stat-card">
+                    <div class="label">Need New</div>
+                    <div class="value" style="color: var(--yellow);">{{ tr.build_qty.need_new_curation }}</div>
+                    <div class="sub">uncovered</div>
+                </div>
+                <div class="stat-card" style="border-left: 3px solid var(--accent);">
+                    <div class="label">Build Qty</div>
+                    <div class="value" style="color: var(--accent);">{{ tr.build_qty.recommended_build_qty }}</div>
+                    <div class="sub">recommended</div>
+                </div>
+                <div class="stat-card">
+                    <div class="label">Leftover</div>
+                    <div class="value">{{ tr.build_qty.expected_leftover }}</div>
+                    <div class="sub">for next month</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Customer Flags -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>👥 Customer Flags — T{{ tri }}</h3>
+            <div style="display: flex; gap: 8px;">
+                <button class="btn cust-tab active" data-tab="covered-{{ tri }}"
+                    onclick="switchCustTab(this, {{ tri }})">
+                    ✓ Covered ({{ tr.covered_count }})
+                </button>
+                <button class="btn cust-tab" data-tab="needs-{{ tri }}" onclick="switchCustTab(this, {{ tri }})">
+                    ⚠ Needs New ({{ tr.needs_new_count }})
+                </button>
+            </div>
+        </div>
+
+        <!-- Covered Customers -->
+        <div class="cust-panel-{{ tri }}" id="covered-{{ tri }}">
+            {% set covered = [] %}
+            {% for c in tr.customers %}{% if not c.needs_new_curation %}{% if covered.append(c) %}{% endif %}{% endif
+            %}{% endfor %}
+            {% if covered %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Customer</th>
+                        <th>Email</th>
+                        <th>Platform</th>
+                        <th>Size</th>
+                        <th>Recommended Kit</th>
+                        <th>Alternatives</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for c in covered %}
+                    <tr>
+                        <td><strong>{{ c.first_name }} {{ c.last_name }}</strong></td>
+                        <td style="font-size: 0.85em; color: var(--text-dim);">{{ c.email }}</td>
+                        <td>
+                            {% if c.platform == 'shopify' %}
+                            <span class="badge badge-green">Shopify</span>
+                            {% elif c.platform == 'cratejoy' %}
+                            <span class="badge badge-blue">Cratejoy</span>
+                            {% else %}
+                            <span class="badge">{{ c.platform }}</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ c.clothing_size or 'Universal' }}</td>
+                        <td><strong style="color: var(--green);">{{ c.recommended_kit_sku }}</strong></td>
+                        <td style="font-size: 0.85em; color: var(--text-dim);">
+                            {% if c.alternative_kit_skus %}
+                            {{ c.alternative_kit_skus | join(', ') }}
+                            {% else %}—{% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state" style="padding: 20px;">
+                <p>No covered customers in T{{ tri }}</p>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Needs New Curation -->
+        <div class="cust-panel-{{ tri }}" id="needs-{{ tri }}" style="display: none;">
+            {% set needs = [] %}
+            {% for c in tr.customers %}{% if c.needs_new_curation %}{% if needs.append(c) %}{% endif %}{% endif %}{%
+            endfor %}
+            {% if needs %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Customer</th>
+                        <th>Email</th>
+                        <th>Platform</th>
+                        <th>Size</th>
+                        <th>Blocked Items</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for c in needs %}
+                    <tr>
+                        <td><strong>{{ c.first_name }} {{ c.last_name }}</strong></td>
+                        <td style="font-size: 0.85em; color: var(--text-dim);">{{ c.email }}</td>
+                        <td>
+                            {% if c.platform == 'shopify' %}
+                            <span class="badge badge-green">Shopify</span>
+                            {% elif c.platform == 'cratejoy' %}
+                            <span class="badge badge-blue">Cratejoy</span>
+                            {% else %}
+                            <span class="badge">{{ c.platform }}</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ c.clothing_size or 'Universal' }}</td>
+                        <td><span class="badge badge-yellow">{{ c.blocking_item_count }}</span></td>
+                        <td style="font-size: 0.85em; color: var(--text-dim);">{{ c.reason }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state" style="padding: 20px;">
+                <p style="color: var(--green);">✓ All T{{ tri }} customers are covered by existing kits!</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    {% else %}
+    <div class="empty-state" style="padding: 30px;">
+        <div class="icon">📭</div>
+        <p>No data for Trimester {{ tri }}</p>
+    </div>
+    {% endif %}
+
+</div><!-- end trimester-panel -->
+{% endfor %}
+
+<!-- Welcome Kit Watchlist -->
+{% if report.welcome_watchlist %}
+<div class="card" style="margin-top: 24px;">
+    <div class="card-header">
+        <h3>🎁 Welcome Kit Watchlist</h3>
+        <span class="badge">{{ report.welcome_watchlist.new_customer_count }} new customers</span>
+    </div>
+    <div style="padding: 20px;">
+        <div class="stat-grid" style="grid-template-columns: repeat(2, 1fr);">
+            <div class="stat-card">
+                <div class="label">Welcome Kit Stock</div>
+                <div class="value">{{ report.welcome_watchlist.total_stock }}</div>
+                <div class="sub">units available</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">New Customers</div>
+                <div class="value">{{ report.welcome_watchlist.new_customer_count }}</div>
+                <div class="sub">awaiting welcome kit</div>
+            </div>
+        </div>
+        {% if report.welcome_watchlist.kits %}
+        <table style="margin-top: 16px;">
+            <thead>
+                <tr>
+                    <th>Kit SKU</th>
+                    <th>Stock</th>
+                    <th>Age Rank</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for k in report.welcome_watchlist.kits %}
+                <tr>
+                    <td><strong>{{ k.sku }}</strong></td>
+                    <td>{{ k.quantity_available }}</td>
+                    <td>{{ k.age_rank }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+
+{% endif %}
+
+<script>
+    function switchTrimester(tri) {
+        // Hide all panels
+        document.querySelectorAll('.trimester-panel').forEach(p => p.style.display = 'none');
+        // Show selected
+        document.getElementById('tri-panel-' + tri).style.display = 'block';
+        // Update tab styles
+        document.querySelectorAll('.trimester-tab').forEach(t => t.classList.remove('btn-primary'));
+        document.querySelector('.trimester-tab[data-tri="' + tri + '"]').classList.add('btn-primary');
+    }
+
+    function switchCustTab(btn, tri) {
+        var tab = btn.getAttribute('data-tab');
+        // Hide all customer panels for this trimester
+        document.querySelectorAll('.cust-panel-' + tri).forEach(p => p.style.display = 'none');
+        // Show selected
+        document.getElementById(tab).style.display = 'block';
+        // Update tab styles
+        btn.parentElement.querySelectorAll('.cust-tab').forEach(t => t.classList.remove('active'));
+        btn.classList.add('active');
+    }
+</script>
+
+{% endblock %}

@@ -1,0 +1,527 @@
+{% extends "base.html" %}
+{% block title %}Forward Planner{% endblock %}
+{% block content %}
+
+{% if msg %}
+<div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}">{{ msg }}</div>
+{% endif %}
+
+<!-- ═══ Generate Projection Form ═══ -->
+{% if not projection %}
+<div class="card" style="margin-bottom: 24px;">
+    <div class="card-header">
+        <h3>📈 Forward Planner — Multi-Month Projection</h3>
+    </div>
+    <div style="padding: 20px;">
+        <div
+            style="border-left: 3px solid var(--blue); background: rgba(59,130,246,0.08); padding: 14px 18px; border-radius: 6px; margin-bottom: 20px;">
+            <strong style="color: var(--blue);">📈 What This Does</strong>
+            <p style="margin: 6px 0 0; color: var(--text-dim); font-size: 0.9em;">
+                Projects the monthly curation report into the future (3-6 months). Shows how customer counts shift
+                between trimesters, where kit stock runs out, and where the safe-item pool shrinks dangerously.
+                If you've committed curated items for a month, those propagate into future months as blocked items.
+            </p>
+        </div>
+        <form method="POST" action="/forward-planner/generate"
+            onsubmit="this.querySelector('button[type=submit]').disabled=true; this.querySelector('button[type=submit]').textContent='Projecting…';">
+            <div class="form-row"
+                style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr auto; gap: 16px; align-items: end;">
+                <div class="form-group">
+                    <label>Start Month</label>
+                    <input type="month" name="base_month" value="{{ default_month }}" required
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <div class="form-group">
+                    <label>Horizon</label>
+                    <select name="horizon_months"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                        <option value="3" selected>3 months</option>
+                        <option value="4">4 months</option>
+                        <option value="6">6 months</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Ship Day</label>
+                    <input type="number" name="ship_day" value="14" min="1" max="28"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <div class="form-group">
+                    <label>Warehouse Min</label>
+                    <input type="number" name="warehouse_min" value="100" min="1"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <div class="form-group">
+                    <label title="Only include customers whose last shipment was within this many months. 0=all.">Active
+                        Since (months)</label>
+                    <input type="number" name="recency_months" value="3" min="0" max="24"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <button type="submit" class="btn btn-primary" style="height: 38px;">
+                    📈 Generate Projection
+                </button>
+            </div>
+            <div style="margin-top: 10px; display: flex; gap: 20px;">
+                <label
+                    style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text-dim); font-size: 0.9em;">
+                    <input type="checkbox" name="include_paused" value="1" style="accent-color: var(--accent);">
+                    Include paused subscriptions
+                </label>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- ═══ Previous Projections ═══ -->
+{% if projection_runs %}
+<div class="card" style="margin-bottom: 24px;">
+    <div class="card-header">
+        <h3>Previous Projections</h3>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>Start Month</th>
+                <th>Horizon</th>
+                <th>Warehouse Min</th>
+                <th>Generated</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for run in projection_runs %}
+            <tr>
+                <td><strong>{{ run.base_month }}</strong></td>
+                <td>{{ run.params.horizon_months or '—' }} months</td>
+                <td>{{ run.params.warehouse_min or '—' }}</td>
+                <td>{{ run.created_at[:10] if run.created_at else '—' }}</td>
+                <td style="white-space: nowrap;">
+                    <a href="/forward-planner/job/{{ run.id }}" class="btn btn-sm btn-secondary">View</a>
+                    <form method="POST" action="/forward-planner/{{ run.id }}/delete" style="display:inline;"
+                        onsubmit="return confirm('Delete this projection run?');">
+                        <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endif %}
+
+<!-- ═══ Projection Results ═══ -->
+{% if projection %}
+<div style="margin-bottom: 16px;">
+    <a href="/forward-planner" class="btn"
+        style="display: inline-block; padding: 6px 14px; background: var(--surface2); color: var(--text); border-radius: 6px; text-decoration: none; font-size: 0.9em;">
+        ← New Projection
+    </a>
+</div>
+
+<!-- ═══ Warnings Panel ═══ -->
+{% if projection.warnings %}
+<div class="card" style="margin-bottom: 24px; border-left: 3px solid var(--yellow);">
+    <div class="card-header">
+        <h3>⚠️ Warnings ({{ projection.warnings|length }})</h3>
+    </div>
+    <div style="padding: 16px;">
+        {% for w in projection.warnings %}
+        <div style="padding: 10px 14px; margin-bottom: 8px; border-radius: 6px;
+            {% if w.severity == 'critical' %}background: rgba(239,68,68,0.12); border-left: 3px solid var(--red);
+            {% else %}background: rgba(255,193,7,0.08); border-left: 3px solid var(--yellow);{% endif %}">
+            <span
+                style="font-weight: 600; {% if w.severity == 'critical' %}color: var(--red){% else %}color: var(--yellow){% endif %}">
+                {% if w.type == 'low_safe_items' %}🚨{% elif w.type == 'kit_stock_depleted' %}📦{% elif w.type ==
+                'high_needs_new' %}⚠️{% elif w.type == 'welcome_low_stock' %}🎁{% endif %}
+                {{ w.month }}{% if w.trimester > 0 %} T{{ w.trimester }}{% endif %}
+            </span>
+            <span style="color: var(--text-dim); margin-left: 8px;">{{ w.detail }}</span>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<!-- ═══ Report Header ═══ -->
+<div class="card" style="margin-bottom: 24px;">
+    <div class="card-header">
+        <h3>📈 Forward Projection: {{ projection.base_month }} → {{ projection.horizon }} months</h3>
+    </div>
+    <div style="padding: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px;">
+        <div>
+            <span style="color: var(--text-dim); font-size: 0.85em;">Start Month</span>
+            <div style="font-size: 1.1em; font-weight: 600;">{{ projection.base_month }}</div>
+        </div>
+        <div>
+            <span style="color: var(--text-dim); font-size: 0.85em;">Horizon</span>
+            <div style="font-size: 1.1em; font-weight: 600;">{{ projection.horizon }} months</div>
+        </div>
+        <div>
+            <span style="color: var(--text-dim); font-size: 0.85em;">Ship Day</span>
+            <div style="font-size: 1.1em; font-weight: 600;">{{ projection.ship_day }}th</div>
+        </div>
+        <div>
+            <span style="color: var(--text-dim); font-size: 0.85em;">Warehouse Min</span>
+            <div style="font-size: 1.1em; font-weight: 600;">{{ projection.warehouse_minimum }}</div>
+        </div>
+        <div>
+            <span style="color: var(--text-dim); font-size: 0.85em;">Active Since</span>
+            <div style="font-size: 1.1em; font-weight: 600;">
+                {% if projection.recency_months %}last {{ projection.recency_months }} mo{% else %}all history{% endif
+                %}
+            </div>
+        </div>
+        <div>
+            <span style="color: var(--text-dim); font-size: 0.85em;">Generated</span>
+            <div style="font-size: 1.1em; font-weight: 600;">{{ projection.generated_at }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══ Timeline Overview: Month Cards ═══ -->
+<div class="card" style="margin-bottom: 24px;">
+    <div class="card-header">
+        <h3>Timeline Overview</h3>
+    </div>
+    <div
+        style="padding: 16px; display: grid; grid-template-columns: repeat({{ projection.months|length }}, 1fr); gap: 12px;">
+        {% for month_str, mdata in projection.months.items() %}
+        <div style="background: var(--surface2); border-radius: 8px; padding: 16px; border: 1px solid var(--border);
+            {% if mdata.has_committed_items %}border-color: var(--green); border-width: 2px;{% endif %}">
+            <div
+                style="text-align: center; font-weight: 700; font-size: 1.05em; margin-bottom: 10px; color: var(--accent);">
+                {{ month_str }}
+                {% if mdata.has_committed_items %}<span title="Has committed items"
+                    style="color: var(--green);">&nbsp;✓</span>{% endif %}
+            </div>
+            <div style="text-align: center; font-size: 0.85em; color: var(--text-dim); margin-bottom: 8px;">
+                {{ mdata.total_renewal }} renewals
+            </div>
+            <!-- Trimester mini-bars -->
+            {% for tri in [1, 2, 3, 4] %}
+            {% set td = mdata.trimesters.get(tri, {}) %}
+            {% if td.projected_customers is defined and td.projected_customers > 0 %}
+            {% set pct_covered = (td.covered_by_existing / td.projected_customers * 100) if td.projected_customers > 0
+            else 0 %}
+            <div style="margin-bottom: 6px;">
+                <div style="display: flex; justify-content: space-between; font-size: 0.8em; margin-bottom: 2px;">
+                    <span>T{{ tri }}</span>
+                    <span
+                        style="{% if pct_covered > 60 %}color: var(--green){% elif pct_covered > 30 %}color: var(--yellow){% else %}color: var(--red){% endif %}">
+                        {{ td.projected_customers }}
+                    </span>
+                </div>
+                <div style="background: var(--surface); border-radius: 3px; height: 6px; overflow: hidden;">
+                    <div
+                        style="height: 100%; border-radius: 3px; width: {{ pct_covered }}%;
+                        {% if pct_covered > 60 %}background: var(--green){% elif pct_covered > 30 %}background: var(--yellow){% else %}background: var(--red){% endif %}">
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+            {% endfor %}
+            <!-- Kit stock summary -->
+            {% set total_kit_stock = namespace(val=0) %}
+            {% for tri in [1, 2, 3, 4] %}
+            {% set td = mdata.trimesters.get(tri, {}) %}
+            {% set total_kit_stock.val = total_kit_stock.val + td.get('kit_stock_remaining', 0) %}
+            {% endfor %}
+            <div style="text-align: center; margin-top: 8px; font-size: 0.8em; color: var(--text-dim);">
+                📦 {{ total_kit_stock.val }} kits remaining
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- ═══ Per-Month Detail Accordion ═══ -->
+{% for month_str, mdata in projection.months.items() %}
+<div class="card" style="margin-bottom: 16px;">
+    <div class="card-header" style="cursor: pointer;"
+        onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none';">
+        <h3 style="display: flex; justify-content: space-between; align-items: center;">
+            <span>
+                📅 {{ month_str }} — Ship {{ mdata.ship_date }}
+                {% if mdata.has_committed_items %}<span
+                    style="color: var(--green); font-size: 0.8em; margin-left: 8px;">✓ Committed</span>{% endif %}
+            </span>
+            <span style="font-size: 0.8em; color: var(--text-dim);">{{ mdata.total_renewal }} renewals &nbsp;▼</span>
+        </h3>
+    </div>
+    <div style="padding: 16px; {% if not loop.first %}display: none;{% endif %}">
+        <!-- Trimester Summary Table -->
+        <table style="width: 100%; margin-bottom: 16px;">
+            <thead>
+                <tr>
+                    <th>Trimester</th>
+                    <th style="text-align: right;">Customers</th>
+                    <th style="text-align: right;">Covered</th>
+                    <th style="text-align: right;">Need New</th>
+                    <th style="text-align: right;">Build Qty</th>
+                    <th style="text-align: right;">Kit Stock</th>
+                    <th style="text-align: right;">DO NOT USE</th>
+                    <th style="text-align: right;">CAN USE</th>
+                    <th style="text-align: right;">Committed</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for tri in [1, 2, 3, 4] %}
+                {% set td = mdata.trimesters.get(tri, {}) %}
+                {% if td.projected_customers is defined %}
+                <tr>
+                    <td><strong>T{{ tri }}</strong></td>
+                    <td style="text-align: right;">{{ td.projected_customers }}</td>
+                    <td style="text-align: right; {% if td.covered_by_existing > 0 %}color: var(--green){% endif %}">
+                        {{ td.covered_by_existing }}
+                    </td>
+                    <td style="text-align: right; {% if td.needs_new_curation > 0 %}color: var(--red){% endif %}">
+                        {{ td.needs_new_curation }}
+                    </td>
+                    <td style="text-align: right; font-weight: 600;">
+                        {{ td.recommended_build_qty }}
+                    </td>
+                    <td style="text-align: right;
+                        {% if td.kit_stock_remaining == 0 and td.projected_customers > 0 %}color: var(--red)
+                        {% elif td.kit_stock_remaining < td.projected_customers %}color: var(--yellow)
+                        {% else %}color: var(--green){% endif %}">
+                        {{ td.kit_stock_remaining }}
+                    </td>
+                    <td style="text-align: right; color: var(--red);">{{ td.do_not_use_count }}</td>
+                    <td style="text-align: right; color: var(--green);">{{ td.can_use_count }}</td>
+                    <td style="text-align: right;">
+                        {% if td.cumulative_committed_count > 0 %}
+                        <span style="color: var(--blue);">{{ td.cumulative_committed_count }}</span>
+                        {% else %}—{% endif %}
+                    </td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+            </tbody>
+            <tfoot>
+                <tr style="border-top: 2px solid var(--border);">
+                    <td><strong>Total</strong></td>
+                    <td style="text-align: right; font-weight: 600;">
+                        {% set ns = namespace(total=0) %}
+                        {% for tri in [1,2,3,4] %}{% set td = mdata.trimesters.get(tri, {}) %}{% set ns.total = ns.total
+                        + td.get('projected_customers', 0) %}{% endfor %}
+                        {{ ns.total }}
+                    </td>
+                    <td style="text-align: right;">
+                        {% set ns = namespace(total=0) %}
+                        {% for tri in [1,2,3,4] %}{% set td = mdata.trimesters.get(tri, {}) %}{% set ns.total = ns.total
+                        + td.get('covered_by_existing', 0) %}{% endfor %}
+                        {{ ns.total }}
+                    </td>
+                    <td style="text-align: right;">
+                        {% set ns = namespace(total=0) %}
+                        {% for tri in [1,2,3,4] %}{% set td = mdata.trimesters.get(tri, {}) %}{% set ns.total = ns.total
+                        + td.get('needs_new_curation', 0) %}{% endfor %}
+                        {{ ns.total }}
+                    </td>
+                    <td style="text-align: right;">
+                        {% set ns = namespace(total=0) %}
+                        {% for tri in [1,2,3,4] %}{% set td = mdata.trimesters.get(tri, {}) %}{% set ns.total = ns.total
+                        + td.get('recommended_build_qty', 0) %}{% endfor %}
+                        {{ ns.total }}
+                    </td>
+                    <td style="text-align: right;">
+                        {% set ns = namespace(total=0) %}
+                        {% for tri in [1,2,3,4] %}{% set td = mdata.trimesters.get(tri, {}) %}{% set ns.total = ns.total
+                        + td.get('kit_stock_remaining', 0) %}{% endfor %}
+                        {{ ns.total }}
+                    </td>
+                    <td colspan="3"></td>
+                </tr>
+            </tfoot>
+        </table>
+
+        <!-- Lookback Window -->
+        <div style="font-size: 0.85em; color: var(--text-dim);">
+            Lookback window: {{ mdata.lookback_window }}
+        </div>
+    </div>
+</div>
+{% endfor %}
+
+<!-- ═══ Committed Items Panel ═══ -->
+<div class="card" style="margin-bottom: 24px;">
+    <div class="card-header">
+        <h3>🔒 Commit Items for a Month</h3>
+    </div>
+    <div style="padding: 16px;">
+        <div
+            style="border-left: 3px solid var(--blue); background: rgba(59,130,246,0.06); padding: 12px 16px; border-radius: 6px; margin-bottom: 16px;">
+            <strong style="color: var(--blue);">Mode B: Committed Items</strong>
+            <p style="margin: 4px 0 0; color: var(--text-dim); font-size: 0.9em;">
+                Select items you've decided to include in a month's curated box. These will be treated as "blocked"
+                for all future months, shrinking the safe-item pool. Re-run the projection to see the impact.
+            </p>
+        </div>
+
+        <form method="POST" action="/forward-planner/commit-items"
+            onsubmit="prepareCommitForm(this); this.querySelector('button[type=submit]').disabled=true;">
+            <div class="form-row"
+                style="display: grid; grid-template-columns: 1fr 1fr 3fr auto; gap: 16px; align-items: end;">
+                <div class="form-group">
+                    <label>Month</label>
+                    <input type="month" name="report_month" value="{{ projection.base_month }}" required
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                </div>
+                <div class="form-group">
+                    <label>Trimester</label>
+                    <select name="trimester" required
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
+                        <option value="1">T1</option>
+                        <option value="2">T2</option>
+                        <option value="3">T3</option>
+                        <option value="4" selected>T4</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Select Items to Commit</label>
+                    <input type="text" id="commitItemSearch" placeholder="Search items by name or SKU..."
+                        autocomplete="off"
+                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%; margin-bottom: 6px;">
+                    <div id="commitItemDropdown"
+                        style="display:none; position:absolute; z-index:100; background:var(--surface2); border:1px solid var(--border); border-radius:6px; max-height:200px; overflow-y:auto; width:100%; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                    </div>
+                    <div id="selectedItemsDisplay" style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;"></div>
+                    <input type="hidden" name="item_ids" id="commitItemIds" value="">
+                </div>
+                <button type="submit" class="btn btn-primary" style="height: 38px;">
+                    🔒 Commit
+                </button>
+            </div>
+        </form>
+
+        <script>
+        (function() {
+            const allItems = {{ all_items | tojson }};
+            const selectedItems = new Map(); // id -> {name, sku}
+            const searchInput = document.getElementById('commitItemSearch');
+            const dropdown = document.getElementById('commitItemDropdown');
+            const display = document.getElementById('selectedItemsDisplay');
+            const hiddenInput = document.getElementById('commitItemIds');
+            const formGroup = searchInput.closest('.form-group');
+            formGroup.style.position = 'relative';
+
+            function updateHidden() {
+                hiddenInput.value = Array.from(selectedItems.keys()).join(',');
+            }
+
+            function renderSelected() {
+                display.innerHTML = '';
+                selectedItems.forEach((info, id) => {
+                    const chip = document.createElement('span');
+                    chip.style.cssText = 'background:var(--accent);color:#fff;padding:2px 8px;border-radius:12px;font-size:0.8em;display:inline-flex;align-items:center;gap:4px;';
+                    chip.innerHTML = `${info.name} <span style="cursor:pointer;font-weight:700;" onclick="window._removeCommitItem('${id}')">&times;</span>`;
+                    display.appendChild(chip);
+                });
+                updateHidden();
+            }
+
+            window._removeCommitItem = function(id) {
+                selectedItems.delete(id);
+                renderSelected();
+            };
+
+            searchInput.addEventListener('input', function() {
+                const q = this.value.toLowerCase().trim();
+                if (!q) { dropdown.style.display = 'none'; return; }
+                const matches = allItems.filter(i =>
+                    !selectedItems.has(i.id) &&
+                    ((i.name || '').toLowerCase().includes(q) || (i.sku || '').toLowerCase().includes(q))
+                ).slice(0, 15);
+                if (!matches.length) { dropdown.style.display = 'none'; return; }
+                dropdown.innerHTML = matches.map(i =>
+                    `<div style="padding:6px 12px;cursor:pointer;font-size:0.9em;border-bottom:1px solid var(--border);"
+                          onmousedown="window._addCommitItem('${i.id}','${(i.name||'').replace(/'/g,"\\'")}','${(i.sku||'').replace(/'/g,"\\'")}')"
+                          onmouseover="this.style.background='var(--accent)';this.style.color='#fff'"
+                          onmouseout="this.style.background='';this.style.color=''">
+                        <strong>${i.name || 'Unnamed'}</strong> <span style="opacity:0.6">${i.sku || ''}</span>
+                    </div>`
+                ).join('');
+                dropdown.style.display = 'block';
+            });
+
+            searchInput.addEventListener('blur', function() {
+                setTimeout(() => { dropdown.style.display = 'none'; }, 200);
+            });
+
+            window._addCommitItem = function(id, name, sku) {
+                selectedItems.set(id, {name, sku});
+                searchInput.value = '';
+                dropdown.style.display = 'none';
+                renderSelected();
+            };
+
+            window.prepareCommitForm = function(form) {
+                updateHidden();
+            };
+        })();
+        </script>
+
+        <!-- Current committed items summary -->
+        {% if projection.committed_items %}
+        <div style="margin-top: 16px;">
+            <h4 style="margin-bottom: 8px; color: var(--text);">Currently Committed</h4>
+            {% for month, tris in projection.committed_items.items() %}
+            <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 6px;">
+                <span style="font-weight: 600; color: var(--accent);">{{ month }}</span>
+                {% for tri, count in tris.items() %}
+                <span style="background: var(--surface2); padding: 2px 10px; border-radius: 12px; font-size: 0.85em;">
+                    T{{ tri }}: {{ count }} items
+                </span>
+                {% endfor %}
+                <form method="POST" action="/forward-planner/clear-committed" style="display: inline;">
+                    <input type="hidden" name="report_month" value="{{ month }}">
+                    <button type="submit"
+                        style="background: none; border: none; color: var(--red); cursor: pointer; font-size: 0.85em;"
+                        title="Clear committed items for this month">
+                        ✕ Clear
+                    </button>
+                </form>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- ═══ Welcome Kit Watchlist ═══ -->
+{% if projection.welcome_watchlist %}
+<div class="card" style="margin-bottom: 24px;">
+    <div class="card-header">
+        <h3>🎁 Welcome Kit Watchlist</h3>
+    </div>
+    <div style="padding: 16px;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+            <div>
+                <span style="color: var(--text-dim); font-size: 0.85em;">Total Stock</span>
+                <div style="font-size: 1.3em; font-weight: 700; color: var(--green);">{{
+                    projection.welcome_watchlist.total_stock }}</div>
+            </div>
+            <div>
+                <span style="color: var(--text-dim); font-size: 0.85em;">New Customers/Month</span>
+                <div style="font-size: 1.3em; font-weight: 700;">{{ projection.welcome_watchlist.new_customer_count }}
+                </div>
+            </div>
+            <div>
+                <span style="color: var(--text-dim); font-size: 0.85em;">Months of Coverage</span>
+                <div
+                    style="font-size: 1.3em; font-weight: 700;
+                    {% if projection.welcome_watchlist.new_customer_count > 0 %}
+                    {% set months_cover = (projection.welcome_watchlist.total_stock / projection.welcome_watchlist.new_customer_count)|round(1) %}
+                    {% if months_cover < 3 %}color: var(--red){% elif months_cover < 6 %}color: var(--yellow){% else %}color: var(--green){% endif %}">
+                    {{ months_cover }}
+                    {% else %}">∞{% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% endif %}
+
+{% endblock %}

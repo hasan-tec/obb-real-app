@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Item Alternatives — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>Item Alternatives (Pipe Items)</h1>
+    <div class="status">
+        <span>{{ alternatives | length }} alternative pairs</span>
+    </div>
+</div>
+<div class="content">
+    {% if msg %}
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}"
+        style="margin-bottom: 16px;">
+        {{ msg }}
+    </div>
+    {% endif %}
+
+    {% if error %}
+    <div class="alert alert-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    <!-- Info Banner -->
+    <div class="card" style="margin-bottom: 20px; border-left: 3px solid var(--yellow);">
+        <div style="padding: 16px;">
+            <p style="color: var(--yellow); font-weight: 600; margin-bottom: 6px;">⚠️ How This Works</p>
+            <p style="color: var(--text-dim); font-size: 13px; line-height: 1.6;">
+                If a customer received <strong>Item A</strong>, and Item B is listed as its alternative, the system will
+                also block <strong>Item B</strong> from being assigned to that customer. This prevents sending
+                interchangeable products (e.g., two similar face serums). <strong>Select items exactly as they appear
+                    in the Items list.</strong>
+            </p>
+        </div>
+    </div>
+
+    <!-- Add Alternative Form -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <h3>Add Alternative Pair</h3>
+        </div>
+        <div style="padding: 16px;">
+            <form method="POST" action="/item-alternatives/add">
+                <div class="form-row" style="align-items: flex-end;">
+                    <div class="form-group" style="flex: 1;">
+                        <label>Item A *</label>
+                        <select name="item_id" class="form-control" required style="max-width: 100%;">
+                            <option value="">— Select Item A —</option>
+                            {% for item in items %}
+                            <option value="{{ item.id }}">{{ item.name }}{% if item.sku %} ({{ item.sku }}){% endif %}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div style="padding: 0 12px 12px; font-size: 20px; color: var(--text-dim);">↔</div>
+                    <div class="form-group" style="flex: 1;">
+                        <label>Item B (Alternative) *</label>
+                        <select name="alternative_item_id" class="form-control" required style="max-width: 100%;">
+                            <option value="">— Select Item B —</option>
+                            {% for item in items %}
+                            <option value="{{ item.id }}">{{ item.name }}{% if item.sku %} ({{ item.sku }}){% endif %}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <button type="submit" class="btn btn-primary">Add Alternative</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Alternatives Table -->
+    <div class="card">
+        <div class="card-header">
+            <h3>Current Alternatives</h3>
+        </div>
+        {% if alternatives %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Item A</th>
+                    <th>Item A SKU</th>
+                    <th style="text-align: center;">↔</th>
+                    <th>Item B</th>
+                    <th>Item B SKU</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for alt in alternatives %}
+                <tr>
+                    <td>{{ alt.item_name }}</td>
+                    <td style="font-family: monospace; font-size: 12px;">{{ alt.item_sku or '—' }}</td>
+                    <td style="text-align: center; color: var(--text-dim);">↔</td>
+                    <td>{{ alt.alt_name }}</td>
+                    <td style="font-family: monospace; font-size: 12px;">{{ alt.alt_sku or '—' }}</td>
+                    <td>
+                        <form method="POST" action="/item-alternatives/remove" style="display:inline;"
+                            onsubmit="return confirm('Remove this alternative pair?');">
+                            <input type="hidden" name="item_id" value="{{ alt.item_id }}">
+                            <input type="hidden" name="alternative_item_id" value="{{ alt.alternative_item_id }}">
+                            <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+            <div class="icon">🔗</div>
+            <p>No alternative pairs defined yet. Add pairs using the form above.</p>
+            <p style="color: var(--text-dim); font-size: 13px; margin-top: 6px;">
+                Ask the team for interchangeable items (pipe items) and enter them here.
+            </p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

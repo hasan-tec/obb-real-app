@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% block title %}Generating {{ job_type }} — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>{{ job_type }}</h1>
+</div>
+<div class="content">
+
+    {% if status == "error" %}
+    <div class="alert alert-error" style="margin-bottom:24px;">
+        ⚠️ Generation failed: {{ error }}
+    </div>
+    <a href="{{ cancel_url }}" class="btn btn-primary">← Back</a>
+
+    {% else %}
+    <!-- Running — spinner + polling -->
+    <div id="loading-card" style="
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 48px 32px;
+        max-width: 560px;
+        margin: 60px auto;
+        text-align: center;
+    ">
+        <!-- Spinner -->
+        <div id="spinner" style="margin-bottom: 24px;">
+            <svg width="56" height="56" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg"
+                style="animation: spin 1.1s linear infinite; display:inline-block;">
+                <circle cx="28" cy="28" r="22" stroke="var(--border)" stroke-width="4" />
+                <path d="M28 6 A22 22 0 0 1 50 28" stroke="var(--accent)" stroke-width="4" stroke-linecap="round" />
+            </svg>
+        </div>
+
+        <h2 style="margin-bottom: 8px; font-size: 1.35rem;">Generating {{ job_type }}</h2>
+        <p style="color: var(--text-dim); margin-bottom: 32px;">
+            This typically takes <strong style="color:var(--text);">30–60 seconds</strong>.
+            You can leave this page — just don't close the tab.
+        </p>
+
+        {% if params %}
+        <div style="
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px 18px;
+            text-align: left;
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            margin-bottom: 28px;
+        ">
+            {% if params.base_month %}<div>Month: <strong style="color:var(--text);">{{ params.base_month }}</strong>
+            </div>{% endif %}
+            {% if params.horizon_months %}<div>Horizon: <strong style="color:var(--text);">{{ params.horizon_months }}
+                    months</strong></div>{% endif %}
+            {% if params.warehouse_min %}<div>Warehouse minimum: <strong style="color:var(--text);">{{
+                    params.warehouse_min }}</strong></div>{% endif %}
+            {% if params.recency_months %}<div>Recency filter: <strong style="color:var(--text);">{{
+                    params.recency_months }} months</strong></div>{% endif %}
+            {% if params.report_month %}<div>Report month: <strong style="color:var(--text);">{{ params.report_month
+                    }}</strong></div>{% endif %}
+        </div>
+        {% endif %}
+
+        <div id="status-msg" style="color: var(--text-dim); font-size: 0.85rem; margin-bottom: 20px;">
+            Checking status…
+        </div>
+
+        <a href="{{ cancel_url }}" style="color: var(--text-dim); font-size: 0.85rem;">
+            Cancel and go back
+        </a>
+    </div>
+
+    <!-- Error card (hidden, shown on poll error) -->
+    <div id="error-card" style="
+        display: none;
+        background: var(--surface);
+        border: 1px solid var(--red);
+        border-radius: 12px;
+        padding: 32px;
+        max-width: 560px;
+        margin: 60px auto;
+        text-align: center;
+    ">
+        <p style="color: var(--red); margin-bottom: 16px; font-weight:600;">⚠️ Generation failed</p>
+        <p id="error-msg" style="color: var(--text-dim); margin-bottom: 24px; font-size: 0.9rem;"></p>
+        <a href="{{ cancel_url }}" class="btn btn-primary">← Back</a>
+    </div>
+
+    <style>
+        @keyframes spin {
+            from {
+                transform: rotate(0deg);
+            }
+
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+
+    <script>
+        (function () {
+            var jobId = {{ job_id | tojson
+        }};
+        var statusUrl = window.location.pathname + "/status";
+        var attempts = 0;
+        var maxAttempts = 120; // ~10 minutes at 5s intervals before giving up
+
+        function checkStatus() {
+            attempts++;
+            fetch(statusUrl)
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.status === "done" && data.redirect_url) {
+                        document.getElementById("status-msg").textContent = "Done! Redirecting…";
+                        window.location.href = data.redirect_url;
+                        return;
+                    }
+                    if (data.status === "error") {
+                        document.getElementById("loading-card").style.display = "none";
+                        var ec = document.getElementById("error-card");
+                        ec.style.display = "block";
+                        document.getElementById("error-msg").textContent = data.error || "An unknown error occurred.";
+                        return;
+                    }
+                    if (data.status === "not_found") {
+                        document.getElementById("status-msg").textContent = "Job not found. It may have expired.";
+                        return;
+                    }
+                    // Still running
+                    var dots = ".".repeat((attempts % 4) + 1);
+                    document.getElementById("status-msg").textContent = "Running" + dots;
+                    if (attempts < maxAttempts) {
+                        setTimeout(checkStatus, 5000);
+                    } else {
+                        document.getElementById("status-msg").textContent = "Taking longer than expected. Try refreshing the page.";
+                    }
+                })
+                .catch(function (err) {
+                    // Network blip — retry silently
+                    if (attempts < maxAttempts) {
+                        setTimeout(checkStatus, 5000);
+                    }
+                });
+        }
+
+        // Start polling after 3 seconds (give the job a moment to kick off)
+        setTimeout(checkStatus, 3000);
+        }) ();
+    </script>
+    {% endif %}
+</div>
+{% endblock %}

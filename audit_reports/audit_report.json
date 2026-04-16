@@ -1,0 +1,29 @@
+{
+  "customers": {
+    "missing_in_db": [],
+    "extra_in_db_count": 74
+  },
+  "kits": {
+    "unmatched_skus": [
+      "OBB-BW-4"
+    ],
+    "kits_no_items": []
+  },
+  "shipments": {
+    "csv_not_in_db_count": 0,
+    "csv_not_in_db_first_50": [],
+    "db_extra_count": 2,
+    "matched_no_items_count": 0
+  },
+  "backfill": {
+    "can_backfill": 0,
+    "cannot_no_kit_id": 0,
+    "cannot_no_kit_items": 0
+  },
+  "history": {
+    "perfect_match": 1603,
+    "count_mismatch": 0,
+    "sku_mismatch": 0,
+    "mismatch_details_first_50": []
+  }
+}

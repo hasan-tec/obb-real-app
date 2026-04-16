@@ -43,6 +43,10 @@
                         <label>Unit Cost ($)</label>
                         <input type="number" name="unit_cost" class="form-control" value="0" min="0" step="0.01">
                     </div>
+                    <div class="form-group">
+                        <label>Expiry Date</label>
+                        <input type="date" name="expiry_date" class="form-control">
+                    </div>
                 </div>
                 <label
                     style="display:flex; align-items:center; gap:6px; cursor:pointer; margin-top:8px; font-size:13px;">
@@ -68,6 +72,7 @@
                     <th>Category</th>
                     <th>Cost</th>
                     <th>Source</th>
+                    <th>Expiry</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -85,6 +90,11 @@
                         <span class="badge badge-dim">OBB</span>
                         {% endif %}
                     </td>
+                    <td>
+                        {% if i.expiry_date %}
+                        <span style="{% if i.expiry_date < today_str %}color: var(--red); font-weight: 600;{% endif %}">{{ i.expiry_date }}</span>
+                        {% else %}—{% endif %}
+                    </td>
                     <td style="white-space: nowrap;">
                         <button type="button" class="btn btn-sm btn-secondary"
                             onclick="toggleItemEditor('{{ i.id }}')">Edit</button>
@@ -95,7 +105,7 @@
                     </td>
                 </tr>
                 <tr id="item-editor-{{ i.id }}" style="display:none; background: rgba(255,255,255,0.02);">
-                    <td colspan="6">
+                    <td colspan="7">
                         <form method="POST" action="/items/{{ i.id }}/edit" style="padding: 12px 0;">
                             <div class="form-row">
                                 <div class="form-group">
@@ -115,6 +125,11 @@
                                     <label>Unit Cost ($)</label>
                                     <input type="number" name="unit_cost" class="form-control"
                                         value="{{ i.unit_cost or 0 }}" min="0" step="0.01">
+                                </div>
+                                <div class="form-group">
+                                    <label>Expiry Date</label>
+                                    <input type="date" name="expiry_date" class="form-control"
+                                        value="{{ i.expiry_date or '' }}">
                                 </div>
                             </div>
                             <label

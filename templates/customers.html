@@ -27,6 +27,7 @@
         <button class="btn btn-sm btn-primary"
             onclick="document.getElementById('addCustomerForm').style.display = document.getElementById('addCustomerForm').style.display === 'none' ? 'block' : 'none'">+
             Add Customer</button>
+        <a href="/customers/export-csv{% if filter_qs %}?{{ filter_qs }}{% endif %}" class="btn btn-sm btn-secondary" title="Download CSV">📥 Export CSV</a>
     </div>
 </div>
 <div class="content">

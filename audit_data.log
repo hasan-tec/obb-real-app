@@ -1,0 +1,242 @@
+2026-04-13 21:20:44,298 [INFO] ======================================================================
+2026-04-13 21:20:44,298 [INFO]   OBB DATA RECONCILIATION AUDIT
+2026-04-13 21:20:44,298 [INFO]   READ-ONLY — No DB changes
+2026-04-13 21:20:44,298 [INFO] ======================================================================
+2026-04-13 21:20:44,303 [INFO] [CSV] Found 24 order-history CSV files
+2026-04-13 21:20:44,303 [INFO]   Parsing: MAR '24 BM (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - MAR '24 BM.csv)
+2026-04-13 21:20:44,307 [INFO]     -> 311 unique customer-shipment rows
+2026-04-13 21:20:44,308 [INFO]   Parsing: MAY '24 BO (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - MAY '24 BO.csv)
+2026-04-13 21:20:44,312 [INFO]     -> 351 unique customer-shipment rows
+2026-04-13 21:20:44,312 [INFO]   Parsing: JUNE '24 BP (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - JUNE '24 BP.csv)
+2026-04-13 21:20:44,317 [INFO]     -> 371 unique customer-shipment rows
+2026-04-13 21:20:44,318 [INFO]   Parsing: JULY '24 BQ (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - JULY '24 BQ.csv)
+2026-04-13 21:20:44,322 [INFO]     -> 366 unique customer-shipment rows
+2026-04-13 21:20:44,322 [INFO]   Parsing: AUG '24 BR (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - AUG '24 BR.csv)
+2026-04-13 21:20:44,326 [INFO]     -> 335 unique customer-shipment rows
+2026-04-13 21:20:44,327 [INFO]   Parsing: SEPT '24 BS (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - SEPT '24 BS.csv)
+2026-04-13 21:20:44,330 [INFO]     -> 287 unique customer-shipment rows
+2026-04-13 21:20:44,330 [INFO]   Parsing: OCT '24 BT (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - OCT '24 BT.csv)
+2026-04-13 21:20:44,335 [INFO]     -> 233 unique customer-shipment rows
+2026-04-13 21:20:44,335 [INFO]   Parsing: NOV '24 BU (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - NOV '24 BU.csv)
+2026-04-13 21:20:44,338 [INFO]     -> 209 unique customer-shipment rows
+2026-04-13 21:20:44,338 [INFO]   Parsing: DEC '24 BV (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - DEC '24 BV.csv)
+2026-04-13 21:20:44,341 [INFO]     -> 191 unique customer-shipment rows
+2026-04-13 21:20:44,341 [INFO]   Parsing: JAN '25 BW (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - JAN '25 BW.csv)
+2026-04-13 21:20:44,344 [INFO]     -> 191 unique customer-shipment rows
+2026-04-13 21:20:44,344 [INFO]   Parsing: FEB '25 BX (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - FEB '25 BX.csv)
+2026-04-13 21:20:44,347 [INFO]     -> 195 unique customer-shipment rows
+2026-04-13 21:20:44,347 [INFO]   Parsing: MAR '25 BY (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - MAR '25 BY.csv)
+2026-04-13 21:20:44,350 [INFO]     -> 199 unique customer-shipment rows
+2026-04-13 21:20:44,350 [INFO]   Parsing: APR '25 BZ (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - APR '25 BZ.csv)
+2026-04-13 21:20:44,357 [INFO]     -> 245 unique customer-shipment rows
+2026-04-13 21:20:44,357 [INFO]   Parsing: MAY '25 CA (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - MAY '25 CA.csv)
+2026-04-13 21:20:44,360 [INFO]     -> 267 unique customer-shipment rows
+2026-04-13 21:20:44,360 [INFO]   Parsing: JUNE '25 CB (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - JUNE '25 CB.csv)
+2026-04-13 21:20:44,364 [INFO]     -> 302 unique customer-shipment rows
+2026-04-13 21:20:44,364 [INFO]   Parsing: JULY '25 CC (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - JULY '25 CC.csv)
+2026-04-13 21:20:44,368 [INFO]     -> 315 unique customer-shipment rows
+2026-04-13 21:20:44,368 [INFO]   Parsing: AUG '25 CD (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - AUG '25 CD.csv)
+2026-04-13 21:20:44,373 [INFO]     -> 349 unique customer-shipment rows
+2026-04-13 21:20:44,373 [INFO]   Parsing: SEPT '25 CE (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - SEPT '25 CE.csv)
+2026-04-13 21:20:44,377 [INFO]     -> 368 unique customer-shipment rows
+2026-04-13 21:20:44,377 [INFO]   Parsing: OCT '25 CF (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - OCT '25 CF.csv)
+2026-04-13 21:20:44,382 [INFO]     -> 375 unique customer-shipment rows
+2026-04-13 21:20:44,382 [INFO]   Parsing: NOV '25 CG (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - NOV '25  CG.csv)
+2026-04-13 21:20:44,387 [INFO]     -> 358 unique customer-shipment rows
+2026-04-13 21:20:44,388 [INFO]   Parsing: DEC '25 CH (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - DEC '25 CH.csv)
+2026-04-13 21:20:44,392 [INFO]     -> 325 unique customer-shipment rows
+2026-04-13 21:20:44,392 [INFO]   Parsing: JAN '26 CI (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - JAN '26 CI.csv)
+2026-04-13 21:20:44,396 [INFO]     -> 327 unique customer-shipment rows
+2026-04-13 21:20:44,397 [INFO]   Parsing: FEB '26 CJ (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - FEB '26 CJ.csv)
+2026-04-13 21:20:44,402 [INFO]     -> 322 unique customer-shipment rows
+2026-04-13 21:20:44,403 [INFO]   Parsing: MAR '26 CK (Oh Baby Boxes - Monthly Boxing_Customer Kit Assignment - MAR '26 CK.csv)
+2026-04-13 21:20:44,407 [INFO]     -> 301 unique customer-shipment rows
+2026-04-13 21:20:44,407 [INFO] [CSV] TOTAL: 1603 unique emails, 7093 unique shipments, 130 unique kit SKUs, 82 duplicate rows skipped
+2026-04-13 21:20:44,702 [INFO] [DB] Loading all data from Supabase...
+2026-04-13 21:20:44,702 [INFO]   Loading customers...
+2026-04-13 21:20:46,644 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/customers?select=%2A&offset=0&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:47,282 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/customers?select=%2A&offset=1000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:47,426 [INFO]   -> 1677 customers
+2026-04-13 21:20:47,426 [INFO]   Loading kits...
+2026-04-13 21:20:47,790 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/kits?select=id%2Csku%2Cname%2Ctrimester%2Csize_variant%2Cis_welcome_kit%2Cquantity_available%2Cage_rank&offset=0&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:47,795 [INFO]   -> 148 kits
+2026-04-13 21:20:47,795 [INFO]   Loading items...
+2026-04-13 21:20:48,165 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/items?select=id%2Cname%2Csku%2Ccategory%2Chas_sizing%2Cis_therabox&offset=0&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:48,308 [INFO]   -> 316 items
+2026-04-13 21:20:48,308 [INFO]   Loading kit_items...
+2026-04-13 21:20:48,650 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/kit_items?select=kit_id%2Citem_id%2Cquantity&offset=0&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:48,998 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/kit_items?select=kit_id%2Citem_id%2Cquantity&offset=1000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:49,001 [INFO]   -> 1213 kit_items
+2026-04-13 21:20:49,002 [INFO]   Loading shipments...
+2026-04-13 21:20:49,454 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipments?select=id%2Ccustomer_id%2Ckit_id%2Ckit_sku%2Cship_date%2Ctrimester_at_ship%2Corder_id%2Cplatform&offset=0&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:50,007 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipments?select=id%2Ccustomer_id%2Ckit_id%2Ckit_sku%2Cship_date%2Ctrimester_at_ship%2Corder_id%2Cplatform&offset=1000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:50,538 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipments?select=id%2Ccustomer_id%2Ckit_id%2Ckit_sku%2Cship_date%2Ctrimester_at_ship%2Corder_id%2Cplatform&offset=2000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:50,971 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipments?select=id%2Ccustomer_id%2Ckit_id%2Ckit_sku%2Cship_date%2Ctrimester_at_ship%2Corder_id%2Cplatform&offset=3000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:51,377 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipments?select=id%2Ccustomer_id%2Ckit_id%2Ckit_sku%2Cship_date%2Ctrimester_at_ship%2Corder_id%2Cplatform&offset=4000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:51,856 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipments?select=id%2Ccustomer_id%2Ckit_id%2Ckit_sku%2Cship_date%2Ctrimester_at_ship%2Corder_id%2Cplatform&offset=5000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:52,268 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipments?select=id%2Ccustomer_id%2Ckit_id%2Ckit_sku%2Cship_date%2Ctrimester_at_ship%2Corder_id%2Cplatform&offset=6000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:52,623 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipments?select=id%2Ccustomer_id%2Ckit_id%2Ckit_sku%2Cship_date%2Ctrimester_at_ship%2Corder_id%2Cplatform&offset=7000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:52,626 [INFO]   -> 7095 shipments
+2026-04-13 21:20:52,626 [INFO]   Loading shipment_items...
+2026-04-13 21:20:52,912 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=0&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:53,181 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=1000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:53,482 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=2000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:53,766 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=3000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:54,100 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=4000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:54,460 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=5000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:54,859 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=6000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:55,235 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=7000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:55,576 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=8000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:55,878 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=9000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:56,183 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=10000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:56,510 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=11000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:56,808 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=12000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:57,101 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=13000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:57,370 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=14000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:57,653 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=15000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:57,959 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=16000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:58,249 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=17000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:58,516 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=18000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:58,786 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=19000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:59,075 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=20000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:59,368 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=21000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:59,638 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=22000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:20:59,943 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=23000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:00,225 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=24000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:00,502 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=25000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:00,787 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=26000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:01,062 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=27000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:01,337 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=28000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:01,648 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=29000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:01,949 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=30000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:02,251 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=31000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:02,562 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=32000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:02,871 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=33000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:03,200 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=34000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:03,501 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=35000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:03,791 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=36000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:04,086 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=37000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:04,415 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=38000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:04,741 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=39000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:05,030 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=40000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:05,305 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=41000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:05,605 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=42000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:05,911 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=43000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:06,223 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=44000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:06,513 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=45000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:06,781 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=46000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:07,057 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=47000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:07,345 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=48000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:07,617 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=49000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:08,004 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=50000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:08,384 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=51000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:08,751 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=52000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:09,167 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=53000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:09,605 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=54000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:09,908 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=55000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:10,225 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=56000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:10,549 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=57000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:10,855 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=58000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:11,158 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=59000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:11,432 [INFO] HTTP Request: GET https://tkcvvjxmzfjaesdhyfiy.supabase.co/rest/v1/shipment_items?select=shipment_id%2Citem_id&offset=60000&limit=1000 "HTTP/2 200 OK"
+2026-04-13 21:21:11,433 [INFO]   -> 60067 shipment_items
+2026-04-13 21:21:11,433 [INFO] 
+======================================================================
+2026-04-13 21:21:11,433 [INFO]   AUDIT 1: CUSTOMER PARITY
+2026-04-13 21:21:11,433 [INFO] ======================================================================
+2026-04-13 21:21:11,435 [INFO]   CSV unique emails:       1603
+2026-04-13 21:21:11,435 [INFO]   DB unique emails:        1677
+2026-04-13 21:21:11,435 [INFO]   In both:                 1603
+2026-04-13 21:21:11,436 [INFO]   In CSV but NOT in DB:    0
+2026-04-13 21:21:11,436 [INFO]   In DB but NOT in CSV:    74
+2026-04-13 21:21:11,436 [INFO]   Extra DB customers (not in CSV history) — 74:
+2026-04-13 21:21:11,436 [INFO]     - 0latitud@bellsouth.net (platform=shopify, status=active, created=2026-04-11)
+2026-04-13 21:21:11,436 [INFO]     - acotbaking@gmail.com (platform=shopify, status=active, created=2026-04-02)
+2026-04-13 21:21:11,437 [INFO]     - aculli2@netscape.net (platform=shopify, status=active, created=2026-04-01)
+2026-04-13 21:21:11,437 [INFO]     - afrazier.frazier@gmail.com (platform=shopify, status=active, created=2026-04-01)
+2026-04-13 21:21:11,437 [INFO]     - aharvey0811@yahoo.com (platform=shopify, status=active, created=2026-04-02)
+2026-04-13 21:21:11,437 [INFO]     - ahavens03@gmail.com (platform=shopify, status=active, created=2026-04-05)
+2026-04-13 21:21:11,437 [INFO]     - bacallihan111@gmail.com (platform=shopify, status=active, created=2026-03-29)
+2026-04-13 21:21:11,437 [INFO]     - bfcraig71@gmail.com (platform=shopify, status=active, created=2026-04-01)
+2026-04-13 21:21:11,438 [INFO]     - bjameswtc@aol.com (platform=shopify, status=active, created=2026-04-08)
+2026-04-13 21:21:11,438 [INFO]     - boyle.leah@yahoo.com (platform=shopify, status=active, created=2026-04-01)
+2026-04-13 21:21:11,438 [INFO]     ... and 64 more
+2026-04-13 21:21:11,438 [INFO] 
+======================================================================
+2026-04-13 21:21:11,438 [INFO]   AUDIT 2: KIT SKU PARITY
+2026-04-13 21:21:11,438 [INFO] ======================================================================
+2026-04-13 21:21:11,439 [INFO]   CSV unique kit SKUs:     130
+2026-04-13 21:21:11,439 [INFO]   Matched in DB:           129
+2026-04-13 21:21:11,439 [INFO]   NOT found in DB:         1
+2026-04-13 21:21:11,439 [WARNING]   KITS IN CSV BUT NOT IN DB:
+2026-04-13 21:21:11,439 [WARNING]     - 'OBB-BW-4'
+2026-04-13 21:21:11,440 [INFO] 
+  DB kits with kit_items:   148
+2026-04-13 21:21:11,440 [INFO]   DB kits WITHOUT items:    0
+2026-04-13 21:21:11,440 [INFO] 
+======================================================================
+2026-04-13 21:21:11,440 [INFO]   AUDIT 3: SHIPMENT PARITY
+2026-04-13 21:21:11,440 [INFO] ======================================================================
+2026-04-13 21:21:11,493 [INFO]   CSV unique shipments:           7093
+2026-04-13 21:21:11,493 [INFO]   DB total shipments:             7095
+2026-04-13 21:21:11,494 [INFO]   CSV→DB matched:                 7093
+2026-04-13 21:21:11,494 [INFO]     with shipment_items:           7093
+2026-04-13 21:21:11,494 [INFO]     WITHOUT shipment_items:        0
+2026-04-13 21:21:11,494 [INFO]   CSV→DB NOT matched:             0
+2026-04-13 21:21:11,494 [INFO]   DB extra (not in CSV):          2
+2026-04-13 21:21:11,494 [INFO] 
+  DB shipments with no CSV match (first 20):
+2026-04-13 21:21:11,494 [INFO]     - jvilks11@msn.com | OBB-WK-H2 KITS | None | kit_id=True
+2026-04-13 21:21:11,495 [INFO]     - cory.piercesr@icloud.com | WKH2 | None | kit_id=True
+2026-04-13 21:21:11,496 [INFO] 
+======================================================================
+2026-04-13 21:21:11,497 [INFO]   AUDIT 4: SHIPMENT ITEMS BACKFILL ANALYSIS
+2026-04-13 21:21:11,497 [INFO] ======================================================================
+2026-04-13 21:21:11,503 [INFO]   Total shipments without items:    0
+2026-04-13 21:21:11,503 [INFO]   CAN backfill (kit_id + items):    0
+2026-04-13 21:21:11,503 [INFO]   Cannot: no kit_id:                0
+2026-04-13 21:21:11,504 [INFO]   Cannot: kit has no items:         0
+2026-04-13 21:21:11,504 [INFO] 
+======================================================================
+2026-04-13 21:21:11,504 [INFO]   AUDIT 5: PER-CUSTOMER HISTORY DIFF
+2026-04-13 21:21:11,504 [INFO] ======================================================================
+2026-04-13 21:21:11,533 [INFO]   Customers checked:        1603
+2026-04-13 21:21:11,534 [INFO]   Perfect match:            1603
+2026-04-13 21:21:11,534 [INFO]   Count mismatch:           0
+2026-04-13 21:21:11,534 [INFO]   SKU/month mismatch:       0
+2026-04-13 21:21:11,535 [INFO] 
+======================================================================
+2026-04-13 21:21:11,535 [INFO]   FINAL AUDIT SUMMARY
+2026-04-13 21:21:11,535 [INFO] ======================================================================
+2026-04-13 21:21:11,536 [INFO] 
+  ── CUSTOMERS ──
+2026-04-13 21:21:11,536 [INFO]   CSV emails: 1603 | DB emails: 1677
+2026-04-13 21:21:11,536 [INFO]   Missing in DB: 0 | Extra in DB: 74
+2026-04-13 21:21:11,536 [INFO] 
+  ── KIT SKUS ──
+2026-04-13 21:21:11,536 [INFO]   CSV kit SKUs: 130 | Matched: 129
+2026-04-13 21:21:11,536 [INFO]   Unmatched: ['OBB-BW-4']
+2026-04-13 21:21:11,537 [INFO]   DB kits with items: 148 | Without items: 0
+2026-04-13 21:21:11,537 [INFO] 
+  ── SHIPMENTS ──
+2026-04-13 21:21:11,537 [INFO]   CSV: 7093 | DB: 7095
+2026-04-13 21:21:11,537 [INFO]   Matched: 7093 | Not in DB: 0 | DB extra: 2
+2026-04-13 21:21:11,537 [INFO]   Matched WITH items: 7093 | WITHOUT items: 0
+2026-04-13 21:21:11,537 [INFO] 
+  ── BACKFILL POTENTIAL ──
+2026-04-13 21:21:11,537 [INFO]   Shipments without items: 0
+2026-04-13 21:21:11,538 [INFO]   Can backfill: 0
+2026-04-13 21:21:11,538 [INFO]   Cannot (no kit_id): 0
+2026-04-13 21:21:11,538 [INFO]   Cannot (kit has no items): 0
+2026-04-13 21:21:11,538 [INFO] 
+  ── PER-CUSTOMER HISTORY ──
+2026-04-13 21:21:11,538 [INFO]   Checked: 1603
+2026-04-13 21:21:11,538 [INFO]   Perfect: 1603 | Count mismatch: 0 | SKU mismatch: 0
+2026-04-13 21:21:11,539 [INFO] 
+======================================================================
+2026-04-13 21:21:11,539 [INFO]   ACTION ITEMS
+2026-04-13 21:21:11,539 [INFO] ======================================================================
+2026-04-13 21:21:11,539 [INFO]   2. CRITICAL: 1 kit SKUs in CSV not found in DB — need to create kits: ['OBB-BW-4']
+2026-04-13 21:21:11,540 [INFO] 
+  Detailed report saved to: C:\Users\hasan\Desktop\opus tin\opus-obb-prototype\audit_reports\audit_report.json
+2026-04-13 21:21:11,540 [INFO]   Full log saved to: C:\Users\hasan\Desktop\opus tin\opus-obb-prototype\audit_data.log

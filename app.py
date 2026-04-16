@@ -13,6 +13,8 @@ import time
 import logging
 import csv
 import io
+import uuid
+import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -135,18 +137,19 @@ def write_decision_to_sheet(decision_data: dict):
         if ws is None:
             logger.info("[GSHEETS] Skipping write — Google Sheets not configured")
             return
-        # Column order: received_at, platform, customer_name, email, trimester,
-        #               order_type, assigned_kit, decision_status, reason,
-        #               external_order_id, due_date, clothing_size
+        # Column order matches sheet headers exactly:
+        # received_at, platform, topic(trimester), customer_name, email,
+        # order_type, decision_status, assigned_kit, reason,
+        # external_order_id, due_date, clothing_size
         row = [
             decision_data.get("date", date.today().isoformat()),
             decision_data.get("platform", ""),
+            f"T{decision_data.get('trimester', '?')}",
             decision_data.get("customer_name", ""),
             decision_data.get("email", ""),
-            f"T{decision_data.get('trimester', '?')}",
             decision_data.get("order_type", "renewal"),
-            decision_data.get("kit_sku", "—"),
             decision_data.get("decision_type", ""),
+            decision_data.get("kit_sku", "—"),
             decision_data.get("reason", ""),
             decision_data.get("order_id", ""),
             decision_data.get("due_date", ""),
@@ -161,9 +164,10 @@ def write_decision_to_sheet(decision_data: dict):
 def update_decision_status_in_sheet(email: str, order_id: str, new_status: str, reason_prefix: str = ""):
     """
     Update an EXISTING row in Google Sheets instead of appending a duplicate.
-    Finds the row by email (col D) + order_id (col J), then updates:
-      - Column F (order_type) → new_status
-      - Column H (decision_status) → new_status
+    Finds the row by email + order_id (searches bottom-to-top to find most recent match).
+    Handles both old column layout (email at col D/index 3) and new layout (email at col E/index 4).
+    Updates:
+      - Column G (decision_status) → new_status
       - Column I (reason) → prepend prefix to existing reason
     Falls back to logging a warning if the row is not found.
     """
@@ -173,23 +177,32 @@ def update_decision_status_in_sheet(email: str, order_id: str, new_status: str, 
             logger.info("[GSHEETS] Skipping update — Google Sheets not configured")
             return
 
-        # Find the row by email + order_id
         all_values = ws.get_all_values()
         target_row = None
-        for idx, row in enumerate(all_values):
-            if idx == 0:
-                continue  # skip header
-            # Col D = email (index 3), Col J = order_id (index 9)
-            row_email = (row[3] if len(row) > 3 else "").strip().lower()
+        target_email = email.strip().lower()
+
+        # Guard: if email doesn't look valid, skip (catches decision_id[:8] fallback)
+        if "@" not in target_email:
+            logger.warning(f"[GSHEETS] Skipping update — '{email}' is not a valid email")
+            return
+
+        target_order_id = str(order_id or "").strip()
+
+        # Search bottom-to-top to find the MOST RECENT matching row
+        for idx in range(len(all_values) - 1, 0, -1):  # reverse, skip header at idx 0
+            row = all_values[idx]
+            # Check email at both old position (col D, index 3) and new position (col E, index 4)
+            row_email_old = (row[3] if len(row) > 3 else "").strip().lower()
+            row_email_new = (row[4] if len(row) > 4 else "").strip().lower()
             row_order_id = (row[9] if len(row) > 9 else "").strip()
-            if row_email == email.strip().lower() and row_order_id == str(order_id or "").strip():
+            email_match = (row_email_old == target_email) or (row_email_new == target_email)
+            if email_match and row_order_id == target_order_id:
                 target_row = idx + 1  # gspread is 1-indexed
                 break
 
         if target_row:
-            # Update status columns in-place: F (col 6), H (col 8), I (col 9)
-            ws.update_cell(target_row, 6, new_status)  # order_type
-            ws.update_cell(target_row, 8, new_status)  # decision_status
+            # Update decision_status column in-place: G (col 7)
+            ws.update_cell(target_row, 7, new_status)  # decision_status
             if reason_prefix:
                 existing_reason = all_values[target_row - 1][8] if len(all_values[target_row - 1]) > 8 else ""
                 # Don't double-prefix if already has it
@@ -209,8 +222,8 @@ def fix_gsheet_headers():
         if ws is None:
             return False
         headers = [
-            "received_at", "platform", "customer_name", "email",
-            "trimester", "order_type", "assigned_kit", "decision_status",
+            "received_at", "platform", "topic", "customer_name",
+            "email", "order_type", "decision_status", "assigned_kit",
             "reason", "external_order_id", "due_date", "clothing_size"
         ]
         ws.update('A1:L1', [headers], value_input_option="USER_ENTERED")
@@ -225,6 +238,66 @@ def fix_gsheet_headers():
 app = FastAPI(title="OBB Curation Engine")
 _BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
+
+
+# ─── Monthly curation report scheduler ───
+# Runs on the 1st of each month at ~6 AM UTC. Uses a lightweight background thread.
+_scheduler_started = False
+
+def _monthly_report_scheduler():
+    """Background thread that checks once per hour if it's the 1st and triggers the report."""
+    import time as _time
+    last_run_month = None
+    while True:
+        try:
+            now = datetime.utcnow()
+            current_month_key = f"{now.year}-{now.month:02d}"
+            # Trigger on 1st of month, after 6 AM UTC, only once per month
+            if now.day == 1 and now.hour >= 6 and last_run_month != current_month_key:
+                logger.info(f"[SCHEDULER] Monthly auto-run triggered for {current_month_key}")
+                try:
+                    db = get_supabase()
+                    from curation_report import run_monthly_report as _sched_run
+                    year, month_num = now.year, now.month
+                    ship_date = date(year, month_num, 14)  # default ship day
+                    report = _sched_run(
+                        db=db,
+                        report_month=current_month_key,
+                        ship_date=ship_date,
+                        warehouse_minimum=100,
+                        include_paused=False,
+                        lookback_months=4,
+                        recency_months=3,
+                    )
+                    # Save to DB
+                    run_insert = db.table("curation_runs").insert({
+                        "report_month": current_month_key,
+                        "ship_date": str(ship_date),
+                        "warehouse_minimum": 100,
+                        "include_paused": False,
+                        "lookback_months": 4,
+                        "status": "completed",
+                        "summary_json": report["executive"],
+                        "completed_at": str(date.today()),
+                    }).execute()
+                    run_id = run_insert.data[0]["id"]
+                    _save_report_details(db, run_id, report)
+                    logger.info(f"[SCHEDULER] Auto-generated curation report for {current_month_key}, run_id={run_id}")
+                    last_run_month = current_month_key
+                except Exception as e:
+                    logger.error(f"[SCHEDULER] Failed to auto-generate report: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"[SCHEDULER] Scheduler loop error: {e}", exc_info=True)
+        _time.sleep(3600)  # Check every hour
+
+
+def _start_scheduler():
+    global _scheduler_started
+    if not _scheduler_started:
+        _scheduler_started = True
+        t = threading.Thread(target=_monthly_report_scheduler, daemon=True, name="monthly-scheduler")
+        t.start()
+        logger.info("[SCHEDULER] Monthly curation report scheduler started")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -701,9 +774,10 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
         filtered = [k for k in available_kits if k.get("is_universal") or k["size_variant"] == customer_variant]
         logger.info(f"[DECISION ENGINE] Size filter: clothing_size={clothing_size}, customer_variant={customer_variant}")
     else:
-        # No size info → only universal kits
-        filtered = [k for k in available_kits if k.get("is_universal")]
-        logger.info(f"[DECISION ENGINE] No size on record → universal kits only")
+        # No size info → universal kits + size_variant=1 (S/default variant)
+        # size_variant=1 kits with is_universal=False contain no sized items (verified); safe for any customer
+        filtered = [k for k in available_kits if k.get("is_universal") or k["size_variant"] == 1]
+        logger.info(f"[DECISION ENGINE] No size on record → universal + variant-1 kits ({len(filtered)} available)")
 
     logger.info(f"[DECISION ENGINE] After size filter: {len(filtered)} kits (customer size: {clothing_size or 'universal-only'})")
 
@@ -905,7 +979,7 @@ async def shopify_order_webhook(request: Request):
             logger.info(
                 f"[SHOPIFY WEBHOOK] NON-SUBSCRIPTION order — "
                 f"line item SKUs: {[i.get('sku', '') for i in line_items]}, price=${total_price}, source={source_name}. "
-                f"Will upsert customer but skip decision engine."
+                f"Will update existing customer (address only) but skip creating new customers and decision engine."
             )
 
         logger.info(f"[SHOPIFY WEBHOOK] Customer: {email}, Name: {first_name} {last_name}")
@@ -915,6 +989,12 @@ async def shopify_order_webhook(request: Request):
         # ─── Upsert customer ───
         if email:
             existing_customer = db.table("customers").select("*").ilike("email", email).execute()
+
+            # Non-subscription order from unknown email → skip entirely (no ghost customers)
+            if not is_subscription_order and not existing_customer.data:
+                logger.info(f"[SHOPIFY WEBHOOK] Non-sub order from unknown email {email} — skipping entirely, no customer created")
+                await log_activity("webhook", f"Non-sub order skipped — unknown email {email}", f"order={shopify_order_id}, SKUs={[i.get('sku','') for i in line_items]}", "info")
+                return JSONResponse({"status": "skipped", "reason": "non-subscription order from unknown customer"})
 
             customer_record = {
                 "email": email,
@@ -945,8 +1025,14 @@ async def shopify_order_webhook(request: Request):
                     customer_record["platform"] = "both"
                 else:
                     customer_record["platform"] = "shopify"
-                db.table("customers").update(customer_record).eq("id", cust_id).execute()
-                logger.info(f"[SHOPIFY WEBHOOK] Updated existing customer: {cust_id}")
+                # Non-sub order for existing customer → update address fields only, don't overwrite quiz data
+                if not is_subscription_order:
+                    address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "city", "province", "zip", "country", "platform") if k in customer_record}
+                    db.table("customers").update(address_only).eq("id", cust_id).execute()
+                    logger.info(f"[SHOPIFY WEBHOOK] Non-sub order — updated address only for existing customer: {cust_id}")
+                else:
+                    db.table("customers").update(customer_record).eq("id", cust_id).execute()
+                    logger.info(f"[SHOPIFY WEBHOOK] Updated existing customer: {cust_id}")
             else:
                 customer_record["platform"] = "shopify"
                 customer_record["subscription_status"] = "active"
@@ -1870,10 +1956,17 @@ async def replay_webhook(webhook_id: str):
                 f"renewal={is_renewal}, is_subscription_order={is_subscription_order}"
             )
             if not is_subscription_order:
-                logger.info(f"[WEBHOOK REPLAY] NON-SUBSCRIPTION order — SKUs: {[i.get('sku', '') for i in line_items]}, price=${total_price}. Updating customer, skipping decision engine.")
+                logger.info(f"[WEBHOOK REPLAY] NON-SUBSCRIPTION order — SKUs: {[i.get('sku', '') for i in line_items]}, price=${total_price}. Skipping decision engine.")
 
             if email:
                 existing_customer = db.table("customers").select("*").ilike("email", email).execute()
+
+                # Non-subscription order from unknown email → skip entirely (no ghost customers)
+                if not is_subscription_order and not existing_customer.data:
+                    logger.info(f"[WEBHOOK REPLAY] Non-sub order from unknown email {email} — skipping entirely")
+                    db.table("webhook_logs").update({"status": "replayed", "replayed_at": date.today().isoformat()}).eq("id", webhook_id).execute()
+                    return RedirectResponse(f"/webhooks/{webhook_id}", status_code=303)
+
                 customer_record = {
                     "email": email,
                     "first_name": first_name or None,
@@ -1902,8 +1995,14 @@ async def replay_webhook(webhook_id: str):
                         customer_record["platform"] = "both"
                     else:
                         customer_record["platform"] = "shopify"
-                    db.table("customers").update(customer_record).eq("id", cust_id).execute()
-                    logger.info(f"[WEBHOOK REPLAY] Updated existing customer: {cust_id}")
+                    # Non-sub order for existing customer → address only
+                    if not is_subscription_order:
+                        address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "city", "province", "zip", "country", "platform") if k in customer_record}
+                        db.table("customers").update(address_only).eq("id", cust_id).execute()
+                        logger.info(f"[WEBHOOK REPLAY] Non-sub order — updated address only for existing customer: {cust_id}")
+                    else:
+                        db.table("customers").update(customer_record).eq("id", cust_id).execute()
+                        logger.info(f"[WEBHOOK REPLAY] Updated existing customer: {cust_id}")
                 else:
                     customer_record["platform"] = "shopify"
                     customer_record["subscription_status"] = "active"
@@ -2302,26 +2401,70 @@ async def customers_page(request: Request):
             filtered = all_customers
 
         # Active vs Past split
-        # Active: status active/cancelled-prepaid/paused AND due_date within last 150 days (or no due_date)
-        # Past: everything else (expired, or due_date > 5 months ago — baby definitely born + all kits shipped)
+        # Active: status active/cancelled-prepaid/paused AND (recent shipment within 3 months OR no due_date or recent due_date)
+        # Past: everything else (cancelled-expired, or no activity in 3+ months)
         today  = date.today()
-        cutoff = today - timedelta(days=150)
+        shipment_cutoff = today - timedelta(days=90)  # 3 months
+        due_date_cutoff = today - timedelta(days=150)  # fallback for customers without shipment data
+
+        # Bulk-load latest shipment dates for all customer IDs in this page
+        customer_ids_on_page = [c["id"] for c in filtered if c.get("id")]
+        latest_shipment_map: dict = {}
+        if customer_ids_on_page:
+            # Load shipments in chunks (Supabase filter limit)
+            for chunk_start in range(0, len(customer_ids_on_page), 200):
+                chunk_ids = customer_ids_on_page[chunk_start:chunk_start + 200]
+                ship_batch = db.table("shipments").select("customer_id, ship_date").in_("customer_id", chunk_ids).execute()
+                for s in (ship_batch.data or []):
+                    cid = s["customer_id"]
+                    sd = s.get("ship_date") or ""
+                    if sd and (cid not in latest_shipment_map or sd > latest_shipment_map[cid]):
+                        latest_shipment_map[cid] = sd
+
         active_customers: list = []
         past_customers:   list = []
         for c in filtered:
+            s = c.get("subscription_status", "")
+            cid = c.get("id", "")
+
+            # Cancelled-expired always goes to past
+            if s == "cancelled-expired":
+                past_customers.append(c)
+                continue
+
+            # Check subscription status first
+            if s not in ("active", "cancelled-prepaid", "paused"):
+                past_customers.append(c)
+                continue
+
+            # Check for recent shipment (primary signal)
+            last_ship = latest_shipment_map.get(cid, "")
+            if last_ship:
+                try:
+                    last_ship_dt = date.fromisoformat(str(last_ship)[:10])
+                    if last_ship_dt >= shipment_cutoff:
+                        active_customers.append(c)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # Fallback to due date for customers without shipment history
             dd_raw = c.get("due_date")
-            s      = c.get("subscription_status", "")
-            dd     = None
             if dd_raw:
                 try:
                     dd = date.fromisoformat(str(dd_raw))
-                except Exception:
+                    if dd >= due_date_cutoff:
+                        active_customers.append(c)
+                        continue
+                except (ValueError, TypeError):
                     pass
-            is_active = s in ("active", "cancelled-prepaid", "paused") and (dd is None or dd >= cutoff)
-            if is_active:
+
+            # No due date and no recent shipment but active status — still show as active
+            if not dd_raw and not last_ship:
                 active_customers.append(c)
-            else:
-                past_customers.append(c)
+                continue
+
+            past_customers.append(c)
         logger.info(f"[CUSTOMERS PAGE] Active={len(active_customers)}, Past={len(past_customers)}")
 
         # Build filter query string for sort links
@@ -2374,6 +2517,96 @@ async def customers_page(request: Request):
             "filter_qs":        "",
             "any_filter_active": False,
         })
+
+
+@app.get("/customers/export-csv")
+async def export_customers_csv(request: Request):
+    """Export filtered customers as a downloadable CSV."""
+    try:
+        db = get_supabase()
+
+        # Re-apply same filter params as customers page
+        f_trimester = request.query_params.get("trimester", "").strip()
+        f_platform  = request.query_params.get("platform", "").strip()
+        f_status    = request.query_params.get("status", "").strip()
+        f_size      = request.query_params.get("size", "").strip()
+        q           = request.query_params.get("q", "").strip().lower()
+
+        def _build_cust_q():
+            qo = db.table("customers").select("*")
+            if f_trimester:
+                try:
+                    qo = qo.eq("trimester", int(f_trimester))
+                except ValueError:
+                    pass
+            if f_platform:
+                qo = qo.eq("platform", f_platform)
+            if f_status:
+                qo = qo.eq("subscription_status", f_status)
+            if f_size:
+                qo = qo.eq("clothing_size", f_size)
+            return qo
+
+        rows: list = []
+        offset = 0
+        PAGE_SIZE = 1000
+        while True:
+            batch = _build_cust_q().order("created_at", desc=True).range(offset, offset + PAGE_SIZE - 1).execute()
+            batch_data = batch.data or []
+            rows.extend(batch_data)
+            if len(batch_data) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+
+        # Client-side text search
+        if q:
+            rows = [
+                c for c in rows
+                if q in (c.get("email") or "").lower()
+                or q in (c.get("first_name") or "").lower()
+                or q in (c.get("last_name") or "").lower()
+                or q in f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".lower()
+            ]
+
+        logger.info(f"[CUSTOMER EXPORT] Exporting {len(rows)} customers")
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Name", "Email", "Platform", "Status",
+            "Trimester", "Due Date", "Size", "Gender",
+            "Phone", "Address", "City", "State", "Zip", "Country",
+        ])
+        for c in rows:
+            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+            writer.writerow([
+                name,
+                c.get("email", ""),
+                c.get("platform", ""),
+                c.get("subscription_status", ""),
+                f"T{c.get('trimester', '')}" if c.get("trimester") else "",
+                c.get("due_date", ""),
+                c.get("clothing_size", ""),
+                c.get("baby_gender", ""),
+                c.get("phone") or "",
+                c.get("address_line1") or "",
+                c.get("city") or "",
+                c.get("province") or "",
+                c.get("zip") or "",
+                c.get("country") or "US",
+            ])
+
+        output.seek(0)
+        filename = f"customers_export_{date.today().isoformat()}.csv"
+        await log_activity("export", f"Customer CSV export: {len(rows)} rows", "", "success")
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except Exception as e:
+        logger.error(f"[CUSTOMER EXPORT] Error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/customers/{customer_id}", response_class=HTMLResponse)
@@ -2741,6 +2974,7 @@ async def items_page(request: Request):
             "msg": msg,
             "msg_type": msg_type,
             "page": "items",
+            "today_str": date.today().isoformat(),
         })
     except Exception as e:
         logger.error(f"[ITEMS PAGE] Error: {e}", exc_info=True)
@@ -2751,6 +2985,7 @@ async def items_page(request: Request):
             "msg": "",
             "msg_type": "error",
             "page": "items",
+            "today_str": date.today().isoformat(),
         })
 
 
@@ -2762,6 +2997,7 @@ async def add_item(
     category: str = Form(""),
     unit_cost: float = Form(0),
     is_therabox: str = Form(""),
+    expiry_date: str = Form(""),
 ):
     """Add a new item."""
     try:
@@ -2770,19 +3006,622 @@ async def add_item(
         name_clean = name.strip()
         sku_clean = sku.strip().upper() or None
         logger.info(f"[ITEMS] Adding item: name='{name_clean}', sku={sku_clean}, category={category}, therabox={therabox}")
-        db.table("items").insert({
+        item_data = {
             "name": name_clean,
             "sku": sku_clean,
             "category": category.strip() or None,
             "unit_cost": unit_cost if unit_cost > 0 else None,
             "is_therabox": therabox,
-        }).execute()
+        }
+        if expiry_date and expiry_date.strip():
+            item_data["expiry_date"] = expiry_date.strip()
+        db.table("items").insert(item_data).execute()
         logger.info(f"[ITEMS] ✅ Added item: {name_clean}")
         await log_activity("item", f"Item '{name_clean}' added", f"SKU: {sku_clean}, TheraBox: {therabox}", "success")
     except Exception as e:
         logger.error(f"[ITEMS] Error adding item: {e}", exc_info=True)
         await log_activity("item", f"Failed to add item: {e}", "", "error")
     return RedirectResponse("/items", status_code=303)
+
+
+# ─── Item Alternatives (Pipe Items) ───
+
+@app.get("/item-alternatives", response_class=HTMLResponse)
+async def item_alternatives_page(request: Request):
+    """View and manage item alternatives (pipe items)."""
+    try:
+        db = get_supabase()
+        msg = request.query_params.get("msg", "")
+        msg_type = request.query_params.get("msg_type", "success")
+
+        # Load all items for the dropdowns
+        items_data = db.table("items").select("id, name, sku").order("name").execute()
+        items_list = items_data.data or []
+        item_lookup = {i["id"]: i for i in items_list}
+
+        # Load existing alternatives
+        alts_data = db.table("item_alternatives").select("item_id, alternative_item_id").execute()
+        alternatives = []
+        for a in (alts_data.data or []):
+            item = item_lookup.get(a["item_id"], {})
+            alt = item_lookup.get(a["alternative_item_id"], {})
+            alternatives.append({
+                "item_id": a["item_id"],
+                "alternative_item_id": a["alternative_item_id"],
+                "item_name": item.get("name", "Unknown"),
+                "item_sku": item.get("sku"),
+                "alt_name": alt.get("name", "Unknown"),
+                "alt_sku": alt.get("sku"),
+            })
+
+        logger.info(f"[ITEM ALTS PAGE] {len(alternatives)} alternative pairs loaded")
+        return templates.TemplateResponse("item_alternatives.html", {
+            "request": request,
+            "items": items_list,
+            "alternatives": alternatives,
+            "msg": msg,
+            "msg_type": msg_type,
+            "page": "item-alternatives",
+        })
+    except Exception as e:
+        logger.error(f"[ITEM ALTS PAGE] Error: {e}", exc_info=True)
+        return templates.TemplateResponse("item_alternatives.html", {
+            "request": request,
+            "items": [],
+            "alternatives": [],
+            "error": str(e),
+            "msg": "",
+            "msg_type": "error",
+            "page": "item-alternatives",
+        })
+
+
+@app.post("/item-alternatives/add")
+async def add_item_alternative(
+    item_id: str = Form(...),
+    alternative_item_id: str = Form(...),
+):
+    """Add an item alternative pair."""
+    try:
+        db = get_supabase()
+        item_id = item_id.strip()
+        alternative_item_id = alternative_item_id.strip()
+
+        if item_id == alternative_item_id:
+            logger.warning(f"[ITEM ALTS] Cannot add self as alternative: {item_id}")
+            return RedirectResponse("/item-alternatives?msg=Cannot+add+an+item+as+its+own+alternative&msg_type=error", status_code=303)
+
+        # Insert both directions for easy lookup
+        logger.info(f"[ITEM ALTS] Adding alternative pair: {item_id} ↔ {alternative_item_id}")
+        try:
+            db.table("item_alternatives").insert({"item_id": item_id, "alternative_item_id": alternative_item_id}).execute()
+        except Exception as dup:
+            if "duplicate" in str(dup).lower() or "23505" in str(dup):
+                logger.info(f"[ITEM ALTS] Pair A→B already exists, skipping")
+            else:
+                raise
+        try:
+            db.table("item_alternatives").insert({"item_id": alternative_item_id, "alternative_item_id": item_id}).execute()
+        except Exception as dup:
+            if "duplicate" in str(dup).lower() or "23505" in str(dup):
+                logger.info(f"[ITEM ALTS] Pair B→A already exists, skipping")
+            else:
+                raise
+
+        # Get item names for logging
+        item_a = db.table("items").select("name").eq("id", item_id).single().execute()
+        item_b = db.table("items").select("name").eq("id", alternative_item_id).single().execute()
+        name_a = item_a.data["name"] if item_a.data else item_id
+        name_b = item_b.data["name"] if item_b.data else alternative_item_id
+        logger.info(f"[ITEM ALTS] ✅ Added: {name_a} ↔ {name_b}")
+        await log_activity("item_alternative", f"Added alternative: {name_a} ↔ {name_b}", "", "success")
+        return RedirectResponse(f"/item-alternatives?msg=Added+alternative:+{quote(name_a)}+↔+{quote(name_b)}", status_code=303)
+    except Exception as e:
+        logger.error(f"[ITEM ALTS] Error adding alternative: {e}", exc_info=True)
+        return RedirectResponse(f"/item-alternatives?msg=Error:+{quote(str(e))}&msg_type=error", status_code=303)
+
+
+@app.post("/item-alternatives/remove")
+async def remove_item_alternative(
+    item_id: str = Form(...),
+    alternative_item_id: str = Form(...),
+):
+    """Remove an item alternative pair (both directions)."""
+    try:
+        db = get_supabase()
+        logger.info(f"[ITEM ALTS] Removing alternative pair: {item_id} ↔ {alternative_item_id}")
+        db.table("item_alternatives").delete().eq("item_id", item_id).eq("alternative_item_id", alternative_item_id).execute()
+        db.table("item_alternatives").delete().eq("item_id", alternative_item_id).eq("alternative_item_id", item_id).execute()
+        logger.info(f"[ITEM ALTS] ✅ Removed alternative pair")
+        await log_activity("item_alternative", "Removed alternative pair", "", "success")
+        return RedirectResponse("/item-alternatives?msg=Alternative+pair+removed", status_code=303)
+    except Exception as e:
+        logger.error(f"[ITEM ALTS] Error removing: {e}", exc_info=True)
+        return RedirectResponse(f"/item-alternatives?msg=Error:+{quote(str(e))}&msg_type=error", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CURATION REPORT ROUTES (Phase 2)
+# ═══════════════════════════════════════════════════════════════════
+
+from curation_report import run_monthly_report
+from projection_engine import project_forward, load_committed_items
+import json as json_module
+
+# ─── In-memory job registry ───────────────────────────────────────
+# Stores background job state for curation report / forward planner.
+# Heroku has a 30-second request timeout (H12). Both operations take
+# ~40s, so we return immediately, run in BackgroundTasks, and the
+# client polls /job/{job_id}/status for completion.
+#
+# Schema: {job_id: {type, status, result, error, created_at, params}}
+# type: "curation_report" | "forward_planner"
+# status: "running" | "done" | "error"
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+
+
+def _create_job(job_type: str, params: dict) -> str:
+    """Create a new job entry and return its ID."""
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "type": job_type,
+            "status": "running",
+            "result": None,
+            "error": None,
+            "created_at": datetime.utcnow().isoformat(),
+            "params": params,
+        }
+    logger.info(f"[JOBS] Created job {job_id} type={job_type}")
+    return job_id
+
+
+def _finish_job(job_id: str, result: dict):
+    """Mark job as done with result."""
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["status"] = "done"
+            _jobs[job_id]["result"] = result
+    logger.info(f"[JOBS] Job {job_id} finished successfully")
+
+
+def _fail_job(job_id: str, error: str):
+    """Mark job as failed with error message."""
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"] = error
+    logger.error(f"[JOBS] Job {job_id} failed: {error}")
+
+
+def _get_job(job_id: str) -> dict | None:
+    with _jobs_lock:
+        return _jobs.get(job_id)
+
+
+@app.get("/curation-report", response_class=HTMLResponse)
+async def curation_report_page(request: Request, msg: str = "", msg_type: str = ""):
+    """Main curation report page — shows form to generate + previous runs."""
+    try:
+        db = get_supabase()
+        logger.info("[CURATION PAGE] Loading curation report page")
+
+        # Load previous runs
+        runs = db.table("curation_runs").select("*").order("generated_at", desc=True).limit(20).execute()
+        previous_runs = runs.data or []
+
+        # Parse summary_json for display
+        for run in previous_runs:
+            if isinstance(run.get("summary_json"), str):
+                try:
+                    run["summary_json"] = json_module.loads(run["summary_json"])
+                except Exception:
+                    run["summary_json"] = None
+
+        # Default month = next month
+        from datetime import date, timedelta
+        today = date.today()
+        if today.month == 12:
+            default_month = f"{today.year + 1}-01"
+        else:
+            default_month = f"{today.year}-{today.month + 1:02d}"
+
+        return templates.TemplateResponse("curation_report.html", {
+            "request": request,
+            "page": "curation-report",
+            "msg": msg,
+            "msg_type": msg_type,
+            "previous_runs": previous_runs,
+            "report": None,
+            "default_month": default_month,
+        })
+    except Exception as e:
+        logger.error(f"[CURATION PAGE] Error loading page: {e}", exc_info=True)
+        return templates.TemplateResponse("curation_report.html", {
+            "request": request,
+            "page": "curation-report",
+            "msg": f"Error loading page: {e}",
+            "msg_type": "error",
+            "previous_runs": [],
+            "report": None,
+            "default_month": "",
+        })
+
+
+@app.post("/curation-report/{run_id}/delete")
+async def delete_curation_run(run_id: str):
+    """Delete a curation report run."""
+    try:
+        db = get_supabase()
+        db.table("curation_runs").delete().eq("id", run_id).execute()
+        logger.info(f"[CURATION DELETE] Deleted curation run {run_id}")
+    except Exception as e:
+        logger.error(f"[CURATION DELETE] Error deleting run {run_id}: {e}", exc_info=True)
+    return RedirectResponse("/curation-report?msg=Report+deleted&msg_type=success", status_code=303)
+
+
+@app.post("/curation-report/generate")
+async def generate_curation_report(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    report_month: str = Form(...),
+    ship_day: int = Form(14),
+    warehouse_min: int = Form(100),
+    lookback_months: int = Form(4),
+    recency_months: int = Form(3),
+    include_paused: str = Form(""),
+):
+    """Start curation report generation as a background job.
+    Returns immediately (HTTP 303) to avoid Heroku's 30-second H12 timeout.
+    The client polls /curation-report/job/{job_id}/status for completion.
+    """
+    paused = include_paused in ("1", "on", "true")
+    recency = recency_months if recency_months > 0 else None
+    params = {
+        "report_month": report_month,
+        "ship_day": ship_day,
+        "warehouse_min": warehouse_min,
+        "lookback_months": lookback_months,
+        "recency_months": recency,
+        "include_paused": paused,
+    }
+    job_id = _create_job("curation_report", params)
+    logger.info(f"[CURATION GEN] Started background job {job_id} for {report_month}")
+    background_tasks.add_task(_run_curation_report_job, job_id, params)
+    return RedirectResponse(f"/curation-report/job/{job_id}", status_code=303)
+
+
+def _run_curation_report_job(job_id: str, params: dict):
+    """Background worker: runs the full curation report and stores result in job registry."""
+    try:
+        db = get_supabase()
+        report_month = params["report_month"]
+        ship_day = params["ship_day"]
+        warehouse_min = params["warehouse_min"]
+        lookback_months = params["lookback_months"]
+        recency = params["recency_months"]
+        paused = params["include_paused"]
+
+        logger.info(f"[CURATION JOB] {job_id} — Generating report: month={report_month}, ship_day={ship_day}, wh_min={warehouse_min}, lookback={lookback_months}, recency={recency}")
+
+        year, month_num = int(report_month.split("-")[0]), int(report_month.split("-")[1])
+        ship_date = date(year, month_num, ship_day)
+
+        # Create curation_run record (status=running)
+        run_insert = db.table("curation_runs").insert({
+            "report_month": report_month,
+            "ship_date": str(ship_date),
+            "warehouse_minimum": warehouse_min,
+            "include_paused": paused,
+            "lookback_months": lookback_months,
+            "status": "running",
+        }).execute()
+        run_id = run_insert.data[0]["id"]
+        logger.info(f"[CURATION JOB] {job_id} — Created curation_run {run_id}")
+
+        # Run the report (the heavy part)
+        report = run_monthly_report(
+            db=db,
+            report_month=report_month,
+            ship_date=ship_date,
+            warehouse_minimum=warehouse_min,
+            include_paused=paused,
+            lookback_months=lookback_months,
+            recency_months=recency,
+        )
+
+        # Save detailed results to DB
+        _save_report_details(db, run_id, report)
+
+        # Mark curation_run completed
+        db.table("curation_runs").update({
+            "status": "completed",
+            "summary_json": report["executive"],
+            "completed_at": str(date.today()),
+        }).eq("id", run_id).execute()
+
+        logger.info(f"[CURATION JOB] {job_id} — Completed. run_id={run_id}")
+        _finish_job(job_id, {"run_id": run_id, "report_month": report_month})
+
+    except Exception as e:
+        logger.error(f"[CURATION JOB] {job_id} — Error: {e}", exc_info=True)
+        # Try to update DB run status
+        try:
+            if "run_id" in locals():
+                db.table("curation_runs").update({
+                    "status": "error",
+                    "error_message": str(e)[:500],
+                }).eq("id", run_id).execute()
+        except Exception:
+            pass
+        _fail_job(job_id, str(e)[:500])
+
+
+@app.get("/curation-report/job/{job_id}", response_class=HTMLResponse)
+async def curation_report_job_page(request: Request, job_id: str):
+    """Loading/result page for a curation report background job."""
+    job = _get_job(job_id)
+    if not job:
+        return RedirectResponse("/curation-report?msg=Job+not+found&msg_type=error", status_code=303)
+
+    if job["status"] == "done":
+        run_id = job["result"]["run_id"]
+        return RedirectResponse(f"/curation-report/{run_id}?msg=Report+generated+successfully", status_code=303)
+
+    if job["status"] == "error":
+        return templates.TemplateResponse("job_loading.html", {
+            "request": request,
+            "job_id": job_id,
+            "job_type": "Curation Report",
+            "status": "error",
+            "error": job["error"],
+            "cancel_url": "/curation-report",
+            "page": "curation-report",
+        })
+
+    # Still running — show loading page
+    return templates.TemplateResponse("job_loading.html", {
+        "request": request,
+        "job_id": job_id,
+        "job_type": "Curation Report",
+        "status": "running",
+        "error": None,
+        "cancel_url": "/curation-report",
+        "page": "curation-report",
+        "params": job["params"],
+    })
+
+
+@app.get("/curation-report/job/{job_id}/status")
+async def curation_report_job_status(job_id: str):
+    """JSON status endpoint for polling. Used by the loading page."""
+    job = _get_job(job_id)
+    if not job:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+    return JSONResponse({
+        "status": job["status"],
+        "error": job["error"],
+        "redirect_url": f"/curation-report/{job['result']['run_id']}" if job["status"] == "done" else None,
+    })
+
+
+
+
+def _save_report_details(db, run_id: str, report: dict):
+    """Save detailed customer and item results to the database."""
+    logger.info(f"[CURATION SAVE] Saving details for run {run_id}")
+
+    customer_rows = []
+    item_rows = []
+
+    for tri_key, tri_data in report.get("trimester_reports", {}).items():
+        trimester = int(tri_key) if isinstance(tri_key, str) else tri_key
+
+        # Customer results
+        for cust in tri_data.get("customers", []):
+            customer_rows.append({
+                "run_id": run_id,
+                "customer_id": cust["customer_id"],
+                "projected_trimester": trimester,
+                "needs_new_curation": cust["needs_new_curation"],
+                "recommended_kit_id": cust.get("recommended_kit_id"),
+                "recommended_kit_sku": cust.get("recommended_kit_sku"),
+                "alternative_kit_skus": cust.get("alternative_kit_skus", []),
+                "reason": cust.get("reason", "")[:500],
+                "blocking_item_count": cust.get("blocking_item_count", 0),
+            })
+
+        # DO NOT USE items
+        for item in tri_data.get("do_not_use", []):
+            item_rows.append({
+                "run_id": run_id,
+                "trimester": trimester,
+                "item_id": item["item_id"],
+                "blocked_count": item["blocked_count"],
+                "group_size": item["group_size"],
+                "blocked_pct": item["blocked_pct"],
+                "risk_level": item["risk_level"],
+            })
+
+        # CAN USE items (LOW risk)
+        for item in tri_data.get("can_use", []):
+            item_rows.append({
+                "run_id": run_id,
+                "trimester": trimester,
+                "item_id": item["item_id"],
+                "blocked_count": item["blocked_count"],
+                "group_size": item["group_size"],
+                "blocked_pct": item["blocked_pct"],
+                "risk_level": item["risk_level"],
+            })
+
+    # Batch insert customers (chunks of 500)
+    for i in range(0, len(customer_rows), 500):
+        batch = customer_rows[i:i + 500]
+        db.table("curation_run_customers").insert(batch).execute()
+    logger.info(f"[CURATION SAVE] Saved {len(customer_rows)} customer records")
+
+    # Batch insert items (chunks of 500)
+    for i in range(0, len(item_rows), 500):
+        batch = item_rows[i:i + 500]
+        db.table("curation_run_items").insert(batch).execute()
+    logger.info(f"[CURATION SAVE] Saved {len(item_rows)} item records")
+
+
+@app.get("/curation-report/{run_id}", response_class=HTMLResponse)
+async def view_curation_report(request: Request, run_id: str, msg: str = "", msg_type: str = ""):
+    """View a specific curation report by run ID."""
+    try:
+        db = get_supabase()
+        logger.info(f"[CURATION VIEW] Loading report: run_id={run_id}")
+
+        # Load the run record
+        run = db.table("curation_runs").select("*").eq("id", run_id).single().execute()
+        if not run.data:
+            return RedirectResponse("/curation-report?msg=Report+not+found&msg_type=error", status_code=303)
+
+        run_data = run.data
+        report_month = run_data["report_month"]
+
+        # Load executive summary from summary_json
+        executive = run_data.get("summary_json", {})
+        if isinstance(executive, str):
+            try:
+                executive = json_module.loads(executive)
+            except Exception:
+                executive = {}
+
+        # Load customer results
+        cust_rows = []
+        offset = 0
+        while True:
+            batch = db.table("curation_run_customers").select("*, customers(email, first_name, last_name, clothing_size, platform)").eq("run_id", run_id).range(offset, offset + 999).execute()
+            cust_rows.extend(batch.data or [])
+            if len(batch.data or []) < 1000:
+                break
+            offset += 1000
+
+        # Load item results
+        item_rows = []
+        offset = 0
+        while True:
+            batch = db.table("curation_run_items").select("*, items(name, sku, category, unit_cost)").eq("run_id", run_id).range(offset, offset + 999).execute()
+            item_rows.extend(batch.data or [])
+            if len(batch.data or []) < 1000:
+                break
+            offset += 1000
+
+        logger.info(f"[CURATION VIEW] Loaded {len(cust_rows)} customers, {len(item_rows)} items")
+
+        # Load inventory status (kits with stock)
+        all_kits = db.table("kits").select("*").eq("is_welcome_kit", False).gt("quantity_available", 0).order("age_rank").execute()
+        kits_by_tri = {}
+        for k in (all_kits.data or []):
+            tri = k["trimester"]
+            if tri not in kits_by_tri:
+                kits_by_tri[tri] = []
+            kits_by_tri[tri].append({
+                "sku": k["sku"],
+                "quantity_available": k.get("quantity_available", 0),
+                "age_rank": k.get("age_rank", 0),
+                "is_universal": k.get("is_universal", False),
+                "size_variant": k.get("size_variant"),
+            })
+
+        # Welcome kits
+        welcome_kits = db.table("kits").select("sku, trimester, quantity_available, age_rank").eq("is_welcome_kit", True).gt("quantity_available", 0).order("age_rank").execute()
+
+        # Build report structure for the template
+        trimester_reports = {}
+        for tri in [1, 2, 3, 4]:
+            tri_customers = []
+            for cr in cust_rows:
+                if cr["projected_trimester"] == tri:
+                    cust_info = cr.get("customers", {}) or {}
+                    tri_customers.append({
+                        "customer_id": cr["customer_id"],
+                        "email": cust_info.get("email", ""),
+                        "first_name": cust_info.get("first_name", ""),
+                        "last_name": cust_info.get("last_name", ""),
+                        "clothing_size": cust_info.get("clothing_size"),
+                        "platform": cust_info.get("platform", ""),
+                        "projected_trimester": tri,
+                        "needs_new_curation": cr["needs_new_curation"],
+                        "recommended_kit_id": cr.get("recommended_kit_id"),
+                        "recommended_kit_sku": cr.get("recommended_kit_sku"),
+                        "alternative_kit_skus": cr.get("alternative_kit_skus", []),
+                        "reason": cr.get("reason", ""),
+                        "blocking_item_count": cr.get("blocking_item_count", 0),
+                    })
+
+            tri_do_not_use = []
+            tri_can_use = []
+            for ir in item_rows:
+                if ir["trimester"] == tri:
+                    item_info = ir.get("items", {}) or {}
+                    entry = {
+                        "item_id": ir["item_id"],
+                        "name": item_info.get("name", "Unknown"),
+                        "sku": item_info.get("sku", ""),
+                        "category": item_info.get("category"),
+                        "unit_cost": item_info.get("unit_cost"),
+                        "blocked_count": ir["blocked_count"],
+                        "group_size": ir["group_size"],
+                        "blocked_pct": ir["blocked_pct"],
+                        "risk_level": ir["risk_level"],
+                    }
+                    if ir["risk_level"] in ("HIGH", "MEDIUM"):
+                        tri_do_not_use.append(entry)
+                    else:
+                        tri_can_use.append(entry)
+
+            # Sort DO NOT USE by blocked_pct desc, CAN USE by blocked_pct asc
+            tri_do_not_use.sort(key=lambda x: -x["blocked_pct"])
+            tri_can_use.sort(key=lambda x: (x["blocked_pct"], x["name"]))
+
+            covered = sum(1 for c in tri_customers if not c["needs_new_curation"])
+            needs_new = sum(1 for c in tri_customers if c["needs_new_curation"])
+
+            trimester_reports[tri] = {
+                "customers": tri_customers,
+                "covered_count": covered,
+                "needs_new_count": needs_new,
+                "do_not_use": tri_do_not_use,
+                "can_use": tri_can_use,
+                "build_qty": {
+                    "projected_customers": len(tri_customers),
+                    "covered_by_existing": covered,
+                    "need_new_curation": needs_new,
+                    "recommended_build_qty": executive.get("trimesters", {}).get(str(tri), {}).get("recommended_build_qty", 0) if executive else 0,
+                    "expected_leftover": executive.get("trimesters", {}).get(str(tri), {}).get("expected_leftover", 0) if executive else 0,
+                },
+                "inventory_status": kits_by_tri.get(tri, []),
+            }
+
+        report = {
+            "executive": executive,
+            "trimester_reports": trimester_reports,
+            "welcome_watchlist": {
+                "total_stock": sum(k.get("quantity_available", 0) for k in (welcome_kits.data or [])),
+                "kits": welcome_kits.data or [],
+                "new_customer_count": executive.get("total_new_customers", 0),
+            },
+        }
+
+        return templates.TemplateResponse("curation_report.html", {
+            "request": request,
+            "page": "curation-report",
+            "msg": msg,
+            "msg_type": msg_type,
+            "report": report,
+            "run_id": run_id,
+            "previous_runs": [],
+            "default_month": "",
+        })
+    except Exception as e:
+        logger.error(f"[CURATION VIEW] Error loading report: {e}", exc_info=True)
+        return RedirectResponse(f"/curation-report?msg=Error:+{quote(str(e)[:200])}&msg_type=error", status_code=303)
 
 
 @app.post("/customers/add")
@@ -4000,6 +4839,13 @@ async def reject_decision(request: Request, decision_id: str):
         cust_email = d.get("customers", {}).get("email", decision_id[:8]) if d.get("customers") else decision_id[:8]
         logger.info(f"[REJECT] Decision {decision_id} rejected for {cust_email}")
         await log_activity("decision", f"Rejected decision for {cust_email}", f"Kit: {d.get('kit_sku', '—')}", "info")
+        # Sync rejection to Google Sheets
+        update_decision_status_in_sheet(
+            email=cust_email,
+            order_id=d.get("order_id", ""),
+            new_status="rejected",
+            reason_prefix="Rejected",
+        )
     except Exception as e:
         logger.error(f"[REJECT] Error: {e}", exc_info=True)
     return RedirectResponse("/decisions", status_code=303)
@@ -4136,6 +4982,25 @@ async def recurate_customer(request: Request, customer_id: str, background_tasks
 
         # Save new decision
         trimester = cust.data.get("trimester")
+
+        # Find old decision's order_id so we can update its sheet row
+        old_order_id = ""
+        try:
+            old_decisions = db.table("decisions").select("order_id").eq("customer_id", customer_id).eq("status", "rejected").order("created_at", desc=True).limit(1).execute()
+            if old_decisions.data:
+                old_order_id = old_decisions.data[0].get("order_id") or ""
+        except Exception:
+            pass
+
+        # Update old decision's sheet row to show "re-curated"
+        if email:
+            update_decision_status_in_sheet(
+                email=email,
+                order_id=old_order_id,
+                new_status="re-curated",
+                reason_prefix="Re-curated",
+            )
+
         decision_record = {
             "customer_id": customer_id,
             "kit_id": kit_decision.get("kit_id"),
@@ -4162,7 +5027,7 @@ async def recurate_customer(request: Request, customer_id: str, background_tasks
             "kit_sku": kit_decision.get("kit_sku", "—"),
             "decision_type": kit_decision["decision_type"],
             "reason": f"[Re-curated] {kit_decision['reason']}",
-            "order_id": "",
+            "order_id": old_order_id or "",
             "due_date": cust.data.get("due_date", "") or "",
             "clothing_size": cust.data.get("clothing_size", "") or "",
         }
@@ -4279,6 +5144,7 @@ async def edit_item(
     category: str = Form(""),
     unit_cost: float = Form(0),
     is_therabox: str = Form(""),
+    expiry_date: str = Form(""),
 ):
     """Edit an existing item's details."""
     try:
@@ -4294,9 +5160,10 @@ async def edit_item(
             "category": category.strip() or None,
             "unit_cost": unit_cost if unit_cost > 0 else None,
             "is_therabox": therabox,
+            "expiry_date": expiry_date.strip() if expiry_date and expiry_date.strip() else None,
         }
         db.table("items").update(record).eq("id", item_id).execute()
-        logger.info(f"[ITEM EDIT] Updated item {item_id}: name='{name_clean}', sku={sku_clean}, therabox={therabox}")
+        logger.info(f"[ITEM EDIT] Updated item {item_id}: name='{name_clean}', sku={sku_clean}, therabox={therabox}, expiry={expiry_date}")
         await log_activity("item", f"Edited item '{name_clean}'", f"SKU: {sku_clean}, TheraBox: {therabox}", "success")
         return RedirectResponse(f"/items?msg={quote(f'Updated {name_clean}')}&msg_type=success", status_code=303)
     except Exception as e:
@@ -4389,7 +5256,7 @@ async def bulk_decision_action(request: Request):
         redirect_qs = form.get("redirect_qs", "")
         logger.info(f"[BULK ACTION] action={action}, count={len(decision_ids)}, ids={decision_ids[:5]}")
 
-        if action not in ("approve", "ship"):
+        if action not in ("approve", "ship", "reject", "recurate"):
             logger.warning(f"[BULK ACTION] Invalid action: '{action}'")
             sep = "&" if redirect_qs else ""
             return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=Invalid+action&msg_type=error", status_code=303)
@@ -4506,6 +5373,84 @@ async def bulk_decision_action(request: Request):
                     logger.info(f"[BULK ACTION] Shipped {did[:8]}")
                     success += 1
 
+                elif action == "reject":
+                    if current_status not in ("pending", "approved"):
+                        logger.debug(f"[BULK ACTION] Skip reject on {did[:8]} — status={current_status}")
+                        skipped += 1
+                        continue
+                    db.table("decisions").update({"status": "rejected"}).eq("id", did).execute()
+                    cust_email_bulk = (d.get("customers") or {}).get("email", did[:8])
+                    update_decision_status_in_sheet(
+                        email=cust_email_bulk,
+                        order_id=d.get("order_id", ""),
+                        new_status="rejected",
+                        reason_prefix="Bulk-rejected",
+                    )
+                    logger.info(f"[BULK ACTION] Rejected {did[:8]}")
+                    success += 1
+
+                elif action == "recurate":
+                    if current_status not in ("pending", "rejected"):
+                        logger.debug(f"[BULK ACTION] Skip recurate on {did[:8]} — status={current_status}")
+                        skipped += 1
+                        continue
+                    # Guard: check for OTHER pending decisions for this customer (prevent stacking)
+                    cust_id_rc = d["customer_id"]
+                    other_pending = db.table("decisions").select("id").eq("customer_id", cust_id_rc).eq("status", "pending").neq("id", did).execute()
+                    if other_pending.data:
+                        logger.warning(f"[BULK ACTION] Skipping recurate for {did[:8]} — {len(other_pending.data)} other pending decision(s) exist for customer {cust_id_rc[:8]}")
+                        skipped += 1
+                        continue
+                    # Reject the old decision first
+                    db.table("decisions").update({"status": "rejected"}).eq("id", did).execute()
+                    # Run the decision engine fresh
+                    kit_decision = await assign_kit(cust_id_rc, date.today())
+                    if kit_decision["decision_type"] == "incomplete-data":
+                        logger.warning(f"[BULK ACTION] Recurate incomplete-data for {did[:8]}")
+                        skipped += 1
+                        continue
+                    trimester_rc = d.get("trimester")
+                    new_decision = {
+                        "customer_id": cust_id_rc,
+                        "kit_id": kit_decision.get("kit_id"),
+                        "kit_sku": kit_decision.get("kit_sku"),
+                        "decision_type": kit_decision["decision_type"],
+                        "reason": f"Bulk re-curate: {kit_decision['reason']}",
+                        "status": "pending",
+                        "order_id": d.get("order_id"),
+                        "platform": d.get("platform"),
+                        "trimester": trimester_rc,
+                        "ship_date": date.today().isoformat(),
+                    }
+                    db.table("decisions").insert(new_decision).execute()
+                    logger.info(f"[BULK ACTION] Re-curated {did[:8]} → {kit_decision['decision_type']}")
+                    # Sync to Google Sheets: update old row + write new row
+                    cust_data_rc = d.get("customers", {}) or {}
+                    cust_email_rc = cust_data_rc.get("email", "")
+                    cust_name_rc = f"{cust_data_rc.get('first_name', '')} {cust_data_rc.get('last_name', '')}".strip()
+                    old_order_id_rc = d.get("order_id", "")
+                    update_decision_status_in_sheet(
+                        email=cust_email_rc,
+                        order_id=old_order_id_rc,
+                        new_status="re-curated",
+                        reason_prefix="Bulk-re-curated",
+                    )
+                    write_decision_to_sheet({
+                        "date": date.today().isoformat(),
+                        "customer_name": cust_name_rc,
+                        "email": cust_email_rc,
+                        "platform": "re-curate",
+                        "trimester": trimester_rc,
+                        "order_type": "re-curate",
+                        "kit_sku": kit_decision.get("kit_sku", "—"),
+                        "decision_type": kit_decision["decision_type"],
+                        "reason": f"[Bulk-re-curated] {kit_decision['reason']}",
+                        "order_id": old_order_id_rc or "",
+                        "due_date": "",
+                        "clothing_size": "",
+                    })
+                    success += 1
+
             except Exception as row_err:
                 logger.error(f"[BULK ACTION] Error on decision {did}: {row_err}", exc_info=True)
                 failed += 1
@@ -4593,7 +5538,13 @@ async def export_decisions_csv(request: Request):
             "Name", "Email", "Address Line 1", "Address Line 2",
             "City", "State", "Zip", "Country", "Phone",
             "Order Number", "Kit SKU", "Trimester",
+            "Weight (oz)", "Length (in)", "Width (in)", "Height (in)",
         ])
+        # Defaults confirmed by Sheena on Apr 15 call: ~3 lb (48 oz), 10 × 7.5 × 4 inches
+        DEFAULT_WEIGHT_OZ = 48
+        DEFAULT_LENGTH_IN = 10
+        DEFAULT_WIDTH_IN = 7.5
+        DEFAULT_HEIGHT_IN = 4
         for d in rows:
             c    = d.get("customers") or {}
             name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
@@ -4610,6 +5561,10 @@ async def export_decisions_csv(request: Request):
                 d.get("order_id", ""),
                 d.get("kit_sku", ""),
                 f"T{d.get('trimester', '')}",
+                DEFAULT_WEIGHT_OZ,
+                DEFAULT_LENGTH_IN,
+                DEFAULT_WIDTH_IN,
+                DEFAULT_HEIGHT_IN,
             ])
 
         output.seek(0)
@@ -4723,6 +5678,502 @@ async def export_decisions_sheet(request: Request, background_tasks: BackgroundT
     except Exception as e:
         logger.error(f"[EXPORT SHEET] Error: {e}", exc_info=True)
         return RedirectResponse(f"/decisions?msg={quote('Sheet export failed: ' + str(e))}&msg_type=error", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════
+# CURATION REPORT — GOOGLE SHEETS EXPORT
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/curation-report/{run_id}/export-sheet")
+async def export_curation_report_sheet(request: Request, run_id: str, background_tasks: BackgroundTasks):
+    """Push curation report to Google Sheets — creates tabs for overview, needs-new, existing-safe, items."""
+    try:
+        db = get_supabase()
+
+        # Load run data
+        run = db.table("curation_runs").select("*").eq("id", run_id).single().execute()
+        if not run.data:
+            return RedirectResponse(f"/curation-report?msg=Report+not+found&msg_type=error", status_code=303)
+
+        run_data = run.data
+        report_month = run_data["report_month"]
+        executive = run_data.get("summary_json", {})
+        if isinstance(executive, str):
+            try:
+                executive = json_module.loads(executive)
+            except Exception:
+                executive = {}
+
+        # Load customer results
+        cust_rows = []
+        offset = 0
+        while True:
+            batch = db.table("curation_run_customers").select("*, customers(email, first_name, last_name, clothing_size, platform)").eq("run_id", run_id).range(offset, offset + 999).execute()
+            cust_rows.extend(batch.data or [])
+            if len(batch.data or []) < 1000:
+                break
+            offset += 1000
+
+        # Load item results
+        item_rows = []
+        offset = 0
+        while True:
+            batch = db.table("curation_run_items").select("*, items(name, sku, category)").eq("run_id", run_id).range(offset, offset + 999).execute()
+            item_rows.extend(batch.data or [])
+            if len(batch.data or []) < 1000:
+                break
+            offset += 1000
+
+        logger.info(f"[CURATION SHEET] Exporting report {report_month}: {len(cust_rows)} customers, {len(item_rows)} items")
+
+        def _push_curation_to_sheet():
+            try:
+                ws = get_gsheet()
+                if not ws:
+                    logger.error("[CURATION SHEET] Google Sheets not configured")
+                    return
+                spreadsheet = ws.spreadsheet
+
+                # ── Tab 1: Monthly Report Overview ──
+                tab1_name = f"Monthly Report - {report_month}"
+                try:
+                    tab1 = spreadsheet.worksheet(tab1_name)
+                    tab1.clear()
+                except Exception:
+                    tab1 = spreadsheet.add_worksheet(title=tab1_name, rows=50, cols=10)
+
+                overview_rows = [
+                    ["OBB Monthly Curation Report", report_month],
+                    ["Ship Date", executive.get("ship_date", "")],
+                    ["Generated", executive.get("generated_at", "")],
+                    ["Lookback Months", executive.get("lookback_months", 4)],
+                    [],
+                    ["Trimester", "Projected", "Covered", "Needs New", "Build Qty", "Leftover"],
+                ]
+                tri_data = executive.get("trimesters", {})
+                for tri_key in ["1", "2", "3", "4"]:
+                    td = tri_data.get(tri_key) or tri_data.get(int(tri_key), {})
+                    if td:
+                        overview_rows.append([
+                            f"T{tri_key}",
+                            td.get("projected_customers", 0),
+                            td.get("covered_by_existing", 0),
+                            td.get("needs_new_curation", 0),
+                            td.get("recommended_build_qty", 0),
+                            td.get("expected_leftover", 0),
+                        ])
+                tab1.update(overview_rows, "A1")
+
+                # ── Tab 2: Needs New Curation ──
+                tab2_name = f"Needs New - {report_month}"
+                needs_new = [c for c in cust_rows if c.get("needs_new_curation")]
+                try:
+                    tab2 = spreadsheet.worksheet(tab2_name)
+                    tab2.clear()
+                except Exception:
+                    tab2 = spreadsheet.add_worksheet(title=tab2_name, rows=max(len(needs_new) + 5, 10), cols=8)
+                nn_header = ["Name", "Email", "Platform", "Trimester", "Size", "Reason"]
+                nn_rows = [nn_header]
+                for c in needs_new:
+                    ci = c.get("customers", {}) or {}
+                    nn_rows.append([
+                        f"{ci.get('first_name', '')} {ci.get('last_name', '')}".strip(),
+                        ci.get("email", ""),
+                        ci.get("platform", ""),
+                        f"T{c.get('projected_trimester', '')}",
+                        ci.get("clothing_size", ""),
+                        c.get("reason", ""),
+                    ])
+                tab2.update(nn_rows, "A1")
+
+                # ── Tab 3: Existing Kit Safe ──
+                tab3_name = f"Existing Safe - {report_month}"
+                safe = [c for c in cust_rows if not c.get("needs_new_curation")]
+                try:
+                    tab3 = spreadsheet.worksheet(tab3_name)
+                    tab3.clear()
+                except Exception:
+                    tab3 = spreadsheet.add_worksheet(title=tab3_name, rows=max(len(safe) + 5, 10), cols=8)
+                safe_header = ["Name", "Email", "Platform", "Trimester", "Size", "Recommended Kit", "Alternatives"]
+                safe_rows = [safe_header]
+                for c in safe:
+                    ci = c.get("customers", {}) or {}
+                    alts = c.get("alternative_kit_skus", [])
+                    alt_str = ", ".join(alts) if isinstance(alts, list) else str(alts or "")
+                    safe_rows.append([
+                        f"{ci.get('first_name', '')} {ci.get('last_name', '')}".strip(),
+                        ci.get("email", ""),
+                        ci.get("platform", ""),
+                        f"T{c.get('projected_trimester', '')}",
+                        ci.get("clothing_size", ""),
+                        c.get("recommended_kit_sku", ""),
+                        alt_str,
+                    ])
+                tab3.update(safe_rows, "A1")
+
+                # ── Tab 4: Item Analysis ──
+                tab4_name = f"Items - {report_month}"
+                try:
+                    tab4 = spreadsheet.worksheet(tab4_name)
+                    tab4.clear()
+                except Exception:
+                    tab4 = spreadsheet.add_worksheet(title=tab4_name, rows=max(len(item_rows) + 5, 10), cols=8)
+                items_header = ["Item Name", "SKU", "Category", "Trimester", "Blocked Count", "Group Size", "Blocked %", "Risk Level"]
+                items_sheet_rows = [items_header]
+                for ir in item_rows:
+                    ii = ir.get("items", {}) or {}
+                    items_sheet_rows.append([
+                        ii.get("name", ""),
+                        ii.get("sku", ""),
+                        ii.get("category", ""),
+                        f"T{ir.get('trimester', '')}",
+                        ir.get("blocked_count", 0),
+                        ir.get("group_size", 0),
+                        ir.get("blocked_pct", 0),
+                        ir.get("risk_level", ""),
+                    ])
+                tab4.update(items_sheet_rows, "A1")
+
+                logger.info(f"[CURATION SHEET] Successfully exported 4 tabs for {report_month}")
+            except Exception as e:
+                logger.error(f"[CURATION SHEET] Error pushing to sheet: {e}", exc_info=True)
+
+        background_tasks.add_task(_push_curation_to_sheet)
+        await log_activity("export", f"Curation report {report_month} pushed to Google Sheets", f"run_id={run_id}", "success")
+        return RedirectResponse(
+            f"/curation-report/{run_id}?msg={quote(f'Exporting {report_month} report to Google Sheets...')}&msg_type=success",
+            status_code=303,
+        )
+    except Exception as e:
+        logger.error(f"[CURATION SHEET] Error: {e}", exc_info=True)
+        return RedirectResponse(f"/curation-report/{run_id}?msg={quote('Sheet export failed: ' + str(e))}&msg_type=error", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FORWARD PLANNER ROUTES (Phase 2 — Milestone 6)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@app.get("/forward-planner", response_class=HTMLResponse)
+async def forward_planner_page(request: Request, msg: str = "", msg_type: str = ""):
+    """Forward Planner page — shows form to generate projection + history of past runs."""
+    try:
+        logger.info("[PLANNER PAGE] Loading forward planner page")
+        from datetime import date as date_cls
+        today = date_cls.today()
+        if today.month == 12:
+            default_month = f"{today.year + 1}-01"
+        else:
+            default_month = f"{today.year}-{today.month + 1:02d}"
+
+        db = get_supabase()
+        all_items_res = db.table("items").select("id, name, sku, category").order("name").execute()
+        all_items = all_items_res.data or []
+
+        # Load projection history from DB
+        try:
+            runs_res = db.table("projection_runs").select("id, base_month, params, created_at, status").order("created_at", desc=True).limit(20).execute()
+            projection_runs = runs_res.data or []
+        except Exception:
+            projection_runs = []
+
+        return templates.TemplateResponse("forward_planner.html", {
+            "request": request,
+            "page": "forward-planner",
+            "msg": msg,
+            "msg_type": msg_type,
+            "projection": None,
+            "default_month": default_month,
+            "all_items": all_items,
+            "projection_runs": projection_runs,
+        })
+    except Exception as e:
+        logger.error(f"[PLANNER PAGE] Error: {e}", exc_info=True)
+        return templates.TemplateResponse("forward_planner.html", {
+            "request": request,
+            "page": "forward-planner",
+            "msg": f"Error: {e}",
+            "msg_type": "error",
+            "projection": None,
+            "default_month": "",
+            "all_items": [],
+            "projection_runs": [],
+        })
+
+
+@app.post("/forward-planner/generate")
+async def generate_forward_projection(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    base_month: str = Form(...),
+    horizon_months: int = Form(3),
+    ship_day: int = Form(14),
+    warehouse_min: int = Form(100),
+    recency_months: int = Form(3),
+    include_paused: str = Form(""),
+):
+    """Start forward projection as a background job.
+    Returns immediately (HTTP 303) to avoid Heroku's 30-second H12 timeout.
+    The client polls /forward-planner/job/{job_id}/status for completion.
+    """
+    paused = include_paused in ("1", "on", "true")
+    recency = recency_months if recency_months > 0 else None
+    params = {
+        "base_month": base_month,
+        "horizon_months": horizon_months,
+        "ship_day": ship_day,
+        "warehouse_min": warehouse_min,
+        "recency_months": recency,
+        "include_paused": paused,
+    }
+    job_id = _create_job("forward_planner", params)
+    logger.info(f"[PLANNER GEN] Started background job {job_id} for {base_month} horizon={horizon_months}")
+    background_tasks.add_task(_run_forward_planner_job, job_id, params)
+    return RedirectResponse(f"/forward-planner/job/{job_id}", status_code=303)
+
+
+def _run_forward_planner_job(job_id: str, params: dict):
+    """Background worker: runs the full forward projection and stores result in job registry and DB."""
+    try:
+        db = get_supabase()
+        base_month = params["base_month"]
+        logger.info(
+            f"[PLANNER JOB] {job_id} — Generating projection: base={base_month}, "
+            f"horizon={params['horizon_months']}, wh_min={params['warehouse_min']}, "
+            f"recency={params['recency_months']}"
+        )
+
+        projection = project_forward(
+            db=db,
+            base_month=base_month,
+            ship_day=params["ship_day"],
+            horizon_months=params["horizon_months"],
+            warehouse_minimum=params["warehouse_min"],
+            include_paused=params["include_paused"],
+            recency_months=params["recency_months"],
+        )
+
+        months_count = len(projection.get("months", {}))
+        warnings_count = len(projection.get("warnings", []))
+        logger.info(f"[PLANNER JOB] {job_id} — Completed: {months_count} months, {warnings_count} warnings")
+        _finish_job(job_id, {"projection": projection, "base_month": base_month})
+
+        # Persist to DB so history survives server restarts
+        try:
+            db.table("projection_runs").insert({
+                "id": job_id,
+                "base_month": base_month,
+                "params": params,
+                "result": {"projection": projection, "base_month": base_month},
+                "status": "done",
+            }).execute()
+            logger.info(f"[PLANNER JOB] {job_id} — Saved to projection_runs")
+        except Exception as db_err:
+            logger.warning(f"[PLANNER JOB] {job_id} — Could not save to DB (table may not exist yet): {db_err}")
+
+    except Exception as e:
+        logger.error(f"[PLANNER JOB] {job_id} — Error: {e}", exc_info=True)
+        _fail_job(job_id, str(e)[:500])
+
+
+@app.get("/forward-planner/job/{job_id}", response_class=HTMLResponse)
+async def forward_planner_job_page(request: Request, job_id: str):
+    """Loading/result page for a forward planner background job."""
+    job = _get_job(job_id)
+
+    # If not in memory (server restarted), try loading from DB
+    if not job:
+        try:
+            db = get_supabase()
+            run_res = db.table("projection_runs").select("*").eq("id", job_id).single().execute()
+            if run_res.data:
+                run = run_res.data
+                projection = run["result"]["projection"]
+                base_month = run["result"]["base_month"]
+                try:
+                    all_items_res = db.table("items").select("id, name, sku, category").order("name").execute()
+                    all_items = all_items_res.data or []
+                except Exception:
+                    all_items = []
+                return templates.TemplateResponse("forward_planner.html", {
+                    "request": request,
+                    "page": "forward-planner",
+                    "msg": f"Projection for {base_month} (loaded from history)",
+                    "msg_type": "success",
+                    "projection": projection,
+                    "default_month": base_month,
+                    "all_items": all_items,
+                    "projection_runs": [],
+                })
+        except Exception:
+            pass
+        return RedirectResponse("/forward-planner?msg=Job+not+found&msg_type=error", status_code=303)
+
+    if job["status"] == "done":
+        projection = job["result"]["projection"]
+        base_month = job["result"]["base_month"]
+        try:
+            db = get_supabase()
+            all_items_res = db.table("items").select("id, name, sku, category").order("name").execute()
+            all_items = all_items_res.data or []
+        except Exception:
+            all_items = []
+        return templates.TemplateResponse("forward_planner.html", {
+            "request": request,
+            "page": "forward-planner",
+            "msg": "Projection generated successfully",
+            "msg_type": "success",
+            "projection": projection,
+            "default_month": base_month,
+            "all_items": all_items,
+            "projection_runs": [],
+        })
+
+    if job["status"] == "error":
+        return templates.TemplateResponse("job_loading.html", {
+            "request": request,
+            "job_id": job_id,
+            "job_type": "Forward Planner",
+            "status": "error",
+            "error": job["error"],
+            "cancel_url": "/forward-planner",
+            "page": "forward-planner",
+        })
+
+    # Still running — show loading page
+    return templates.TemplateResponse("job_loading.html", {
+        "request": request,
+        "job_id": job_id,
+        "job_type": "Forward Planner",
+        "status": "running",
+        "error": None,
+        "cancel_url": "/forward-planner",
+        "page": "forward-planner",
+        "params": job["params"],
+    })
+
+
+@app.get("/forward-planner/job/{job_id}/status")
+async def forward_planner_job_status(job_id: str):
+    """JSON status endpoint for polling. Used by the loading page."""
+    job = _get_job(job_id)
+    if not job:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+    return JSONResponse({
+        "status": job["status"],
+        "error": job["error"],
+        "redirect_url": f"/forward-planner/job/{job_id}" if job["status"] == "done" else None,
+    })
+
+
+@app.post("/forward-planner/{run_id}/delete")
+async def delete_projection_run(run_id: str):
+    """Delete a projection run from history."""
+    try:
+        db = get_supabase()
+        db.table("projection_runs").delete().eq("id", run_id).execute()
+        logger.info(f"[PLANNER DELETE] Deleted projection run {run_id}")
+    except Exception as e:
+        logger.error(f"[PLANNER DELETE] Error deleting run {run_id}: {e}", exc_info=True)
+    return RedirectResponse("/forward-planner?msg=Projection+deleted&msg_type=success", status_code=303)
+
+
+
+
+@app.post("/forward-planner/commit-items")
+async def commit_items(
+    request: Request,
+    report_month: str = Form(...),
+    trimester: int = Form(...),
+    item_ids: str = Form(""),
+):
+    """Commit curated items for a specific month/trimester."""
+    try:
+        db = get_supabase()
+        # Parse comma-separated UUIDs
+        raw_ids = [x.strip() for x in item_ids.split(",") if x.strip()]
+        if not raw_ids:
+            return RedirectResponse(
+                f"/forward-planner?msg={quote('No item IDs provided')}&msg_type=error",
+                status_code=303,
+            )
+
+        logger.info(f"[PLANNER COMMIT] Committing {len(raw_ids)} items for {report_month} T{trimester}")
+
+        # Validate item IDs exist
+        valid_items = db.table("items").select("id").in_("id", raw_ids).execute()
+        valid_ids = {i["id"] for i in (valid_items.data or [])}
+        invalid = [x for x in raw_ids if x not in valid_ids]
+        if invalid:
+            logger.warning(f"[PLANNER COMMIT] Invalid item IDs: {invalid}")
+            return RedirectResponse(
+                f"/forward-planner?msg={quote(f'Invalid item IDs: {invalid[:3]}')}&msg_type=error",
+                status_code=303,
+            )
+
+        # Upsert committed items
+        rows = [
+            {
+                "report_month": report_month,
+                "trimester": trimester,
+                "item_id": iid,
+            }
+            for iid in valid_ids
+        ]
+        db.table("curation_committed_items").upsert(
+            rows, on_conflict="report_month,trimester,item_id"
+        ).execute()
+
+        logger.info(f"[PLANNER COMMIT] Committed {len(rows)} items for {report_month} T{trimester}")
+        await log_activity("forward_planner", f"Committed {len(rows)} items for {report_month} T{trimester}", "", "success")
+
+        return RedirectResponse(
+            f"/forward-planner?msg={quote(f'Committed {len(rows)} items for {report_month} T{trimester}')}&msg_type=success",
+            status_code=303,
+        )
+
+    except Exception as e:
+        logger.error(f"[PLANNER COMMIT] Error: {e}", exc_info=True)
+        return RedirectResponse(
+            f"/forward-planner?msg={quote(f'Error: {e}')}&msg_type=error",
+            status_code=303,
+        )
+
+
+@app.post("/forward-planner/clear-committed")
+async def clear_committed_items(
+    request: Request,
+    report_month: str = Form(...),
+):
+    """Clear all committed items for a specific month."""
+    try:
+        db = get_supabase()
+        logger.info(f"[PLANNER CLEAR] Clearing committed items for {report_month}")
+
+        result = db.table("curation_committed_items") \
+            .delete() \
+            .eq("report_month", report_month) \
+            .execute()
+
+        deleted = len(result.data or [])
+        logger.info(f"[PLANNER CLEAR] Cleared {deleted} committed items for {report_month}")
+        await log_activity("forward_planner", f"Cleared {deleted} committed items for {report_month}", "", "success")
+
+        return RedirectResponse(
+            f"/forward-planner?msg={quote(f'Cleared committed items for {report_month}')}&msg_type=success",
+            status_code=303,
+        )
+
+    except Exception as e:
+        logger.error(f"[PLANNER CLEAR] Error: {e}", exc_info=True)
+        return RedirectResponse(
+            f"/forward-planner?msg={quote(f'Error: {e}')}&msg_type=error",
+            status_code=303,
+        )
+
+
+# ─── Start the monthly scheduler ───
+_start_scheduler()
 
 
 if __name__ == "__main__":
