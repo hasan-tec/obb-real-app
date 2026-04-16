@@ -6,15 +6,21 @@ Specifically addressing user concerns:
 3. Are ALL numbers correct?
 """
 import os, logging
-os.environ['SUPABASE_URL'] = 'https://tkcvvjxmzfjaesdhyfiy.supabase.co'
-os.environ['SUPABASE_SERVICE_ROLE_KEY'] = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRrY3Z2anhtemZqYWVzZGh5Zml5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUzOTg1MSwiZXhwIjoyMDkwMTE1ODUxfQ.3rktaVHiFesZ0RU7BUcULZ9bBfO0r6wOGJqMK60a-7Q'
+from dotenv import load_dotenv
 logging.disable(logging.CRITICAL)
+
+load_dotenv()
 
 from supabase import create_client
 from datetime import date, timedelta
 from collections import Counter, defaultdict
 
-db = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_ROLE_KEY'])
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tkcvvjxmzfjaesdhyfiy.supabase.co")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Missing SUPABASE_SERVICE_ROLE_KEY in environment")
+
+db = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 ship_date = date(2026, 5, 14)
 t4_cutoff = ship_date + timedelta(days=19)   # 2026-06-02

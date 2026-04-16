@@ -19,10 +19,13 @@ import json
 import logging
 import argparse
 from collections import defaultdict
+from dotenv import load_dotenv
 
-os.environ.setdefault("SUPABASE_URL", "https://tkcvvjxmzfjaesdhyfiy.supabase.co")
-os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRrY3Z2anhtemZqYWVzZGh5Zml5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUzOTg1MSwiZXhwIjoyMDkwMTE1ODUxfQ.3rktaVHiFesZ0RU7BUcULZ9bBfO0r6wOGJqMK60a-7Q")
+load_dotenv()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tkcvvjxmzfjaesdhyfiy.supabase.co")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Missing SUPABASE_SERVICE_ROLE_KEY in environment")
 
 from supabase import create_client
 
@@ -59,7 +62,7 @@ def main():
         print("\nError: must specify --dry-run or --execute")
         sys.exit(1)
 
-    db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+    db = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
     # Load kit_items
     logger.info("[LOAD] Loading kit_items...")

@@ -29,11 +29,14 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 from collections import defaultdict
+from dotenv import load_dotenv
 
 # ── Environment ──────────────────────────────────────────────────────────────
-os.environ.setdefault("SUPABASE_URL", "https://tkcvvjxmzfjaesdhyfiy.supabase.co")
-os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRrY3Z2anhtemZqYWVzZGh5Zml5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUzOTg1MSwiZXhwIjoyMDkwMTE1ODUxfQ.3rktaVHiFesZ0RU7BUcULZ9bBfO0r6wOGJqMK60a-7Q")
+load_dotenv()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tkcvvjxmzfjaesdhyfiy.supabase.co")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Missing SUPABASE_SERVICE_ROLE_KEY in environment")
 
 from supabase import create_client
 
@@ -804,7 +807,7 @@ def main():
     csv_customers, csv_shipments, csv_kit_skus = parse_all_csvs()
 
     # Phase 2: Load DB
-    db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+    db = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     db_state = load_db_state(db)
 
     # Phase 3: Audits

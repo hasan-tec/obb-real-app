@@ -3,13 +3,18 @@ Cross-verification script: Is 1604 renewals correct?
 Checking DB counts, statuses, and whether the logic is right.
 """
 import os
-os.environ['SUPABASE_URL'] = 'https://tkcvvjxmzfjaesdhyfiy.supabase.co'
-os.environ['SUPABASE_SERVICE_ROLE_KEY'] = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRrY3Z2anhtemZqYWVzZGh5Zml5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUzOTg1MSwiZXhwIjoyMDkwMTE1ODUxfQ.3rktaVHiFesZ0RU7BUcULZ9bBfO0r6wOGJqMK60a-7Q'
+from dotenv import load_dotenv
 from supabase import create_client
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-db = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_ROLE_KEY'])
+load_dotenv()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://tkcvvjxmzfjaesdhyfiy.supabase.co")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Missing SUPABASE_SERVICE_ROLE_KEY in environment")
+
+db = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ═══════════════════════════════════════════════════════
 # 1. TOTAL CUSTOMERS IN DB
