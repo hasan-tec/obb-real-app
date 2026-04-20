@@ -11,3 +11,5 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+logs/
+*.log
