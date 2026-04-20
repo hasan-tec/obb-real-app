@@ -774,10 +774,10 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
         filtered = [k for k in available_kits if k.get("is_universal") or k["size_variant"] == customer_variant]
         logger.info(f"[DECISION ENGINE] Size filter: clothing_size={clothing_size}, customer_variant={customer_variant}")
     else:
-        # No size info → universal kits + size_variant=1 (S/default variant)
-        # size_variant=1 kits with is_universal=False contain no sized items (verified); safe for any customer
-        filtered = [k for k in available_kits if k.get("is_universal") or k["size_variant"] == 1]
-        logger.info(f"[DECISION ENGINE] No size on record → universal + variant-1 kits ({len(filtered)} available)")
+        # No size info → universal kits ONLY
+        # size_variant=1 with is_universal=False are S-only kits — wrong to assign to unknown-size customers
+        filtered = [k for k in available_kits if k.get("is_universal")]
+        logger.info(f"[DECISION ENGINE] No size on record → universal-only kits ({len(filtered)} available)")
 
     logger.info(f"[DECISION ENGINE] After size filter: {len(filtered)} kits (customer size: {clothing_size or 'universal-only'})")
 
@@ -5536,7 +5536,7 @@ async def export_decisions_csv(request: Request):
         writer = csv.writer(output)
         writer.writerow([
             "Name", "Email", "Address Line 1", "Address Line 2",
-            "City", "State", "Zip", "Country", "Phone",
+            "City", "State/Province", "Zip", "Country", "Phone",
             "Order Number", "Kit SKU", "Trimester",
             "Weight (oz)", "Length (in)", "Width (in)", "Height (in)",
         ])

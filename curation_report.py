@@ -341,8 +341,8 @@ def evaluate_existing_kit_coverage(
         customer_variant = size_to_variant.get(clothing_size, 1)
         size_filtered = [k for k in available_kits if k.get("is_universal") or k["size_variant"] == customer_variant]
     else:
-        # NULL size → universal + variant-1 (same fix as C2)
-        size_filtered = [k for k in available_kits if k.get("is_universal") or k["size_variant"] == 1]
+        # NULL size → universal kits ONLY (S-only kits with variant=1 should not go to unknown-size customers)
+        size_filtered = [k for k in available_kits if k.get("is_universal")]
 
     if not size_filtered:
         return {
