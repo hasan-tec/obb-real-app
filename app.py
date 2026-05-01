@@ -68,6 +68,49 @@ SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "")
 CRATEJOY_CLIENT_ID = os.getenv("CRATEJOY_CLIENT_ID", "")
 CRATEJOY_CLIENT_SECRET = os.getenv("CRATEJOY_CLIENT_SECRET", "")
 
+# ─── VeraCore config (Phase 3 — fulfillment push) ───
+# When VERACORE_BASE_URL is empty/unset, all VeraCore calls become no-ops and
+# the app routes approved decisions to the CSV fallback instead.  This is how
+# local-dev + creds-pending periods stay functional.
+VERACORE_BASE_URL   = os.getenv("VERACORE_BASE_URL", "").rstrip("/")
+VERACORE_USER_ID    = os.getenv("VERACORE_USER_ID", "")
+VERACORE_PASSWORD   = os.getenv("VERACORE_PASSWORD", "")
+VERACORE_SYSTEM_ID  = os.getenv("VERACORE_SYSTEM_ID", "")
+VERACORE_AUTH_MODE  = os.getenv("VERACORE_AUTH_MODE", "basic")  # basic | base64_json | oauth2
+# Optional endpoint-path overrides (match Ting's tenant Swagger if non-standard).
+VERACORE_INVENTORY_PATH = os.getenv("VERACORE_INVENTORY_PATH", "/inventory")
+VERACORE_ORDER_PATH     = os.getenv("VERACORE_ORDER_PATH", "/orders")
+VERACORE_SHIPMENT_PATH  = os.getenv("VERACORE_SHIPMENT_PATH", "/shipments")
+
+_vc_client = None
+
+def veracore_enabled() -> bool:
+    """True when creds are configured and live VeraCore calls should fire."""
+    return bool(VERACORE_BASE_URL and VERACORE_USER_ID and VERACORE_PASSWORD)
+
+def get_veracore_client():
+    """
+    Lazy-init VeraCoreClient.  Returns None when creds are missing — callers
+    MUST handle that (they do — submit_to_veracore short-circuits to no-op).
+    """
+    global _vc_client
+    if not veracore_enabled():
+        return None
+    if _vc_client is None:
+        from veracore_client import VeraCoreClient
+        logger.info("[VERACORE] Initializing client for base_url=%s", VERACORE_BASE_URL)
+        _vc_client = VeraCoreClient(
+            base_url=VERACORE_BASE_URL,
+            user_id=VERACORE_USER_ID,
+            password=VERACORE_PASSWORD,
+            system_id=VERACORE_SYSTEM_ID,
+            auth_mode=VERACORE_AUTH_MODE,
+            inventory_path=VERACORE_INVENTORY_PATH,
+            order_path=VERACORE_ORDER_PATH,
+            shipment_path=VERACORE_SHIPMENT_PATH,
+        )
+    return _vc_client
+
 # ─── App config ───
 BASE_URL = os.getenv("BASE_URL", "https://obb-real-d4e16a8bb2ff.herokuapp.com")
 
@@ -248,6 +291,8 @@ def _monthly_report_scheduler():
     """Background thread that checks once per hour if it's the 1st and triggers the report."""
     import time as _time
     last_run_month = None
+    last_inventory_day = None  # Phase 3 — daily VeraCore inventory sync guard
+    last_shipment_poll_day = None  # Phase 3 — daily VeraCore shipment poll guard
     while True:
         try:
             now = datetime.utcnow()
@@ -286,6 +331,40 @@ def _monthly_report_scheduler():
                     last_run_month = current_month_key
                 except Exception as e:
                     logger.error(f"[SCHEDULER] Failed to auto-generate report: {e}", exc_info=True)
+
+            # Phase 3 — Daily VeraCore inventory sync at ~04:00 UTC (≈11 PM ET).
+            # Skipped entirely when VeraCore is not configured.
+            current_day_key = now.strftime("%Y-%m-%d")
+            if (veracore_enabled()
+                    and now.hour == 4
+                    and last_inventory_day != current_day_key):
+                logger.info("[SCHEDULER] Daily VeraCore inventory sync triggered for %s", current_day_key)
+                try:
+                    db = get_supabase()
+                    vc = get_veracore_client()
+                    if vc is not None:
+                        from veracore_sync import run_inventory_sync
+                        inv_result = run_inventory_sync(db, vc)
+                        logger.info("[SCHEDULER] Inventory sync result: %s", inv_result)
+                    last_inventory_day = current_day_key
+                except Exception as e:
+                    logger.error("[SCHEDULER] VeraCore inventory sync failed: %s", e, exc_info=True)
+
+            # Phase 3 — Daily VeraCore shipment poll at ~05:00 UTC (1 hour after inventory).
+            if (veracore_enabled()
+                    and now.hour == 5
+                    and last_shipment_poll_day != current_day_key):
+                logger.info("[SCHEDULER] Daily VeraCore shipment poll triggered for %s", current_day_key)
+                try:
+                    db = get_supabase()
+                    vc = get_veracore_client()
+                    if vc is not None:
+                        from veracore_sync import run_shipment_poll
+                        poll_result = run_shipment_poll(db, vc)
+                        logger.info("[SCHEDULER] Shipment poll result: %s", poll_result)
+                    last_shipment_poll_day = current_day_key
+                except Exception as e:
+                    logger.error("[SCHEDULER] VeraCore shipment poll failed: %s", e, exc_info=True)
         except Exception as e:
             logger.error(f"[SCHEDULER] Scheduler loop error: {e}", exc_info=True)
         _time.sleep(3600)  # Check every hour
@@ -1789,6 +1868,28 @@ async def dashboard(request: Request):
         # Recent activity
         activity = db.table("activity_log").select("*").order("created_at", desc=True).limit(10).execute()
 
+        # Phase 3 — VeraCore mini stats (safe if migration not applied yet)
+        vc_pending_push = 0
+        vc_failed       = 0
+        vc_last_sync    = None
+        try:
+            vc_rows = db.table("decisions").select("status, veracore_status").execute().data or []
+            for r in vc_rows:
+                if r.get("status") == "approved" and not r.get("veracore_status"):
+                    vc_pending_push += 1
+                if r.get("veracore_status") == "failed":
+                    vc_failed += 1
+            last = (db.table("veracore_sync_log")
+                      .select("run_at")
+                      .eq("status", "ok")
+                      .eq("sync_type", "inventory")
+                      .order("run_at", desc=True)
+                      .limit(1)
+                      .execute().data or [])
+            vc_last_sync = last[0]["run_at"] if last else None
+        except Exception as vc_err:
+            logger.debug("[DASHBOARD] VC widget skipped (migration 012?): %s", vc_err)
+
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
             "total_customers": total_customers,
@@ -1802,6 +1903,10 @@ async def dashboard(request: Request):
             "total_kits": total_kits,
             "total_kit_units": total_kit_units,
             "recent_activity": activity.data or [],
+            "vc_enabled":      veracore_enabled(),
+            "vc_pending_push": vc_pending_push,
+            "vc_failed":       vc_failed,
+            "vc_last_sync":    vc_last_sync,
             "page": "dashboard",
         })
     except Exception as e:
@@ -1813,6 +1918,7 @@ async def dashboard(request: Request):
             "total_decisions": 0, "pending_decisions": 0,
             "total_kits": 0, "total_kit_units": 0,
             "recent_activity": [],
+            "vc_enabled": False, "vc_pending_push": 0, "vc_failed": 0, "vc_last_sync": None,
             "error": str(e),
             "page": "dashboard",
         })
@@ -2861,6 +2967,17 @@ async def kits_page(request: Request):
         # Get all items for the kit creation form
         all_items = db.table("items").select("*").order("name").execute()
 
+        # Phase 3 — unresolved low-stock alerts from VeraCore inventory sync
+        stock_alerts = []
+        try:
+            alerts_res = db.table("kit_stock_alerts").select(
+                "id, kit_id, seen_qty, threshold, alerted_at, kits(sku, name)"
+            ).eq("resolved", False).order("alerted_at", desc=True).execute()
+            stock_alerts = alerts_res.data or []
+        except Exception as alert_err:
+            # Table may not exist if migration 012 hasn't been applied yet.
+            logger.warning("[KITS PAGE] Could not load stock alerts (migration 012 applied?): %s", alert_err)
+
         return templates.TemplateResponse("kits.html", {
             "request": request,
             "kits": all_kits,           # kept for backwards compat
@@ -2868,6 +2985,7 @@ async def kits_page(request: Request):
             "regular_kits": regular_kits,
             "kit_item_counts": kit_item_counts,
             "all_items": all_items.data or [],
+            "stock_alerts": stock_alerts,
             "msg": msg,
             "msg_type": msg_type,
             "page": "kits",
@@ -2883,6 +3001,7 @@ async def kits_page(request: Request):
             "regular_kits": [],
             "kit_item_counts": {},
             "all_items": [],
+            "stock_alerts": [],
             "error": str(e),
             "msg": "",
             "msg_type": "error",
@@ -4742,6 +4861,144 @@ async def test_webhook_cratejoy(request: Request):
 # DECISION APPROVAL / REJECT / SHIP
 # ═══════════════════════════════════════════════════════════
 
+# ─── VeraCore submission helper (Phase 3) ───────────────────
+
+def _build_ship_to_from_customer(c: dict) -> dict:
+    """Extract a VeraCore-shaped ship_to block from a customers row."""
+    from veracore_client import normalize_country
+    name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip() or c.get("email", "")
+    return {
+        "name":     name,
+        "address1": c.get("address_line1", "") or "",
+        "address2": c.get("address_line2", "") or "",
+        "city":     c.get("city", "") or "",
+        "state":    c.get("province", "") or "",
+        "zip":      c.get("zip") or c.get("zip_code", "") or "",
+        "country":  normalize_country(c.get("country")),
+        "phone":    c.get("phone", "") or "",
+    }
+
+
+def submit_to_veracore(decision_id: str) -> dict:
+    """
+    Push an approved decision to VeraCore as a warehouse order.
+
+    Guarantees:
+      - No-op when VERACORE_BASE_URL is empty → CSV fallback picks it up later.
+      - Idempotent: if decisions.veracore_order_id is already set, we skip.
+      - Always writes a row to veracore_sync_log (success OR failure).
+      - Never raises — callers can trust a return dict.
+
+    Returns: {status: 'skipped'|'noop'|'submitted'|'failed'|'already_submitted',
+              order_id: str|None, error: str|None}
+    """
+    from veracore_client import VeraCoreError, build_customs, pick_shipping_method
+    from veracore_sync import log_sync
+
+    db = get_supabase()
+
+    # Fetch decision + customer + kit in one round-trip (Supabase embed).
+    try:
+        d_res = db.table("decisions").select(
+            "*, customers(*), kits(id, sku, veracore_sku, cost_per_kit, name)"
+        ).eq("id", decision_id).single().execute()
+    except Exception as e:
+        logger.error("[VERACORE SUBMIT] Could not load decision %s: %s", decision_id, e)
+        return {"status": "failed", "order_id": None, "error": f"load failed: {e}"}
+
+    d = d_res.data
+    if not d:
+        logger.warning("[VERACORE SUBMIT] Decision %s not found", decision_id)
+        return {"status": "failed", "order_id": None, "error": "decision not found"}
+
+    # ── Short-circuits ──────────────────────────────────────
+    if d.get("veracore_order_id"):
+        logger.info("[VERACORE SUBMIT] %s already has veracore_order_id=%s — skipping (idempotent)",
+                    decision_id, d["veracore_order_id"])
+        return {"status": "already_submitted", "order_id": d["veracore_order_id"], "error": None}
+
+    if not veracore_enabled():
+        logger.info("[VERACORE SUBMIT] VERACORE_BASE_URL empty — no-op (CSV fallback will handle)")
+        return {"status": "noop", "order_id": None, "error": None}
+
+    kit      = d.get("kits") or {}
+    customer = d.get("customers") or {}
+    if not kit:
+        logger.warning("[VERACORE SUBMIT] %s has no kit — cannot submit", decision_id)
+        return {"status": "skipped", "order_id": None, "error": "no kit"}
+    if not customer:
+        logger.warning("[VERACORE SUBMIT] %s has no customer — cannot submit", decision_id)
+        return {"status": "skipped", "order_id": None, "error": "no customer"}
+
+    vc = get_veracore_client()
+    if vc is None:
+        return {"status": "noop", "order_id": None, "error": None}
+
+    ship_to         = _build_ship_to_from_customer(customer)
+    is_intl         = ship_to["country"] != "US"
+    shipping_method = pick_shipping_method(ship_to["country"])
+    offer_id        = kit.get("veracore_sku") or kit.get("sku")
+    order_public_id = d.get("order_id") or f"OBB-{decision_id[:8]}"
+    comments        = f"Kit {kit.get('sku','?')} | T{d.get('trimester','?')} | decision {decision_id[:8]}"
+
+    request_payload = {
+        "order_id":         order_public_id,
+        "ship_to":          ship_to,
+        "line_items":       [{"offer_id": offer_id, "quantity": 1}],
+        "shipping_method":  shipping_method,
+        "comments":         comments,
+        "is_international": is_intl,
+    }
+
+    try:
+        resp = vc.add_order(
+            order_id=order_public_id,
+            ship_to=ship_to,
+            line_items=[{"offer_id": offer_id, "quantity": 1}],
+            shipping_method=shipping_method,
+            comments=comments,
+            customs=build_customs(kit) if is_intl else None,
+        )
+        internal_id = resp.get("veracore_internal_id") or order_public_id
+        db.table("decisions").update({
+            "veracore_order_id":     internal_id,
+            "veracore_status":       "submitted",
+            "veracore_submitted_at": datetime.utcnow().isoformat(),
+            "veracore_last_error":   None,
+        }).eq("id", decision_id).execute()
+        log_sync(db, "order_submit", decision_id, request_payload, resp, "ok")
+        logger.info("[VERACORE SUBMIT] ✅ decision=%s VC id=%s", decision_id, internal_id)
+        return {"status": "submitted", "order_id": internal_id, "error": None}
+
+    except VeraCoreError as e:
+        err = f"{e} (HTTP {e.status_code})" if e.status_code else str(e)
+        logger.error("[VERACORE SUBMIT] ❌ decision=%s: %s", decision_id, err)
+        try:
+            db.table("decisions").update({
+                "veracore_status":     "failed",
+                "veracore_last_error": err[:500],
+            }).eq("id", decision_id).execute()
+        except Exception as db_err:
+            logger.error("[VERACORE SUBMIT] Failed to mark decision failed: %s", db_err)
+        log_sync(db, "order_submit", decision_id, request_payload,
+                 {"body": e.response_body} if e.response_body else None,
+                 "fail", err)
+        return {"status": "failed", "order_id": None, "error": err}
+
+    except Exception as e:
+        err = f"unexpected: {e}"
+        logger.error("[VERACORE SUBMIT] ❌ decision=%s: %s", decision_id, err, exc_info=True)
+        try:
+            db.table("decisions").update({
+                "veracore_status":     "failed",
+                "veracore_last_error": err[:500],
+            }).eq("id", decision_id).execute()
+        except Exception:
+            pass
+        log_sync(db, "order_submit", decision_id, request_payload, None, "fail", err)
+        return {"status": "failed", "order_id": None, "error": err}
+
+
 @app.post("/decisions/{decision_id}/approve")
 async def approve_decision(request: Request, decision_id: str):
     """
@@ -4815,6 +5072,34 @@ async def approve_decision(request: Request, decision_id: str):
             new_status="approved",
             reason_prefix="Approved",
         )
+
+        # Phase 3 — Push to VeraCore (no-op when creds missing → CSV fallback).
+        # Idempotent on retry; always writes to veracore_sync_log.
+        # Staff can explicitly route to Pirate Ship CSV by adding ?via=pirateship
+        # to the approve URL — in that case we skip VC and mark status='manual'
+        # so the CSV export picks it up and the VeraCore column shows it clearly.
+        via = (request.query_params.get("via") or "").lower()
+        if via == "pirateship":
+            try:
+                db.table("decisions").update({
+                    "veracore_status": "manual",
+                    "veracore_last_error": None,
+                }).eq("id", decision_id).execute()
+                logger.info("[APPROVE] decision=%s routed to Pirate Ship (VC push skipped)", decision_id)
+                await log_activity("veracore",
+                                   f"Approved via Pirate Ship for {cust_email}",
+                                   f"Kit: {d.get('kit_sku', '—')} — VC push skipped",
+                                   "info")
+            except Exception as ps_err:
+                logger.error("[APPROVE] Failed to mark manual route: %s", ps_err)
+        else:
+            try:
+                vc_result = submit_to_veracore(decision_id)
+                logger.info("[APPROVE] VeraCore push: %s", vc_result)
+            except Exception as vc_err:
+                # Never let VeraCore failure break the approve request — helper catches
+                # everything, but double-guard just in case.
+                logger.error("[APPROVE] VeraCore push raised unexpectedly: %s", vc_err, exc_info=True)
     except Exception as e:
         logger.error(f"[APPROVE] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to approve decision: {e}", "", "error")
@@ -4849,6 +5134,204 @@ async def reject_decision(request: Request, decision_id: str):
     except Exception as e:
         logger.error(f"[REJECT] Error: {e}", exc_info=True)
     return RedirectResponse("/decisions", status_code=303)
+
+
+@app.post("/decisions/{decision_id}/veracore-retry")
+async def veracore_retry_decision(request: Request, decision_id: str):
+    """
+    Retry a failed VeraCore submission for a single decision.
+    Clears veracore_last_error, then re-runs submit_to_veracore (which is idempotent
+    — if a VC order ID is already set, it skips cleanly, preventing duplicates).
+    """
+    try:
+        db = get_supabase()
+        d_res = db.table("decisions").select(
+            "id, veracore_status, veracore_last_error, veracore_order_id"
+        ).eq("id", decision_id).single().execute()
+        if not d_res.data:
+            return JSONResponse({"error": "Decision not found"}, status_code=404)
+
+        logger.info("[VC RETRY] decision=%s current_status=%s order_id=%s",
+                    decision_id, d_res.data.get("veracore_status"),
+                    d_res.data.get("veracore_order_id"))
+
+        # Clear previous error so UI shows a fresh attempt.
+        db.table("decisions").update({"veracore_last_error": None}).eq("id", decision_id).execute()
+
+        result = submit_to_veracore(decision_id)
+        logger.info("[VC RETRY] decision=%s result=%s", decision_id, result)
+        await log_activity(
+            "veracore",
+            f"VeraCore retry for decision {decision_id[:8]}: {result['status']}",
+            (result.get("error") or "")[:200],
+            "success" if result["status"] in ("submitted", "already_submitted") else "warning",
+        )
+    except Exception as e:
+        logger.error("[VC RETRY] Error: %s", e, exc_info=True)
+        await log_activity("veracore", f"VeraCore retry failed: {e}", "", "error")
+    return RedirectResponse("/decisions", status_code=303)
+
+
+# ═══════════════════════════════════════════════════════════
+# VERACORE OPS PAGE + MANUAL TRIGGERS (Phase 3 UI)
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/veracore", response_class=HTMLResponse)
+async def veracore_ops_page(request: Request):
+    """
+    VeraCore ops dashboard — the staff's one-stop view of what the fulfillment
+    integration is doing.  Shows connection status, recent syncs, failed submits
+    (with retry buttons), and manual trigger buttons.
+    """
+    try:
+        db = get_supabase()
+        msg      = request.query_params.get("msg", "")
+        msg_type = request.query_params.get("msg_type", "success")
+
+        # Counts for the status tiles.
+        approved_count      = 0
+        pending_push_count  = 0
+        submitted_count     = 0
+        failed_count        = 0
+        shipped_count       = 0
+        try:
+            status_rows = db.table("decisions").select("status, veracore_status").execute().data or []
+            for r in status_rows:
+                s  = r.get("status")
+                vs = r.get("veracore_status")
+                if s == "approved" and not vs:
+                    pending_push_count += 1
+                if vs == "submitted":
+                    submitted_count += 1
+                elif vs == "failed":
+                    failed_count += 1
+                elif vs == "shipped":
+                    shipped_count += 1
+                if s == "approved":
+                    approved_count += 1
+        except Exception as e:
+            logger.warning("[VC OPS] counts failed: %s", e)
+
+        # Recent sync log (last 50).
+        recent_syncs = []
+        try:
+            recent_syncs = (db.table("veracore_sync_log")
+                              .select("id, run_at, sync_type, status, error, request, response, decision_id")
+                              .order("run_at", desc=True)
+                              .limit(50)
+                              .execute().data or [])
+        except Exception as e:
+            logger.warning("[VC OPS] sync_log fetch failed (migration 012 applied?): %s", e)
+
+        # Last successful inventory + shipment sync timestamps.
+        last_inventory = None
+        last_shipment  = None
+        for s in recent_syncs:
+            if s["status"] == "ok" and s["sync_type"] == "inventory" and last_inventory is None:
+                last_inventory = s["run_at"]
+            if s["status"] == "ok" and s["sync_type"] == "shipment_poll" and last_shipment is None:
+                last_shipment = s["run_at"]
+            if last_inventory and last_shipment:
+                break
+
+        # Failed submit list w/ retry buttons.
+        failed_decisions = []
+        try:
+            fd = (db.table("decisions")
+                    .select("id, order_id, kit_sku, veracore_last_error, veracore_submitted_at, customers(email, first_name, last_name)")
+                    .eq("veracore_status", "failed")
+                    .order("veracore_submitted_at", desc=True, nullsfirst=False)
+                    .limit(30)
+                    .execute().data or [])
+            failed_decisions = fd
+        except Exception as e:
+            logger.warning("[VC OPS] failed decisions fetch failed: %s", e)
+
+        return templates.TemplateResponse("veracore.html", {
+            "request":          request,
+            "page":             "veracore",
+            "enabled":          veracore_enabled(),
+            "base_url":         VERACORE_BASE_URL,
+            "auth_mode":        VERACORE_AUTH_MODE,
+            "system_id":        VERACORE_SYSTEM_ID,
+            "last_inventory":   last_inventory,
+            "last_shipment":    last_shipment,
+            "approved_count":   approved_count,
+            "pending_push_count": pending_push_count,
+            "submitted_count":  submitted_count,
+            "failed_count":     failed_count,
+            "shipped_count":    shipped_count,
+            "recent_syncs":     recent_syncs,
+            "failed_decisions": failed_decisions,
+            "msg":              msg,
+            "msg_type":         msg_type,
+        })
+    except Exception as e:
+        logger.error("[VC OPS] Error: %s", e, exc_info=True)
+        return templates.TemplateResponse("veracore.html", {
+            "request": request, "page": "veracore",
+            "enabled": False, "base_url": "", "auth_mode": "", "system_id": "",
+            "last_inventory": None, "last_shipment": None,
+            "approved_count": 0, "pending_push_count": 0, "submitted_count": 0,
+            "failed_count": 0, "shipped_count": 0,
+            "recent_syncs": [], "failed_decisions": [],
+            "error": str(e), "msg": "", "msg_type": "error",
+        })
+
+
+@app.post("/veracore/sync-inventory-now")
+async def veracore_sync_inventory_now(request: Request):
+    """Manually trigger a VeraCore inventory sync (off-schedule)."""
+    try:
+        if not veracore_enabled():
+            return RedirectResponse("/veracore?msg=VeraCore+not+configured+(env+vars+missing)&msg_type=error",
+                                    status_code=303)
+        db = get_supabase()
+        vc = get_veracore_client()
+        if vc is None:
+            return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
+                                    status_code=303)
+        from veracore_sync import run_inventory_sync
+        r = run_inventory_sync(db, vc)
+        await log_activity("veracore",
+                           f"Manual inventory sync: synced={r['synced']} skipped={r['skipped']} alerts={r['alerts_raised']}",
+                           (r.get("error") or "")[:200],
+                           "error" if r.get("error") else "success")
+        if r.get("error"):
+            return RedirectResponse(f"/veracore?msg=Inventory+sync+failed:+{r['error'][:100]}&msg_type=error",
+                                    status_code=303)
+        return RedirectResponse(
+            f"/veracore?msg=Inventory+synced:+{r['synced']}+kits,+{r['alerts_raised']}+alerts+raised&msg_type=success",
+            status_code=303)
+    except Exception as e:
+        logger.error("[VC SYNC NOW] %s", e, exc_info=True)
+        return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
+
+
+@app.post("/veracore/poll-shipments-now")
+async def veracore_poll_shipments_now(request: Request):
+    """Manually poll VeraCore for shipment/tracking updates."""
+    try:
+        if not veracore_enabled():
+            return RedirectResponse("/veracore?msg=VeraCore+not+configured&msg_type=error", status_code=303)
+        db = get_supabase()
+        vc = get_veracore_client()
+        if vc is None:
+            return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error", status_code=303)
+        from veracore_sync import run_shipment_poll
+        r = run_shipment_poll(db, vc)
+        await log_activity("veracore",
+                           f"Manual shipment poll: matched={r['matched']} updated={r['updated']} unmatched={r['unmatched']}",
+                           (r.get("error") or "")[:200],
+                           "error" if r.get("error") else "success")
+        if r.get("error"):
+            return RedirectResponse(f"/veracore?msg=Poll+failed:+{r['error'][:100]}&msg_type=error", status_code=303)
+        return RedirectResponse(
+            f"/veracore?msg=Poll+done:+{r['updated']}+decisions+updated,+{r['unmatched']}+unmatched&msg_type=success",
+            status_code=303)
+    except Exception as e:
+        logger.error("[VC POLL NOW] %s", e, exc_info=True)
+        return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
 
 
 @app.post("/decisions/{decision_id}/ship")
@@ -5321,6 +5804,13 @@ async def bulk_decision_action(request: Request):
                         new_status="approved",
                         reason_prefix="Bulk-approved",
                     )
+                    # Phase 3 — Push to VeraCore (partial-failure safe).
+                    # Succeeded rows stay submitted; failed rows surface in UI for retry.
+                    try:
+                        vc_bulk_result = submit_to_veracore(did)
+                        logger.debug("[BULK ACTION] VeraCore push for %s: %s", did[:8], vc_bulk_result)
+                    except Exception as vc_err:
+                        logger.error("[BULK ACTION] VeraCore push raised for %s: %s", did[:8], vc_err)
                     success += 1
 
                 elif action == "ship":
@@ -5539,15 +6029,32 @@ async def export_decisions_csv(request: Request):
             "City", "State/Province", "Zip", "Country", "Phone",
             "Order Number", "Kit SKU", "Trimester",
             "Weight (oz)", "Length (in)", "Width (in)", "Height (in)",
+            # Phase 3 — international customs cols (appended; Pirate Ship ignores unknown cols)
+            "Customs Description", "Customs Value", "Customs Quantity", "Customs Country of Origin",
         ])
         # Defaults confirmed by Sheena on Apr 15 call: ~3 lb (48 oz), 10 × 7.5 × 4 inches
         DEFAULT_WEIGHT_OZ = 48
         DEFAULT_LENGTH_IN = 10
         DEFAULT_WIDTH_IN = 7.5
         DEFAULT_HEIGHT_IN = 4
+        # Customs defaults — applied only when country != 'US'
+        from veracore_client import normalize_country as _norm_country, build_customs as _build_customs
         for d in rows:
             c    = d.get("customers") or {}
             name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+            country_iso = _norm_country(c.get("country") or "US")
+            is_intl = country_iso != "US"
+            if is_intl:
+                # Use kit cost_per_kit if available; else fallback in build_customs defaults.
+                # We only have kit_sku on the decision — grab cost from kits in one shot would be nice,
+                # but for a CSV export we keep it cheap: use the generic default value.
+                customs = _build_customs({"cost_per_kit": None})
+                customs_desc  = customs["description"]
+                customs_value = f"{customs['declared_value']:.2f}"
+                customs_qty   = "1"
+                customs_origin = customs["country_of_origin"]
+            else:
+                customs_desc = customs_value = customs_qty = customs_origin = ""
             writer.writerow([
                 name,
                 c.get("email", ""),
@@ -5556,7 +6063,7 @@ async def export_decisions_csv(request: Request):
                 c.get("city", ""),
                 c.get("province", ""),
                 c.get("zip") or c.get("zip_code", ""),
-                c.get("country") or "US",
+                country_iso,
                 c.get("phone") or "",
                 d.get("order_id", ""),
                 d.get("kit_sku", ""),
@@ -5565,6 +6072,10 @@ async def export_decisions_csv(request: Request):
                 DEFAULT_LENGTH_IN,
                 DEFAULT_WIDTH_IN,
                 DEFAULT_HEIGHT_IN,
+                customs_desc,
+                customs_value,
+                customs_qty,
+                customs_origin,
             ])
 
         output.seek(0)
@@ -5577,6 +6088,94 @@ async def export_decisions_csv(request: Request):
         )
     except Exception as e:
         logger.error(f"[EXPORT CSV] Error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/decisions/export-veracore-csv")
+async def export_decisions_veracore_csv(request: Request):
+    """
+    Phase 3 fallback — download approved+unsubmitted decisions as a VeraCore-import CSV.
+    Used when VeraCore API is down or creds haven't arrived yet.
+    Column order matches VeraCore's standard order-import utility.
+    """
+    try:
+        db = get_supabase()
+        # Default: rows that are approved in OBB but NOT yet pushed to VeraCore.
+        only_unsubmitted = request.query_params.get("only_unsubmitted", "1").strip() != "0"
+
+        q = db.table("decisions").select("*, customers(*), kits(sku, veracore_sku, cost_per_kit)").eq("status", "approved")
+        if only_unsubmitted:
+            q = q.is_("veracore_order_id", "null")
+
+        # Paginate past Supabase 1000-row cap
+        rows: list = []
+        offset    = 0
+        PAGE_SIZE = 1000
+        while True:
+            batch = q.order("created_at", desc=True).range(offset, offset + PAGE_SIZE - 1).execute()
+            batch_data = batch.data or []
+            rows.extend(batch_data)
+            if len(batch_data) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+
+        logger.info(f"[EXPORT VC CSV] Exporting {len(rows)} decisions (only_unsubmitted={only_unsubmitted})")
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        # Column order matches VeraCore's documented import template.
+        writer.writerow([
+            "OrderID", "ShipToName", "ShipToAddress1", "ShipToAddress2",
+            "ShipToCity", "ShipToState", "ShipToZip", "ShipToCountry", "ShipToPhone",
+            "OfferID", "Quantity", "ShipMethod", "Comments",
+            "CustomsDescription", "CustomsValue",
+        ])
+
+        from veracore_client import normalize_country as _norm_country, pick_shipping_method as _pick_ship, build_customs as _build_customs
+        for d in rows:
+            c = d.get("customers") or {}
+            k = d.get("kits") or {}
+            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip() or c.get("email", "")
+            country_iso = _norm_country(c.get("country") or "US")
+            is_intl = country_iso != "US"
+            offer_id = k.get("veracore_sku") or k.get("sku") or d.get("kit_sku", "")
+            order_public_id = d.get("order_id") or f"OBB-{str(d.get('id', ''))[:8]}"
+            if is_intl:
+                customs = _build_customs(k)
+                customs_desc  = customs["description"]
+                customs_value = f"{customs['declared_value']:.2f}"
+            else:
+                customs_desc = ""
+                customs_value = ""
+            writer.writerow([
+                order_public_id,
+                name,
+                c.get("address_line1", ""),
+                c.get("address_line2") or "",
+                c.get("city", ""),
+                c.get("province", ""),
+                c.get("zip") or c.get("zip_code", ""),
+                country_iso,
+                c.get("phone") or "",
+                offer_id,
+                1,
+                _pick_ship(country_iso),
+                f"Kit {k.get('sku','?')} | T{d.get('trimester','?')} | decision {str(d.get('id',''))[:8]}",
+                customs_desc,
+                customs_value,
+            ])
+
+        output.seek(0)
+        filename = f"veracore_fallback_{date.today().isoformat()}.csv"
+        await log_activity("export", f"VeraCore CSV fallback export: {len(rows)} rows",
+                           f"only_unsubmitted={only_unsubmitted}", "success")
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except Exception as e:
+        logger.error(f"[EXPORT VC CSV] Error: {e}", exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 

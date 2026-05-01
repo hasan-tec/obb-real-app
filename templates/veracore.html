@@ -1,0 +1,308 @@
+{% extends "base.html" %}
+{% block title %}VeraCore — OBB Engine{% endblock %}
+{% block content %}
+<div class="topbar">
+    <h1>🏭 VeraCore Fulfillment</h1>
+    <div class="status">
+        {% if enabled %}
+        <span><span class="dot green"></span> Connected</span>
+        {% else %}
+        <span><span class="dot red"></span> Not configured</span>
+        {% endif %}
+    </div>
+</div>
+<div class="content">
+
+    {% if msg %}
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}"
+        style="margin-bottom:16px;">
+        {{ msg }}
+    </div>
+    {% endif %}
+    {% if error %}
+    <div class="alert alert-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    {# ─── Connection panel ─── #}
+    <div class="card" style="margin-bottom:18px;">
+        <div class="card-header">
+            <h3>Connection</h3>
+        </div>
+        <div style="padding:14px 18px;">
+            {% if enabled %}
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;font-size:13px;">
+                <div>
+                    <div
+                        style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+                        Base URL</div>
+                    <div style="font-family:monospace;">{{ base_url }}</div>
+                </div>
+                <div>
+                    <div
+                        style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+                        Auth Mode</div>
+                    <div><span class="badge badge-purple">{{ auth_mode }}</span></div>
+                </div>
+                <div>
+                    <div
+                        style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+                        System ID</div>
+                    <div style="font-family:monospace;">{{ system_id or '—' }}</div>
+                </div>
+            </div>
+            {% else %}
+            <div style="color:var(--yellow);font-size:13px;line-height:1.6;">
+                <strong>VeraCore is not configured yet.</strong><br>
+                Approved decisions will fall back to the Pirate Ship CSV export until
+                <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;">VERACORE_BASE_URL</code>,
+                <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;">VERACORE_USER_ID</code>, and
+                <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;">VERACORE_PASSWORD</code>
+                env vars are set on the server.
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    {# ─── Status tiles ─── #}
+    <div class="stat-grid" style="margin-bottom:18px;">
+        <div class="stat-card">
+            <div class="label">Approved (all-time)</div>
+            <div class="value">{{ approved_count }}</div>
+            <div class="sub">Decisions staff approved</div>
+        </div>
+        <div class="stat-card" {% if pending_push_count> 0 %}style="border-color:var(--yellow);"{% endif %}>
+            <div class="label">⏳ Pending VC push</div>
+            <div class="value" {% if pending_push_count> 0 %}style="color:var(--yellow);"{% endif %}>{{
+                pending_push_count }}</div>
+            <div class="sub">Approved, not yet in VeraCore</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">✅ Submitted to VC</div>
+            <div class="value" style="color:var(--green);">{{ submitted_count }}</div>
+            <div class="sub">Order accepted by VeraCore</div>
+        </div>
+        <div class="stat-card" {% if failed_count> 0 %}style="border-color:var(--red);"{% endif %}>
+            <div class="label">❌ Failed</div>
+            <div class="value" {% if failed_count> 0 %}style="color:var(--red);"{% endif %}>{{ failed_count }}</div>
+            <div class="sub">Needs retry or manual fix</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">📦 Shipped</div>
+            <div class="value" style="color:var(--blue);">{{ shipped_count }}</div>
+            <div class="sub">Tracking received from VC</div>
+        </div>
+    </div>
+
+    {# ─── Scheduled jobs + manual triggers ─── #}
+    <div class="card" style="margin-bottom:18px;">
+        <div class="card-header">
+            <h3>Scheduled Syncs</h3>
+        </div>
+        <div style="padding:14px 18px;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+                <div style="padding:14px;background:var(--surface2);border-radius:8px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                        <strong style="font-size:14px;">🔄 Inventory Sync</strong>
+                        <span class="badge badge-purple">daily · 04:00 UTC</span>
+                    </div>
+                    <div style="font-size:12px;color:var(--text-dim);margin-bottom:4px;">
+                        Pulls kit on-hand balances from VeraCore → updates <code>kits.quantity_available</code> + raises
+                        low-stock alerts under 15 units.
+                    </div>
+                    <div style="font-size:12px;margin-bottom:10px;">
+                        Last success:
+                        {% if last_inventory %}
+                        <strong>{{ last_inventory[:19] | replace('T', ' ') }} UTC</strong>
+                        {% else %}
+                        <span style="color:var(--text-dim);">never</span>
+                        {% endif %}
+                    </div>
+                    <form method="POST" action="/veracore/sync-inventory-now" style="display:inline;">
+                        <button type="submit" class="btn btn-sm btn-primary" {% if not enabled %}disabled
+                            title="VeraCore not configured" {% endif %}>
+                            ↻ Sync inventory now
+                        </button>
+                    </form>
+                </div>
+
+                <div style="padding:14px;background:var(--surface2);border-radius:8px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                        <strong style="font-size:14px;">📦 Shipment Poll</strong>
+                        <span class="badge badge-purple">daily · 05:00 UTC</span>
+                    </div>
+                    <div style="font-size:12px;color:var(--text-dim);margin-bottom:4px;">
+                        Pulls tracking numbers from VeraCore → updates <code>decisions.veracore_tracking</code> + flips
+                        status to <code>shipped</code>.
+                    </div>
+                    <div style="font-size:12px;margin-bottom:10px;">
+                        Last success:
+                        {% if last_shipment %}
+                        <strong>{{ last_shipment[:19] | replace('T', ' ') }} UTC</strong>
+                        {% else %}
+                        <span style="color:var(--text-dim);">never</span>
+                        {% endif %}
+                    </div>
+                    <form method="POST" action="/veracore/poll-shipments-now" style="display:inline;">
+                        <button type="submit" class="btn btn-sm btn-primary" {% if not enabled %}disabled
+                            title="VeraCore not configured" {% endif %}>
+                            ↻ Poll shipments now
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    {# ─── What gets synced ─── #}
+    <div class="card" style="margin-bottom:18px;">
+        <div class="card-header">
+            <h3>What syncs with VeraCore?</h3>
+        </div>
+        <div style="padding:14px 18px;">
+            <table style="width:100%;font-size:13px;">
+                <thead>
+                    <tr style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;">
+                        <th style="text-align:left;padding:6px 0;">Direction</th>
+                        <th style="text-align:left;padding:6px 0;">What</th>
+                        <th style="text-align:left;padding:6px 0;">When</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td style="padding:8px 12px 8px 0;"><span class="badge badge-blue">OBB → VC</span></td>
+                        <td style="padding:8px 12px 8px 0;"><strong>Approved decision</strong> → new warehouse
+                            order<br><span style="color:var(--text-dim);font-size:12px;">ship-to, kit SKU, shipping
+                                method, customs (intl only)</span></td>
+                        <td style="padding:8px 0;">On <strong>Approve</strong> click</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px 8px 0;"><span class="badge badge-green">VC → OBB</span></td>
+                        <td style="padding:8px 12px 8px 0;"><strong>Kit inventory</strong> → updates
+                            <code>kits.quantity_available</code><br><span
+                                style="color:var(--text-dim);font-size:12px;">raises low-stock alert if any kit under 15
+                                units</span></td>
+                        <td style="padding:8px 0;">Daily 04:00 UTC</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px 8px 0;"><span class="badge badge-green">VC → OBB</span></td>
+                        <td style="padding:8px 12px 8px 0;"><strong>Shipment tracking</strong> → updates
+                            <code>veracore_tracking</code> + marks shipped<br><span
+                                style="color:var(--text-dim);font-size:12px;">tracking # shows up on the decision
+                                row</span></td>
+                        <td style="padding:8px 0;">Daily 05:00 UTC</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div
+                style="margin-top:12px;padding:10px 12px;background:rgba(108,99,255,0.08);border-left:3px solid var(--accent);border-radius:4px;font-size:12px;color:var(--text-dim);line-height:1.6;">
+                <strong style="color:var(--text);">Not synced (by design):</strong>
+                individual items (VeraCore stocks pre-built kits, not loose items — items live in OBB + TheraBox
+                warehouses),
+                customers (ship-to travels with each order),
+                and historical shipments (one-way: OBB creates orders, VC ships them).
+            </div>
+        </div>
+    </div>
+
+    {# ─── Failed submissions ─── #}
+    {% if failed_decisions %}
+    <div class="card" style="margin-bottom:18px;">
+        <div class="card-header">
+            <h3 style="color:var(--red);">❌ Failed Submissions ({{ failed_decisions | length }})</h3>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Attempted</th>
+                    <th>Customer</th>
+                    <th>Order ID</th>
+                    <th>Kit</th>
+                    <th>Error</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for d in failed_decisions %}
+                <tr>
+                    <td style="font-size:12px;white-space:nowrap;">
+                        {{ (d.veracore_submitted_at or '')[:19] | replace('T', ' ') if d.veracore_submitted_at else '—'
+                        }}
+                    </td>
+                    <td style="font-size:13px;">
+                        {% set c = d.customers or {} %}
+                        {{ c.email or '—' }}
+                    </td>
+                    <td style="font-family:monospace;font-size:12px;">{{ d.order_id or '—' }}</td>
+                    <td><span class="badge badge-purple">{{ d.kit_sku or '—' }}</span></td>
+                    <td style="max-width:360px;font-size:12px;color:var(--red);overflow:hidden;text-overflow:ellipsis;">
+                        {{ (d.veracore_last_error or 'unknown error')[:180] }}
+                    </td>
+                    <td>
+                        <form method="POST" action="/decisions/{{ d.id }}/veracore-retry" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-primary">↻ Retry</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    {# ─── Recent sync log ─── #}
+    <div class="card">
+        <div class="card-header">
+            <h3>Recent Activity</h3>
+            <span style="font-size:12px;color:var(--text-dim);">Last {{ recent_syncs | length }} events from
+                <code>veracore_sync_log</code></span>
+        </div>
+        {% if recent_syncs %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Time (UTC)</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in recent_syncs %}
+                <tr>
+                    <td style="font-size:12px;white-space:nowrap;">{{ (s.run_at or '')[:19] | replace('T', ' ') }}</td>
+                    <td>
+                        {% if s.sync_type == 'inventory' %}<span class="badge badge-blue">📦 inventory</span>
+                        {% elif s.sync_type == 'order_submit' %}<span class="badge badge-purple">→ order</span>
+                        {% elif s.sync_type == 'shipment_poll' %}<span class="badge badge-green">← shipment</span>
+                        {% else %}<span class="badge badge-dim">{{ s.sync_type }}</span>{% endif %}
+                    </td>
+                    <td>
+                        {% if s.status == 'ok' %}<span class="badge badge-green">✓ ok</span>
+                        {% else %}<span class="badge badge-red">✕ fail</span>{% endif %}
+                    </td>
+                    <td
+                        style="font-size:12px;color:var(--text-dim);max-width:500px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                        {% if s.status == 'fail' %}<span style="color:var(--red);">{{ (s.error or '')[:180] }}</span>
+                        {% elif s.sync_type == 'inventory' and s.response %}
+                        synced={{ s.response.synced or 0 }} · skipped={{ s.response.skipped or 0 }} · alerts={{
+                        s.response.alerts_raised or 0 }}
+                        {% elif s.sync_type == 'order_submit' and s.response %}
+                        VC-ID {{ s.response.veracore_internal_id or s.response.OrderID or '—' }}
+                        {% elif s.sync_type == 'shipment_poll' and s.response %}
+                        matched={{ s.response.matched or 0 }} · updated={{ s.response.updated or 0 }} · unmatched={{
+                        s.response.unmatched or 0 }}
+                        {% else %}—{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div style="padding:30px;text-align:center;color:var(--text-dim);">
+            No sync activity yet. Apply migration 012 and set VeraCore env vars to start.
+        </div>
+        {% endif %}
+    </div>
+
+</div>
+{% endblock %}

@@ -37,6 +37,52 @@
         </div>
     </div>
 
+    {# ─── Phase 3: VeraCore health widget ─── #}
+    <div class="card" style="margin-bottom:18px;">
+        <div class="card-header">
+            <h3>🏭 VeraCore Fulfillment</h3>
+            <a href="/veracore" class="btn btn-sm btn-secondary">Open →</a>
+        </div>
+        <div style="padding:12px 18px;display:grid;grid-template-columns:repeat(4,1fr);gap:14px;font-size:13px;">
+            <div>
+                <div
+                    style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+                    Connection</div>
+                <div style="font-weight:600;">
+                    {% if vc_enabled %}<span style="color:var(--green);">● Connected</span>
+                    {% else %}<span style="color:var(--text-dim);">○ Not configured</span>{% endif %}
+                </div>
+            </div>
+            <div>
+                <div
+                    style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+                    Pending Push</div>
+                <div style="font-weight:600;{% if vc_pending_push > 0 %}color:var(--yellow);{% endif %}">
+                    {{ vc_pending_push }} <span style="font-size:11px;color:var(--text-dim);font-weight:400;">approved,
+                        not in VC</span>
+                </div>
+            </div>
+            <div>
+                <div
+                    style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+                    Failed</div>
+                <div style="font-weight:600;{% if vc_failed > 0 %}color:var(--red);{% endif %}">
+                    {{ vc_failed }} <span style="font-size:11px;color:var(--text-dim);font-weight:400;">needs
+                        retry</span>
+                </div>
+            </div>
+            <div>
+                <div
+                    style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+                    Last Inventory Sync</div>
+                <div style="font-weight:600;font-size:12px;">
+                    {% if vc_last_sync %}{{ vc_last_sync[:19] | replace('T', ' ') }} UTC
+                    {% else %}<span style="color:var(--text-dim);">never</span>{% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="card">
         <div class="card-header">
             <h3>Recent Activity</h3>
