@@ -4742,6 +4742,148 @@ async def test_webhook_cratejoy(request: Request):
 # DECISION APPROVAL / REJECT / SHIP
 # ═══════════════════════════════════════════════════════════
 
+# ─── VeraCore submission helper (Phase 3) ───────────────────
+
+def _build_ship_to_from_customer(c: dict) -> dict:
+    """Extract a VeraCore-shaped ship_to block from a customers row."""
+    from veracore_client import normalize_country
+    name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip() or c.get("email", "")
+    return {
+        "name":     name,
+        "address1": c.get("address_line1", "") or "",
+        "address2": c.get("address_line2", "") or "",
+        "city":     c.get("city", "") or "",
+        "state":    c.get("province", "") or "",
+        "zip":      c.get("zip") or c.get("zip_code", "") or "",
+        "country":  normalize_country(c.get("country")),
+        "phone":    c.get("phone", "") or "",
+    }
+
+
+def submit_to_veracore(decision_id: str) -> dict:
+    """
+    Push an approved decision to VeraCore as a warehouse order.
+
+    Guarantees:
+      - No-op when VERACORE_BASE_URL is empty → CSV fallback picks it up later.
+      - Idempotent: if decisions.veracore_order_id is already set, we skip.
+      - Always writes a row to veracore_sync_log (success OR failure).
+      - Never raises — callers can trust a return dict.
+
+    Returns: {status: 'skipped'|'noop'|'submitted'|'failed'|'already_submitted',
+              order_id: str|None, error: str|None}
+    """
+    db = get_supabase()
+
+    # Fetch decision + customer + kit in one round-trip (Supabase embed).
+    try:
+        d_res = db.table("decisions").select(
+            "*, customers(*), kits(id, sku, veracore_sku, cost_per_kit, name)"
+        ).eq("id", decision_id).single().execute()
+    except Exception as e:
+        logger.error("[VERACORE SUBMIT] Could not load decision %s: %s", decision_id, e)
+        return {"status": "failed", "order_id": None, "error": f"load failed: {e}"}
+
+    d = d_res.data
+    if not d:
+        logger.warning("[VERACORE SUBMIT] Decision %s not found", decision_id)
+        return {"status": "failed", "order_id": None, "error": "decision not found"}
+
+    # ── Short-circuits ──────────────────────────────────────
+    if d.get("veracore_order_id"):
+        logger.info("[VERACORE SUBMIT] %s already has veracore_order_id=%s — skipping (idempotent)",
+                    decision_id, d["veracore_order_id"])
+        return {"status": "already_submitted", "order_id": d["veracore_order_id"], "error": None}
+
+    if not veracore_enabled():
+        logger.info("[VERACORE SUBMIT] VERACORE_BASE_URL empty — no-op (CSV fallback will handle)")
+        return {"status": "noop", "order_id": None, "error": None}
+
+    try:
+        from veracore_client import VeraCoreError, build_customs, pick_shipping_method
+        from veracore_sync import log_sync
+    except ImportError as e:
+        logger.warning("[VERACORE SUBMIT] veracore_client not yet installed — no-op: %s", e)
+        return {"status": "noop", "order_id": None, "error": None}
+
+    kit      = d.get("kits") or {}
+    customer = d.get("customers") or {}
+    if not kit:
+        logger.warning("[VERACORE SUBMIT] %s has no kit — cannot submit", decision_id)
+        return {"status": "skipped", "order_id": None, "error": "no kit"}
+    if not customer:
+        logger.warning("[VERACORE SUBMIT] %s has no customer — cannot submit", decision_id)
+        return {"status": "skipped", "order_id": None, "error": "no customer"}
+
+    vc = get_veracore_client()
+    if vc is None:
+        return {"status": "noop", "order_id": None, "error": None}
+
+    ship_to         = _build_ship_to_from_customer(customer)
+    is_intl         = ship_to["country"] != "US"
+    shipping_method = pick_shipping_method(ship_to["country"])
+    offer_id        = kit.get("veracore_sku") or kit.get("sku")
+    order_public_id = d.get("order_id") or f"OBB-{decision_id[:8]}"
+    comments        = f"Kit {kit.get('sku','?')} | T{d.get('trimester','?')} | decision {decision_id[:8]}"
+
+    request_payload = {
+        "order_id":         order_public_id,
+        "ship_to":          ship_to,
+        "line_items":       [{"offer_id": offer_id, "quantity": 1}],
+        "shipping_method":  shipping_method,
+        "comments":         comments,
+        "is_international": is_intl,
+    }
+
+    try:
+        resp = vc.add_order(
+            order_id=order_public_id,
+            ship_to=ship_to,
+            line_items=[{"offer_id": offer_id, "quantity": 1}],
+            shipping_method=shipping_method,
+            comments=comments,
+            customs=build_customs(kit) if is_intl else None,
+        )
+        internal_id = resp.get("veracore_internal_id") or order_public_id
+        db.table("decisions").update({
+            "veracore_order_id":     internal_id,
+            "veracore_status":       "submitted",
+            "veracore_submitted_at": datetime.utcnow().isoformat(),
+            "veracore_last_error":   None,
+        }).eq("id", decision_id).execute()
+        log_sync(db, "order_submit", decision_id, request_payload, resp, "ok")
+        logger.info("[VERACORE SUBMIT] ✅ decision=%s VC id=%s", decision_id, internal_id)
+        return {"status": "submitted", "order_id": internal_id, "error": None}
+
+    except VeraCoreError as e:
+        err = f"{e} (HTTP {e.status_code})" if e.status_code else str(e)
+        logger.error("[VERACORE SUBMIT] ❌ decision=%s: %s", decision_id, err)
+        try:
+            db.table("decisions").update({
+                "veracore_status":     "failed",
+                "veracore_last_error": err[:500],
+            }).eq("id", decision_id).execute()
+        except Exception as db_err:
+            logger.error("[VERACORE SUBMIT] Failed to mark decision failed: %s", db_err)
+        log_sync(db, "order_submit", decision_id, request_payload,
+                 {"body": e.response_body} if e.response_body else None,
+                 "fail", err)
+        return {"status": "failed", "order_id": None, "error": err}
+
+    except Exception as e:
+        err = f"unexpected: {e}"
+        logger.error("[VERACORE SUBMIT] ❌ decision=%s: %s", decision_id, err, exc_info=True)
+        try:
+            db.table("decisions").update({
+                "veracore_status":     "failed",
+                "veracore_last_error": err[:500],
+            }).eq("id", decision_id).execute()
+        except Exception:
+            pass
+        log_sync(db, "order_submit", decision_id, request_payload, None, "fail", err)
+        return {"status": "failed", "order_id": None, "error": err}
+
+
 @app.post("/decisions/{decision_id}/approve")
 async def approve_decision(request: Request, decision_id: str):
     """
