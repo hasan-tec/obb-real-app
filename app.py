@@ -4892,9 +4892,6 @@ def submit_to_veracore(decision_id: str) -> dict:
     Returns: {status: 'skipped'|'noop'|'submitted'|'failed'|'already_submitted',
               order_id: str|None, error: str|None}
     """
-    from veracore_client import VeraCoreError, build_customs, pick_shipping_method
-    from veracore_sync import log_sync
-
     db = get_supabase()
 
     # Fetch decision + customer + kit in one round-trip (Supabase embed).
@@ -4919,6 +4916,13 @@ def submit_to_veracore(decision_id: str) -> dict:
 
     if not veracore_enabled():
         logger.info("[VERACORE SUBMIT] VERACORE_BASE_URL empty — no-op (CSV fallback will handle)")
+        return {"status": "noop", "order_id": None, "error": None}
+
+    try:
+        from veracore_client import VeraCoreError, build_customs, pick_shipping_method
+        from veracore_sync import log_sync
+    except ImportError as e:
+        logger.warning("[VERACORE SUBMIT] veracore_client not yet installed — no-op: %s", e)
         return {"status": "noop", "order_id": None, "error": None}
 
     kit      = d.get("kits") or {}

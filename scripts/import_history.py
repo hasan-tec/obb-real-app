@@ -137,7 +137,7 @@ SUPABASE_KEY = (
 
 # --- Paths --------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
-ORDER_HISTORY_DIR = SCRIPT_DIR.parent / "order history"
+ORDER_HISTORY_DIR = SCRIPT_DIR.parent.parent / "order history"
 
 # --- Logging ------------------------------------------------------------------
 # Force UTF-8 on Windows console so arrow/box chars don't crash logging
