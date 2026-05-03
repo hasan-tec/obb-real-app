@@ -473,6 +473,8 @@ def load_existing_ship_keys(db: Client) -> set:
             break
         rows = result.data or []
         for row in rows:
+            if not row.get("ship_date") or not row.get("kit_sku"):
+                continue
             year_month = row["ship_date"][:7]  # "2026-03"
             keys.add((row["customer_id"], row["kit_sku"], year_month))
         if len(rows) < page_size:
@@ -1139,9 +1141,12 @@ def main():
     logger.info("  Press Enter to continue, or Ctrl+C to abort.")
     try:
         input()
-    except KeyboardInterrupt:
-        logger.info("Aborted.")
-        sys.exit(0)
+    except (KeyboardInterrupt, EOFError):
+        if isinstance(sys.exc_info()[1], EOFError):
+            logger.info("Non-interactive mode — proceeding automatically.")
+        else:
+            logger.info("Aborted.")
+            sys.exit(0)
 
     # -- PHASE 2 -- Customer writes ---------------------------------------------
     logger.info("")
