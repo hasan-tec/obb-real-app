@@ -2646,7 +2646,7 @@ async def customer_detail(request: Request, customer_id: str):
                 logger.warning(f"[CUSTOMER DETAIL] Could not recalculate trimester: {tri_err}")
 
         # Get all kits for the shipment form dropdown and override form
-        kits_list = db.table("kits").select("id, sku, trimester, is_welcome_kit").order("sku").execute()
+        kits_list = db.table("kits").select("id, sku, trimester, is_welcome_kit, quantity_available").gt("quantity_available", 0).order("sku").execute()
 
         return templates.TemplateResponse("customer_detail.html", {
             "request": request,
