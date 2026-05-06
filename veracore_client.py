@@ -93,7 +93,7 @@ class VeraCoreClient:
     ):
         if not base_url:
             raise VeraCoreError("VeraCoreClient: base_url is required")
-        if auth_mode not in ("basic", "base64_json", "oauth2"):
+        if auth_mode not in ("basic", "base64_json", "oauth2", "jwt"):
             raise VeraCoreError(f"VeraCoreClient: unknown auth_mode '{auth_mode}'")
 
         self.base_url = base_url.rstrip("/")
@@ -120,8 +120,56 @@ class VeraCoreClient:
     # Auth
     # ─────────────────────────────────────────────────────────
 
+    def _get_jwt_token(self) -> str:
+        """Fetch + cache JWT from POST /api/Login. Refresh 5 min before expiry."""
+        if self._token and time.time() < self._token_expires_at - 300:
+            logger.debug("[VERACORE] Reusing cached JWT (expires in %ds)",
+                         int(self._token_expires_at - time.time()))
+            return self._token
+
+        url = f"{self.base_url}/api/Login"
+        logger.info("[VERACORE] Fetching new JWT from %s", url)
+        try:
+            r = self._http.post(url, json={
+                "userName": self.user_id,
+                "password": self.password,
+                "systemId": self.system_id,
+            })
+            r.raise_for_status()
+            body = r.json()
+            self._token = body.get("Token") or body.get("token") or body.get("access_token")
+            if not self._token:
+                raise VeraCoreError("JWT login returned no token field")
+            exp_str = body.get("UtcExpirationDate") or body.get("expires_at")
+            if exp_str:
+                try:
+                    import datetime as _dt
+                    exp_clean = exp_str[:26].rstrip("Z") + "+00:00"
+                    self._token_expires_at = _dt.datetime.fromisoformat(exp_clean).timestamp()
+                except Exception:
+                    self._token_expires_at = time.time() + (89 * 24 * 3600)
+            else:
+                self._token_expires_at = time.time() + (89 * 24 * 3600)
+            logger.info("[VERACORE] JWT acquired, expires %s", exp_str or "unknown")
+            return self._token
+        except httpx.HTTPStatusError as e:
+            logger.error("[VERACORE] JWT login failed %s: %s", e.response.status_code, e.response.text)
+            raise VeraCoreError(
+                f"JWT login failed: {e.response.status_code}",
+                status_code=e.response.status_code,
+                response_body=e.response.text,
+            ) from e
+        except VeraCoreError:
+            raise
+        except Exception as e:
+            logger.error("[VERACORE] JWT login network error: %s", e, exc_info=True)
+            raise VeraCoreError(f"JWT login network error: {e}") from e
+
     def _auth_headers(self) -> dict:
         """Build Authorization header based on auth_mode."""
+        if self.auth_mode == "jwt":
+            return {"Authorization": f"Bearer {self._get_jwt_token()}"}
+
         if self.auth_mode == "basic":
             token = base64.b64encode(
                 f"{self.user_id}:{self.password}".encode("utf-8")
@@ -282,7 +330,9 @@ class VeraCoreClient:
         for row in raw:
             if not isinstance(row, dict):
                 continue
-            sku = row.get("Sku") or row.get("sku") or row.get("OfferID") or row.get("offer_id")
+            sku = (row.get("Id") or row.get("id")
+                   or row.get("Sku") or row.get("sku")
+                   or row.get("OfferID") or row.get("offer_id"))
             if not sku:
                 continue
             normalized.append({
@@ -384,9 +434,9 @@ class VeraCoreClient:
 
         Returns normalized: [{order_id, tracking_number, carrier, shipped_at}, ...]
         """
-        raw = self._request("GET", self.shipment_path, params={"since": since_iso})
+        raw = self._request("GET", self.shipment_path, params={"StartDate": since_iso})
         if isinstance(raw, dict):
-            for key in ("data", "Shipments", "shipments", "items"):
+            for key in ("data", "ShippingOrders", "Shipments", "shipments", "items"):
                 if key in raw and isinstance(raw[key], list):
                     raw = raw[key]
                     break
