@@ -353,80 +353,76 @@ class VeraCoreClient:
         logger.info("[VERACORE] Inventory sync pulled %d SKUs", len(normalized))
         return normalized
 
+    def get_offers(self, offer_ids: Optional[list] = None) -> list[dict]:
+        """
+        GET /api/Offers — list Offers (kit definitions) in the VeraCore account.
+
+        Use this to verify which kits exist in the system and get their Offer IDs.
+        NOTE: Does NOT include real-time inventory quantities — use get_inventory() for that.
+
+        Returns: [{id, title, status}, ...]
+        """
+        params = {}
+        if offer_ids:
+            params["offerIds"] = ",".join(offer_ids)
+        raw = self._request("GET", "/api/Offers", params=params or None)
+        offers = raw.get("offers", []) if isinstance(raw, dict) else []
+        logger.info("[VERACORE] get_offers returned %d offers", len(offers))
+        return [
+            {
+                "id": o.get("id", ""),
+                "title": o.get("title", ""),
+                "inactive": (o.get("status") or {}).get("inactive") is not None,
+            }
+            for o in offers if isinstance(o, dict)
+        ]
+
     def add_order(
         self,
         order_id: str,
-        ship_to: dict,
-        line_items: list[dict],
-        shipping_method: str,
-        comments: str = "",
-        customs: Optional[dict] = None,
+        _ship_to: dict,
+        _line_items: list[dict],
+        _shipping_method: str,
+        _comments: str = "",
+        _customs: Optional[dict] = None,
     ) -> dict:
         """
-        POST {base}/orders — submit an order to VeraCore.
+        Submit a new customer order to VeraCore.
 
-        ship_to      = {name, address1, address2?, city, state, zip, country, phone?}
-        line_items   = [{offer_id, quantity}, ...]
-        customs      = optional, REQUIRED for non-US: {description, declared_value,
-                       country_of_origin, hs_code?}
+        ⚠️  IMPLEMENTATION BLOCKED — see note below before calling this.
 
-        Returns: {order_id (OBB), veracore_internal_id (VC), status, raw}
+        CONFIRMED from Swagger (2026-05-07): The VeraCore Public REST API at
+        /VeraCore/Public.Api has NO endpoint for creating new OMS orders.
+        The only REST order endpoints are GET (query existing orders).
+
+        POST /api/ShippingOrder is for creating WMS pick slips from EXISTING OMS
+        orders — it requires an orderId that must already exist in the OMS. It is
+        NOT for creating new customer orders. Tested live: returns 400 "Unable to
+        locate Order for Order Id '...'" when the order doesn't pre-exist.
+
+        WHAT IS NEEDED: The classic VeraCore "Add Order Web Service" — a SOAP
+        endpoint at a different base URL (e.g. /VeraCore/Services.asmx or similar).
+        Brian (VeraCore rep) must provide: the SOAP endpoint URL and the exact
+        XML request schema. Once that is known, this method should be rewritten to
+        call the SOAP endpoint using httpx + raw XML (or the zeep library).
+
+        Until then: this method logs a critical warning and raises VeraCoreError so
+        the caller sees a clean 'failed' status rather than a silent wrong call.
         """
         if not order_id:
             raise VeraCoreError("add_order: order_id is required")
-        if not line_items:
-            raise VeraCoreError("add_order: at least one line item required")
 
-        # Build VeraCore-style payload (PascalCase, per REST docs).
-        # Junior dev: cross-check field names against Ting's Swagger before go-live.
-        payload = {
-            "OrderID": order_id,
-            "SystemID": self.system_id,
-            "ShipTo": {
-                "Name": ship_to.get("name", ""),
-                "Address1": ship_to.get("address1", ""),
-                "Address2": ship_to.get("address2", "") or "",
-                "City": ship_to.get("city", ""),
-                "State": ship_to.get("state", ""),
-                "Zip": ship_to.get("zip", ""),
-                "Country": ship_to.get("country", "US"),
-                "Phone": ship_to.get("phone", "") or "",
-            },
-            "Items": [
-                {"OfferID": li["offer_id"], "Quantity": int(li.get("quantity", 1))}
-                for li in line_items
-            ],
-            "ShipMethod": shipping_method,
-            "Comments": comments,
-        }
-        if customs:
-            payload["Customs"] = {
-                "Description": customs.get("description", ""),
-                "DeclaredValue": float(customs.get("declared_value", 0)),
-                "CountryOfOrigin": customs.get("country_of_origin", "US"),
-                "HSCode": customs.get("hs_code", ""),
-            }
-
-        logger.info("[VERACORE] add_order OrderID=%s, items=%d, method=%s, customs=%s",
-                    order_id, len(line_items), shipping_method, bool(customs))
-        raw = self._request("POST", self.order_path, json_body=payload)
-
-        # Response shape varies by tenant. Extract whatever identifier VeraCore returns.
-        veracore_internal_id = (
-            raw.get("VeraCoreOrderID")
-            or raw.get("veracore_order_id")
-            or raw.get("InternalOrderID")
-            or raw.get("OrderNumber")
-            or raw.get("order_number")
-            or raw.get("OrderID")
-            or order_id  # fall back to our ID if VC echoes it
+        logger.critical(
+            "[VERACORE] add_order called but SOAP endpoint not yet implemented. "
+            "OrderID=%s will NOT be submitted. Ask Brian for the Add Order SOAP URL.",
+            order_id,
         )
-        return {
-            "order_id": order_id,
-            "veracore_internal_id": str(veracore_internal_id),
-            "status": raw.get("Status") or raw.get("status") or "submitted",
-            "raw": raw,
-        }
+        raise VeraCoreError(
+            "add_order: VeraCore order creation requires the SOAP AddOrder web service "
+            "which is not yet implemented. The Public REST API has no POST /api/orders "
+            "endpoint. Obtain the SOAP endpoint URL from Brian and implement it here.",
+            status_code=None,
+        )
 
     def get_shipments(self, since_iso: str) -> list[dict]:
         """
