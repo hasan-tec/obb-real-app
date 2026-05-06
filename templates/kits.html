@@ -7,12 +7,12 @@
 {% set next_dir = ('asc' if sort_dir == 'desc' else 'desc') if sort == col else 'asc' %}
 <th>
     <a href="?sort={{ col }}&dir={{ next_dir }}"
-       style="color:var(--text);text-decoration:none;display:flex;align-items:center;gap:4px;white-space:nowrap;">
+        style="color:var(--text);text-decoration:none;display:flex;align-items:center;gap:4px;white-space:nowrap;">
         {{ label }}
         {% if sort == col %}
-            <span style="color:var(--accent);font-size:11px;">{{ '▲' if sort_dir == 'asc' else '▼' }}</span>
+        <span style="color:var(--accent);font-size:11px;">{{ '▲' if sort_dir == 'asc' else '▼' }}</span>
         {% else %}
-            <span style="color:var(--border);font-size:10px;">⇅</span>
+        <span style="color:var(--border);font-size:10px;">⇅</span>
         {% endif %}
     </a>
 </th>
@@ -34,6 +34,34 @@
 
     {% if error %}
     <div class="alert alert-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    {# ─── Phase 3: VeraCore low-stock alerts banner ─── #}
+    {% if stock_alerts %}
+    <div
+        style="background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.5); border-radius:8px; padding:14px 16px; margin-bottom:18px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+            <span style="font-size:18px;">🚨</span>
+            <strong style="color:var(--yellow, #f59e0b);font-size:14px;">
+                Low-stock alerts from VeraCore — {{ stock_alerts | length }} kit{{ 's' if stock_alerts | length != 1
+                else '' }} below threshold
+            </strong>
+        </div>
+        <ul style="margin:0;padding-left:22px;font-size:13px;color:var(--text);line-height:1.8;">
+            {% for a in stock_alerts[:10] %}
+            <li>
+                <strong>{{ (a.kits or {}).sku or '—' }}</strong>
+                {% if (a.kits or {}).name %}<span style="color:var(--text-dim);">({{ a.kits.name }})</span>{% endif %}
+                — on hand: <strong style="color:var(--red, #ef4444);">{{ a.seen_qty }}</strong>
+                <span style="color:var(--text-dim);">(threshold: {{ a.threshold }}, alerted {{ a.alerted_at[:10] if
+                    a.alerted_at else '—' }})</span>
+            </li>
+            {% endfor %}
+            {% if stock_alerts | length > 10 %}
+            <li style="color:var(--text-dim);font-style:italic;">… and {{ stock_alerts | length - 10 }} more</li>
+            {% endif %}
+        </ul>
+    </div>
     {% endif %}
 
     <!-- Age Rank Info Panel -->
@@ -208,7 +236,8 @@
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Size Variant <span style="color:var(--text-dim);font-size:11px;">(SKU 2nd digit: 1=S, 2=M, 3=L, 4=XL)</span></label>
+                        <label>Size Variant <span style="color:var(--text-dim);font-size:11px;">(SKU 2nd digit: 1=S,
+                                2=M, 3=L, 4=XL)</span></label>
                         <select name="size_variant" class="form-control">
                             <option value="1">1 — S (Small)</option>
                             <option value="2">2 — M</option>
@@ -251,9 +280,11 @@
                             ✅ Universal (no sized item)
                         </label>
                     </div>
-                    <div style="font-size:11px;color:var(--text-dim);margin-top:4px;padding:6px 10px;background:rgba(99,179,237,0.06);border-radius:6px;border:1px solid rgba(99,179,237,0.2);">
+                    <div
+                        style="font-size:11px;color:var(--text-dim);margin-top:4px;padding:6px 10px;background:rgba(99,179,237,0.06);border-radius:6px;border:1px solid rgba(99,179,237,0.2);">
                         <strong style="color:var(--accent);">📏</strong>
-                        <strong>✅ Universal checked</strong> → all customers get this kit (most monthly kits like CK21, CJ31…).
+                        <strong>✅ Universal checked</strong> → all customers get this kit (most monthly kits like CK21,
+                        CJ31…).
                         &nbsp;|&nbsp;
                         <strong>☐ Unchecked</strong> → engine matches by Size Variant digit (1=S, 2=M, 3=L, 4=XL).
                     </div>
@@ -318,10 +349,10 @@
         <table>
             <thead>
                 <tr>
-                    {{ sort_th('SKU',      'sku') }}
+                    {{ sort_th('SKU', 'sku') }}
                     <th>Name</th>
                     {{ sort_th('Trimester','trimester') }}
-                    {{ sort_th('Size',     'size_variant') }}
+                    {{ sort_th('Size', 'size_variant') }}
                     <th>Items</th>
                     {{ sort_th('Quantity', 'quantity_available') }}
                     {{ sort_th('Age Rank', 'age_rank') }}
@@ -394,10 +425,10 @@
         <table>
             <thead>
                 <tr>
-                    {{ sort_th('SKU',      'sku') }}
+                    {{ sort_th('SKU', 'sku') }}
                     <th>Name</th>
                     {{ sort_th('Trimester','trimester') }}
-                    {{ sort_th('Size',     'size_variant') }}
+                    {{ sort_th('Size', 'size_variant') }}
                     <th>Items</th>
                     {{ sort_th('Quantity', 'quantity_available') }}
                     {{ sort_th('Age Rank', 'age_rank') }}

@@ -4,15 +4,16 @@
 
 {# ─── Reusable sort-header macro ─── #}
 {% macro sort_th(label, col) %}
-{% set next_dir = ('asc' if sort_dir == 'desc' else 'desc') if sort == col else ('desc' if col == 'created_at' else 'asc') %}
+{% set next_dir = ('asc' if sort_dir == 'desc' else 'desc') if sort == col else ('desc' if col == 'created_at' else
+'asc') %}
 <th>
     <a href="?sort={{ col }}&dir={{ next_dir }}{% if filter_qs %}&{{ filter_qs }}{% endif %}"
-       style="color:var(--text);text-decoration:none;display:flex;align-items:center;gap:4px;white-space:nowrap;">
+        style="color:var(--text);text-decoration:none;display:flex;align-items:center;gap:4px;white-space:nowrap;">
         {{ label }}
         {% if sort == col %}
-            <span style="color:var(--accent);font-size:11px;">{{ '▲' if sort_dir == 'asc' else '▼' }}</span>
+        <span style="color:var(--accent);font-size:11px;">{{ '▲' if sort_dir == 'asc' else '▼' }}</span>
         {% else %}
-            <span style="color:var(--border);font-size:10px;">⇅</span>
+        <span style="color:var(--border);font-size:10px;">⇅</span>
         {% endif %}
     </a>
 </th>
@@ -21,13 +22,15 @@
 <div class="topbar">
     <h1>Kit Decisions</h1>
     <div class="status">
-        <span>{{ decisions | length }}{% if any_filter_active %} of {{ total_decisions }}{% endif %} decisions{% if filter_qs %} (filtered){% endif %}</span>
+        <span>{{ decisions | length }}{% if any_filter_active %} of {{ total_decisions }}{% endif %} decisions{% if
+            filter_qs %} (filtered){% endif %}</span>
     </div>
 </div>
 
 <div class="content">
     {% if msg %}
-    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}" style="margin-bottom:16px;">
+    <div class="alert {% if msg_type == 'error' %}alert-error{% else %}alert-success{% endif %}"
+        style="margin-bottom:16px;">
         {{ msg }}
     </div>
     {% endif %}
@@ -36,97 +39,118 @@
     {% endif %}
 
     <!-- ── Filter Bar ── -->
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:14px;">
+    <div
+        style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:14px;">
         <form method="GET" action="/decisions" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
             <div style="display:flex;flex-direction:column;gap:3px;">
-                <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Trimester</label>
+                <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Trimester</label>
                 <select name="trimester" class="form-control" style="height:32px;font-size:13px;min-width:80px;">
                     <option value="">All</option>
-                    <option value="1" {% if filters.trimester == '1' %}selected{% endif %}>T1</option>
-                    <option value="2" {% if filters.trimester == '2' %}selected{% endif %}>T2</option>
-                    <option value="3" {% if filters.trimester == '3' %}selected{% endif %}>T3</option>
-                    <option value="4" {% if filters.trimester == '4' %}selected{% endif %}>T4</option>
+                    <option value="1" {% if filters.trimester=='1' %}selected{% endif %}>T1</option>
+                    <option value="2" {% if filters.trimester=='2' %}selected{% endif %}>T2</option>
+                    <option value="3" {% if filters.trimester=='3' %}selected{% endif %}>T3</option>
+                    <option value="4" {% if filters.trimester=='4' %}selected{% endif %}>T4</option>
                 </select>
             </div>
             <div style="display:flex;flex-direction:column;gap:3px;">
-                <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Status</label>
+                <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Status</label>
                 <select name="status" class="form-control" style="height:32px;font-size:13px;min-width:105px;">
                     <option value="">All</option>
-                    <option value="pending"  {% if filters.status == 'pending'  %}selected{% endif %}>Pending</option>
-                    <option value="approved" {% if filters.status == 'approved' %}selected{% endif %}>Approved</option>
-                    <option value="shipped"  {% if filters.status == 'shipped'  %}selected{% endif %}>Shipped</option>
-                    <option value="rejected" {% if filters.status == 'rejected' %}selected{% endif %}>Rejected</option>
-                    <option value="override" {% if filters.status == 'override' %}selected{% endif %}>Override</option>
+                    <option value="pending" {% if filters.status=='pending' %}selected{% endif %}>Pending</option>
+                    <option value="approved" {% if filters.status=='approved' %}selected{% endif %}>Approved</option>
+                    <option value="shipped" {% if filters.status=='shipped' %}selected{% endif %}>Shipped</option>
+                    <option value="rejected" {% if filters.status=='rejected' %}selected{% endif %}>Rejected</option>
+                    <option value="override" {% if filters.status=='override' %}selected{% endif %}>Override</option>
                 </select>
             </div>
             <div style="display:flex;flex-direction:column;gap:3px;">
-                <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Type</label>
+                <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Type</label>
                 <select name="type" class="form-control" style="height:32px;font-size:13px;min-width:115px;">
                     <option value="">All</option>
-                    <option value="auto"            {% if filters.type == 'auto'            %}selected{% endif %}>Auto</option>
-                    <option value="needs-curation"  {% if filters.type == 'needs-curation'  %}selected{% endif %}>Needs Curation</option>
-                    <option value="incomplete-data" {% if filters.type == 'incomplete-data' %}selected{% endif %}>Incomplete</option>
-                    <option value="manual-override" {% if filters.type == 'manual-override' %}selected{% endif %}>Override</option>
-                    <option value="skipped"         {% if filters.type == 'skipped'         %}selected{% endif %}>Skipped</option>
+                    <option value="auto" {% if filters.type=='auto' %}selected{% endif %}>Auto</option>
+                    <option value="needs-curation" {% if filters.type=='needs-curation' %}selected{% endif %}>Needs
+                        Curation</option>
+                    <option value="incomplete-data" {% if filters.type=='incomplete-data' %}selected{% endif %}>
+                        Incomplete</option>
+                    <option value="manual-override" {% if filters.type=='manual-override' %}selected{% endif %}>Override
+                    </option>
+                    <option value="skipped" {% if filters.type=='skipped' %}selected{% endif %}>Skipped</option>
                 </select>
             </div>
             <div style="display:flex;flex-direction:column;gap:3px;">
-                <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Platform</label>
+                <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Platform</label>
                 <select name="platform" class="form-control" style="height:32px;font-size:13px;min-width:100px;">
                     <option value="">All</option>
-                    <option value="shopify"  {% if filters.platform == 'shopify'  %}selected{% endif %}>Shopify</option>
-                    <option value="cratejoy" {% if filters.platform == 'cratejoy' %}selected{% endif %}>Cratejoy</option>
+                    <option value="shopify" {% if filters.platform=='shopify' %}selected{% endif %}>Shopify</option>
+                    <option value="cratejoy" {% if filters.platform=='cratejoy' %}selected{% endif %}>Cratejoy</option>
                 </select>
             </div>
             <div style="display:flex;flex-direction:column;gap:3px;">
-                <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Month</label>
-                <input type="month" name="month" value="{{ filters.month or '' }}" class="form-control" style="height:32px;font-size:13px;min-width:130px;">
+                <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Month</label>
+                <input type="month" name="month" value="{{ filters.month or '' }}" class="form-control"
+                    style="height:32px;font-size:13px;min-width:130px;">
             </div>
             <div style="display:flex;flex-direction:column;gap:3px;">
-                <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Search</label>
-                <input type="text" name="q" value="{{ filters.q or '' }}" placeholder="name, email, SKU…" class="form-control" style="height:32px;font-size:13px;min-width:150px;">
+                <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Search</label>
+                <input type="text" name="q" value="{{ filters.q or '' }}" placeholder="name, email, SKU…"
+                    class="form-control" style="height:32px;font-size:13px;min-width:150px;">
             </div>
             <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
                 <button type="submit" class="btn btn-sm btn-primary" style="height:32px;">Filter</button>
-                <a href="/decisions" class="btn btn-sm" style="height:32px;line-height:22px;background:var(--surface2);border:1px solid var(--border);">Clear</a>
+                <a href="/decisions" class="btn btn-sm"
+                    style="height:32px;line-height:22px;background:var(--surface2);border:1px solid var(--border);">Clear</a>
             </div>
         </form>
         <!-- Export buttons (outside filter form so they don't interfere with submit) -->
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);align-items:center;">
+        <div
+            style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);align-items:center;">
             <a href="/decisions/export-csv{% if filter_qs %}?{{ filter_qs }}{% if 'status=' not in filter_qs %}&status=approved{% endif %}{% else %}?status=approved{% endif %}"
-               class="btn btn-sm" style="background:var(--blue);color:white;border:none;" title="Download Pirate Ship CSV">
+                class="btn btn-sm" style="background:var(--blue);color:white;border:none;"
+                title="Download Pirate Ship CSV">
                 📥 Pirate Ship CSV
             </a>
             <form method="POST" action="/decisions/export-sheet" style="display:inline;">
-                <input type="hidden" name="status"      value="{{ filters.status or 'approved' }}">
-                <input type="hidden" name="trimester"   value="{{ filters.trimester or '' }}">
-                <input type="hidden" name="type"        value="{{ filters.type or '' }}">
-                <input type="hidden" name="platform"    value="{{ filters.platform or '' }}">
-                <input type="hidden" name="month"       value="{{ filters.month or '' }}">
+                <input type="hidden" name="status" value="{{ filters.status or 'approved' }}">
+                <input type="hidden" name="trimester" value="{{ filters.trimester or '' }}">
+                <input type="hidden" name="type" value="{{ filters.type or '' }}">
+                <input type="hidden" name="platform" value="{{ filters.platform or '' }}">
+                <input type="hidden" name="month" value="{{ filters.month or '' }}">
                 <input type="hidden" name="redirect_qs" value="{{ filter_qs or '' }}">
-                <button type="submit" class="btn btn-sm" style="background:var(--green);color:white;border:none;" title="Push to Google Sheets">
+                <button type="submit" class="btn btn-sm" style="background:var(--green);color:white;border:none;"
+                    title="Push to Google Sheets">
                     📊 Push to Sheet
                 </button>
             </form>
-            <span style="font-size:11px;color:var(--text-dim);">CSV &amp; Sheet export default to <strong>approved</strong> status — use Status filter to change</span>
+            <span style="font-size:11px;color:var(--text-dim);">CSV &amp; Sheet export default to
+                <strong>approved</strong> status — use Status filter to change</span>
         </div>
     </div>
 
     <!-- ── Bulk Action Bar (sticky, hidden until selections made) ── -->
-    <div id="bulkBar" style="display:none;position:sticky;top:0;z-index:50;background:var(--surface2);border:1px solid var(--accent);border-radius:8px;padding:10px 16px;margin-bottom:12px;align-items:center;gap:12px;flex-wrap:wrap;">
+    <div id="bulkBar"
+        style="display:none;position:sticky;top:0;z-index:50;background:var(--surface2);border:1px solid var(--accent);border-radius:8px;padding:10px 16px;margin-bottom:12px;align-items:center;gap:12px;flex-wrap:wrap;">
         <span style="font-size:13px;color:var(--text-dim);">
             <strong id="selectedCount" style="color:var(--text);">0</strong> selected
         </span>
         <form id="bulkForm" method="POST" action="/decisions/bulk-action">
-            <input type="hidden" name="action"      value="">
+            <input type="hidden" name="action" value="">
             <input type="hidden" name="redirect_qs" value="{{ filter_qs or '' }}">
             {# decision_ids injected dynamically by submitBulk() #}
         </form>
-        <button onclick="submitBulk('approve')"     class="btn btn-sm btn-primary">✓ Approve Selected</button>
-        <button onclick="submitBulk('ship')"        class="btn btn-sm btn-secondary">📦 Ship Selected</button>
-        <button onclick="submitBulk('reject')"      class="btn btn-sm" style="background:var(--red);color:#fff;border:none;">✕ Reject Selected</button>
-        <button onclick="submitBulk('recurate')"    class="btn btn-sm" style="background:var(--yellow);color:#000;border:none;">🔄 Re-curate Selected</button>
-        <button onclick="clearBulkSelection()"      class="btn btn-sm" style="background:var(--surface);border:1px solid var(--border);">✕ Clear</button>
+        <button onclick="submitBulk('approve')" class="btn btn-sm btn-primary">✓ Approve Selected</button>
+        <button onclick="submitBulk('ship')" class="btn btn-sm btn-secondary">📦 Ship Selected</button>
+        <button onclick="submitBulk('reject')" class="btn btn-sm"
+            style="background:var(--red);color:#fff;border:none;">✕ Reject Selected</button>
+        <button onclick="submitBulk('recurate')" class="btn btn-sm"
+            style="background:var(--yellow);color:#000;border:none;">🔄 Re-curate Selected</button>
+        <button onclick="clearBulkSelection()" class="btn btn-sm"
+            style="background:var(--surface);border:1px solid var(--border);">✕ Clear</button>
     </div>
 
     <div class="card">
@@ -141,13 +165,14 @@
                     <th style="width:32px;">
                         <input type="checkbox" id="selectAll" title="Select / deselect all" style="cursor:pointer;">
                     </th>
-                    {{ sort_th('Date',      'created_at') }}
+                    {{ sort_th('Date', 'created_at') }}
                     {{ sort_th('Customer', 'customer_name') }}
                     <th>Platform</th>
                     {{ sort_th('Trimester', 'trimester') }}
-                    {{ sort_th('Type',      'decision_type') }}
-                    {{ sort_th('Kit',       'kit_sku') }}
-                    {{ sort_th('Status',    'status') }}
+                    {{ sort_th('Type', 'decision_type') }}
+                    {{ sort_th('Kit', 'kit_sku') }}
+                    {{ sort_th('Status', 'status') }}
+                    <th>VeraCore</th>
                     <th>Reason</th>
                     <th>Actions</th>
                 </tr>
@@ -156,7 +181,8 @@
                 {% for d in decisions %}
                 <tr>
                     <td>
-                        <input type="checkbox" class="decision-checkbox" value="{{ d.id }}" onchange="updateBulkBar()" style="cursor:pointer;">
+                        <input type="checkbox" class="decision-checkbox" value="{{ d.id }}" onchange="updateBulkBar()"
+                            style="cursor:pointer;">
                     </td>
                     <td>{{ d.created_at[:10] }}</td>
                     <td>
@@ -174,10 +200,12 @@
                         {% elif d.platform == 'cratejoy' %}<span class="badge badge-blue">Cratejoy</span>
                         {% else %}<span class="badge badge-dim">{{ d.platform or '—' }}</span>{% endif %}
                     </td>
-                    <td>{% if d.trimester %}<span class="badge badge-purple">T{{ d.trimester }}</span>{% else %}—{% endif %}</td>
+                    <td>{% if d.trimester %}<span class="badge badge-purple">T{{ d.trimester }}</span>{% else %}—{%
+                        endif %}</td>
                     <td>
                         {% if d.decision_type == 'auto' %}<span class="badge badge-green">Auto</span>
-                        {% elif d.decision_type == 'needs-curation' %}<span class="badge badge-yellow">Needs Curation</span>
+                        {% elif d.decision_type == 'needs-curation' %}<span class="badge badge-yellow">Needs
+                            Curation</span>
                         {% elif d.decision_type == 'incomplete-data' %}<span class="badge badge-red">Incomplete</span>
                         {% elif d.decision_type == 'needs-data-entry' %}<span class="badge badge-red">Needs Data</span>
                         {% elif d.decision_type == 'skipped' %}<span class="badge badge-dim">Skipped</span>
@@ -191,16 +219,46 @@
                         {% elif d.status == 'shipped' %}<span class="badge badge-blue">{{ d.status }}</span>
                         {% else %}<span class="badge badge-dim">{{ d.status }}</span>{% endif %}
                     </td>
+                    <td style="white-space:nowrap;">
+                        {% if d.veracore_status == 'submitted' %}
+                        <span class="badge badge-green" title="VC Order: {{ d.veracore_order_id or '—' }}">✓
+                            submitted</span>
+                        {% elif d.veracore_status == 'shipped' %}
+                        <span class="badge badge-blue" title="VC Order: {{ d.veracore_order_id or '—' }}">📦
+                            shipped</span>
+                        {% if d.veracore_tracking %}
+                        <div style="font-size:10px;color:var(--text-dim);font-family:monospace;margin-top:2px;"
+                            title="{{ d.veracore_tracking }}">
+                            {{ d.veracore_tracking[:28] }}{% if d.veracore_tracking | length > 28 %}…{% endif %}
+                        </div>
+                        {% endif %}
+                        {% elif d.veracore_status == 'failed' %}
+                        <span class="badge badge-red" title="{{ (d.veracore_last_error or 'unknown error')[:200] }}">✕
+                            failed</span>
+                        <form method="POST" action="/decisions/{{ d.id }}/veracore-retry"
+                            style="display:inline;margin-left:4px;">
+                            <button type="submit" class="btn btn-sm btn-secondary"
+                                title="Retry VeraCore submit (idempotent)">↻ retry</button>
+                        </form>
+                        {% elif d.veracore_status == 'manual' %}
+                        <span class="badge badge-purple" title="Approved via Pirate Ship — not pushed to VeraCore">🏴
+                            Pirate Ship</span>
+                        {% elif d.status == 'approved' %}
+                        <span class="badge badge-dim" title="Not yet pushed to VeraCore">pending push</span>
+                        {% else %}
+                        <span style="color:var(--text-dim);font-size:11px;">—</span>
+                        {% endif %}
+                    </td>
                     <td style="max-width:250px;">
                         {% if d.reason and d.reason | length > 80 %}
                         <span id="reason-short-{{ d.id }}" style="font-size:12px;color:var(--text-dim);cursor:pointer;"
-                              onclick="toggleReason('{{ d.id }}')" title="Click to expand">
+                            onclick="toggleReason('{{ d.id }}')" title="Click to expand">
                             {{ d.reason[:80] }}… <span style="font-size:10px;color:var(--accent);">[more]</span>
                         </span>
                         <span id="reason-full-{{ d.id }}" style="display:none;font-size:12px;color:var(--text-dim);">
                             {{ d.reason }}
                             <a href="#" onclick="toggleReason('{{ d.id }}');return false;"
-                               style="font-size:10px;color:var(--accent);margin-left:4px;">[less]</a>
+                                style="font-size:10px;color:var(--accent);margin-left:4px;">[less]</a>
                         </span>
                         {% else %}
                         <span style="font-size:12px;color:var(--text-dim);">{{ d.reason or '—' }}</span>
@@ -208,25 +266,33 @@
                     </td>
                     <td style="white-space:nowrap;">
                         {% if d.status == 'pending' %}
-                            {% if d.kit_sku %}
-                            <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-primary" title="Approve and decrement stock">✓</button>
-                            </form>
-                            <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-secondary" title="Approve + Mark Shipped"
-                                        onclick="return confirm('Approve and mark as shipped?')">📦</button>
-                            </form>
-                            {% endif %}
-                            <form method="POST" action="/decisions/{{ d.id }}/reject" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-danger" title="Reject"
-                                        onclick="return confirm('Reject this decision?')">✕</button>
-                            </form>
+                        {% if d.kit_sku %}
+                        <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-primary" title="Approve → push to VeraCore">✓
+                                VC</button>
+                        </form>
+                        <form method="POST" action="/decisions/{{ d.id }}/approve?via=pirateship"
+                            style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-secondary"
+                                title="Approve → Pirate Ship CSV (skip VeraCore)"
+                                onclick="return confirm('Approve via Pirate Ship? (VeraCore push will be skipped — use CSV export instead.)')">🏴
+                                PS</button>
+                        </form>
+                        <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-secondary" title="Approve + Mark Shipped"
+                                onclick="return confirm('Approve and mark as shipped?')">📦</button>
+                        </form>
+                        {% endif %}
+                        <form method="POST" action="/decisions/{{ d.id }}/reject" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-danger" title="Reject"
+                                onclick="return confirm('Reject this decision?')">✕</button>
+                        </form>
                         {% elif d.status == 'approved' %}
-                            <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-secondary" title="Mark Shipped">📦 Ship</button>
-                            </form>
+                        <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-secondary" title="Mark Shipped">📦 Ship</button>
+                        </form>
                         {% else %}
-                            <span style="color:var(--text-dim);font-size:11px;">—</span>
+                        <span style="color:var(--text-dim);font-size:11px;">—</span>
                         {% endif %}
                     </td>
                 </tr>
@@ -249,11 +315,11 @@
 <script>
     function toggleReason(id) {
         var shortEl = document.getElementById('reason-short-' + id);
-        var fullEl  = document.getElementById('reason-full-'  + id);
+        var fullEl = document.getElementById('reason-full-' + id);
         if (!shortEl || !fullEl) return;
         var isHidden = fullEl.style.display === 'none';
-        shortEl.style.display = isHidden ? 'none'   : 'inline';
-        fullEl.style.display  = isHidden ? 'inline' : 'none';
+        shortEl.style.display = isHidden ? 'none' : 'inline';
+        fullEl.style.display = isHidden ? 'inline' : 'none';
     }
 
     var selectAllEl = document.getElementById('selectAll');
@@ -268,9 +334,9 @@
 
     function updateBulkBar() {
         var checked = document.querySelectorAll('.decision-checkbox:checked');
-        var bar     = document.getElementById('bulkBar');
+        var bar = document.getElementById('bulkBar');
         var countEl = document.getElementById('selectedCount');
-        if (bar)     bar.style.display   = checked.length > 0 ? 'flex' : 'none';
+        if (bar) bar.style.display = checked.length > 0 ? 'flex' : 'none';
         if (countEl) countEl.textContent = checked.length;
     }
 
@@ -281,9 +347,9 @@
         var checked = document.querySelectorAll('.decision-checkbox:checked');
         if (checked.length === 0) { alert('No decisions selected.'); return; }
         checked.forEach(function (cb) {
-            var inp   = document.createElement('input');
-            inp.type  = 'hidden';
-            inp.name  = 'decision_ids';
+            var inp = document.createElement('input');
+            inp.type = 'hidden';
+            inp.name = 'decision_ids';
             inp.value = cb.value;
             form.appendChild(inp);
         });
