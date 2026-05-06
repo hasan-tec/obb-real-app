@@ -81,6 +81,8 @@ VERACORE_AUTH_MODE  = os.getenv("VERACORE_AUTH_MODE", "basic")  # basic | base64
 VERACORE_INVENTORY_PATH = os.getenv("VERACORE_INVENTORY_PATH", "/inventory")
 VERACORE_ORDER_PATH     = os.getenv("VERACORE_ORDER_PATH", "/orders")
 VERACORE_SHIPMENT_PATH  = os.getenv("VERACORE_SHIPMENT_PATH", "/shipments")
+# SOAP endpoint for order creation — defaults derived from REST host if blank.
+VERACORE_SOAP_URL       = os.getenv("VERACORE_SOAP_URL", "")
 
 _vc_client = None
 
@@ -108,6 +110,7 @@ def get_veracore_client():
             inventory_path=VERACORE_INVENTORY_PATH,
             order_path=VERACORE_ORDER_PATH,
             shipment_path=VERACORE_SHIPMENT_PATH,
+            soap_url=VERACORE_SOAP_URL,
         )
     return _vc_client
 

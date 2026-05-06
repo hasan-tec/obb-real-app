@@ -36,7 +36,10 @@ import base64
 import json
 import logging
 import time
+import xml.etree.ElementTree as ET
 from typing import Optional
+from urllib.parse import urlparse
+from xml.sax.saxutils import escape as _xml_escape
 
 import httpx
 
@@ -59,6 +62,11 @@ MAX_RETRIES = 3
 BACKOFF_BASE_SECONDS = 1.0
 # Per-request timeout (connect + read).
 DEFAULT_TIMEOUT_SECONDS = 30.0
+
+# VeraCore SOAP AddOrder constants.
+_SOAP_NS = "http://sma-promail/"
+_SOAP_ACTION_ADD_ORDER = "http://sma-promail/AddOrder"
+ORDER_ID_MAX_LEN = 20  # VeraCore hard limit
 
 
 class VeraCoreClient:
@@ -90,6 +98,9 @@ class VeraCoreClient:
         order_path: str = "/orders",
         shipment_path: str = "/shipments",
         oauth_token_path: str = "/oauth/token",
+        # SOAP endpoint for order creation (different base path from REST API).
+        # Defaults to https://<same-host>/pmomsws/order.asmx if not supplied.
+        soap_url: str = "",
     ):
         if not base_url:
             raise VeraCoreError("VeraCoreClient: base_url is required")
@@ -106,6 +117,10 @@ class VeraCoreClient:
         self.order_path = order_path
         self.shipment_path = shipment_path
         self.oauth_token_path = oauth_token_path
+
+        # SOAP endpoint — derive from REST host if not explicitly set.
+        parsed = urlparse(self.base_url)
+        self.soap_url = soap_url or f"{parsed.scheme}://{parsed.netloc}/pmomsws/order.asmx"
 
         self._token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -353,6 +368,166 @@ class VeraCoreClient:
         logger.info("[VERACORE] Inventory sync pulled %d SKUs", len(normalized))
         return normalized
 
+    # ─────────────────────────────────────────────────────────
+    # SOAP helpers (AddOrder)
+    # ─────────────────────────────────────────────────────────
+
+    def _build_soap_add_order_xml(
+        self,
+        order_id: str,
+        ship_to: dict,
+        line_items: list[dict],
+        shipping_method: str,
+        comments: str,
+    ) -> str:
+        """
+        Return a SOAP 1.1 envelope for AddOrder, matching the actual WSDL schema.
+
+        Field sources confirmed from rhu190.veracore.com/pmomsws/order.asmx?wsdl:
+        - OrderedBy / OrderShipTo both extend OrderMailer, which has:
+          FirstName, LastName, Address1, Address2, City, State, PostalCode, Country, Phone, Email
+        - Offers is a direct child of <order>, NOT nested inside ShipTo
+        - Shipping carrier/service goes in <Shipping><FreightCarrier><Name> + <FreightService><Description>
+        - Flag=OrderedBy on OrderShipTo means "ship to same address as OrderedBy"
+        - AuthenticationHeader and AddOrder use xmlns="http://sma-promail/" default namespace (no prefix)
+        """
+
+        def e(v) -> str:
+            return _xml_escape(str(v or ""))
+
+        # Split full name → FirstName / LastName (OrderMailer uses separate fields).
+        name_parts = (ship_to.get("name") or "").strip().split(" ", 1)
+        first_name = name_parts[0]
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+        # Shipping: FreightCarrier.Name + FreightService.Description.
+        # VeraCore carrier/service must match codes configured in their account.
+        # "USPS Ground Advantage" → carrier="USPS", service="Ground Advantage".
+        carrier, _, service = (shipping_method or "USPS").partition(" ")
+        if not service:
+            service = carrier
+            carrier = "USPS"
+
+        # Build OfferOrdered blocks — Offers is at <order> level, not inside ShipTo.
+        # Offer.Header.ID = the kit Offer code in VeraCore (e.g. "CK21").
+        offers_xml = ""
+        for item in line_items:
+            offer_sku = item.get("offer_id") or item.get("sku") or ""
+            qty = int(item.get("quantity", 1))
+            offers_xml += f"""
+        <OfferOrdered>
+          <Offer>
+            <Header>
+              <ID>{e(offer_sku)}</ID>
+            </Header>
+          </Offer>
+          <Quantity>{qty}</Quantity>
+        </OfferOrdered>"""
+
+        addr2_xml = f"<Address2>{e(ship_to['address2'])}</Address2>" if ship_to.get("address2") else ""
+        phone_xml = f"<Phone>{e(ship_to['phone'])}</Phone>" if ship_to.get("phone") else ""
+        comments_xml = f"<Comments>{e(comments)}</Comments>" if comments else ""
+
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <AuthenticationHeader xmlns="http://sma-promail/">
+      <Username>{e(self.user_id)}</Username>
+      <Password>{e(self.password)}</Password>
+    </AuthenticationHeader>
+  </soap:Header>
+  <soap:Body>
+    <AddOrder xmlns="http://sma-promail/">
+      <order>
+        <Header>
+          <ID>{e(order_id)}</ID>
+          {comments_xml}
+        </Header>
+        <Shipping>
+          <FreightCarrier>
+            <Name>{e(carrier)}</Name>
+          </FreightCarrier>
+          <FreightService>
+            <Description>{e(service)}</Description>
+          </FreightService>
+        </Shipping>
+        <OrderedBy>
+          <FirstName>{e(first_name)}</FirstName>
+          <LastName>{e(last_name)}</LastName>
+          <Address1>{e(ship_to.get("address1"))}</Address1>
+          {addr2_xml}
+          <City>{e(ship_to.get("city"))}</City>
+          <State>{e(ship_to.get("state"))}</State>
+          <PostalCode>{e(ship_to.get("zip"))}</PostalCode>
+          <Country>{e(ship_to.get("country", "US"))}</Country>
+          {phone_xml}
+        </OrderedBy>
+        <ShipTo>
+          <OrderShipTo>
+            <Flag>OrderedBy</Flag>
+          </OrderShipTo>
+        </ShipTo>
+        <Offers>{offers_xml}
+        </Offers>
+      </order>
+    </AddOrder>
+  </soap:Body>
+</soap:Envelope>"""
+
+    def _soap_request(self, xml_body: str, soap_action: str) -> str:
+        """POST raw SOAP XML to self.soap_url with retry on 5xx/network errors."""
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8",
+            "SOAPAction": f'"{soap_action}"',
+        }
+        last_exc: Optional[Exception] = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                logger.info("[VERACORE-SOAP] POST %s (attempt %d/%d)",
+                            self.soap_url, attempt + 1, MAX_RETRIES + 1)
+                r = self._http.post(
+                    self.soap_url,
+                    content=xml_body.encode("utf-8"),
+                    headers=headers,
+                )
+                if 400 <= r.status_code < 500:
+                    logger.error("[VERACORE-SOAP] %d (client error): %s",
+                                 r.status_code, r.text[:500])
+                    raise VeraCoreError(
+                        f"SOAP AddOrder → {r.status_code}: {r.text[:200]}",
+                        status_code=r.status_code,
+                        response_body=r.text,
+                    )
+                if r.status_code >= 500:
+                    # SOAP faults come back as HTTP 500 with an XML body.
+                    # If the body is XML, return it and let add_order() parse the fault.
+                    # Only retry if it's a non-XML server crash (HTML error page etc.).
+                    if r.text.strip().startswith("<"):
+                        logger.error("[VERACORE-SOAP] SOAP 500 XML response (likely fault): %s",
+                                     r.text[:300])
+                        return r.text
+                    logger.warning("[VERACORE-SOAP] %d non-XML server error (will retry)", r.status_code)
+                    last_exc = VeraCoreError(
+                        f"SOAP AddOrder -> {r.status_code}",
+                        status_code=r.status_code,
+                        response_body=r.text,
+                    )
+                    if attempt < MAX_RETRIES:
+                        time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+                        continue
+                    raise last_exc
+                return r.text
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                logger.warning("[VERACORE-SOAP] Network error attempt %d: %s", attempt + 1, exc)
+                last_exc = VeraCoreError(f"SOAP network error: {exc}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+                    continue
+                raise last_exc from exc
+        raise last_exc or VeraCoreError("SOAP request failed after retries")
+
     def get_offers(self, offer_ids: Optional[list] = None) -> list[dict]:
         """
         GET /api/Offers — list Offers (kit definitions) in the VeraCore account.
@@ -380,49 +555,83 @@ class VeraCoreClient:
     def add_order(
         self,
         order_id: str,
-        _ship_to: dict,
-        _line_items: list[dict],
-        _shipping_method: str,
-        _comments: str = "",
-        _customs: Optional[dict] = None,
+        ship_to: dict,
+        line_items: list[dict],
+        shipping_method: str,
+        comments: str = "",
+        customs: Optional[dict] = None,
     ) -> dict:
         """
-        Submit a new customer order to VeraCore.
+        Submit a new customer order to VeraCore via SOAP AddOrder web service.
 
-        ⚠️  IMPLEMENTATION BLOCKED — see note below before calling this.
+        Endpoint: POST {soap_url}  (default: https://<host>/pmomsws/order.asmx)
+        SOAPAction: "http://sma-promail/AddOrder"
+        Auth: SOAP AuthenticationHeader (Username + Password) — NOT JWT.
 
-        CONFIRMED from Swagger (2026-05-07): The VeraCore Public REST API at
-        /VeraCore/Public.Api has NO endpoint for creating new OMS orders.
-        The only REST order endpoints are GET (query existing orders).
+        line_items items must have keys: offer_id (= kit SKU in VeraCore, e.g. "CK21")
+        and quantity (int, typically 1).
 
-        POST /api/ShippingOrder is for creating WMS pick slips from EXISTING OMS
-        orders — it requires an orderId that must already exist in the OMS. It is
-        NOT for creating new customer orders. Tested live: returns 400 "Unable to
-        locate Order for Order Id '...'" when the order doesn't pre-exist.
+        Returns: {"order_id": str, "veracore_internal_id": int_or_None}
+          - veracore_internal_id = OrderSeqID from VeraCore (their internal PK)
+          - order_id = the ID we sent (echoed back)
 
-        WHAT IS NEEDED: The classic VeraCore "Add Order Web Service" — a SOAP
-        endpoint at a different base URL (e.g. /VeraCore/Services.asmx or similar).
-        Brian (VeraCore rep) must provide: the SOAP endpoint URL and the exact
-        XML request schema. Once that is known, this method should be rewritten to
-        call the SOAP endpoint using httpx + raw XML (or the zeep library).
-
-        Until then: this method logs a critical warning and raises VeraCoreError so
-        the caller sees a clean 'failed' status rather than a silent wrong call.
+        NOTE: order_id is hard-limited to 20 characters by VeraCore.
+        NOTE: customs is not sent in the SOAP body (no standard AddOrder field for it).
+              For international orders, customs paperwork is handled separately in VeraCore.
         """
         if not order_id:
             raise VeraCoreError("add_order: order_id is required")
+        if not ship_to:
+            raise VeraCoreError("add_order: ship_to is required")
+        if not line_items:
+            raise VeraCoreError("add_order: line_items cannot be empty")
+        if len(order_id) > ORDER_ID_MAX_LEN:
+            raise VeraCoreError(
+                f"add_order: order_id '{order_id}' exceeds {ORDER_ID_MAX_LEN}-char VeraCore limit"
+            )
 
-        logger.critical(
-            "[VERACORE] add_order called but SOAP endpoint not yet implemented. "
-            "OrderID=%s will NOT be submitted. Ask Brian for the Add Order SOAP URL.",
-            order_id,
+        logger.info(
+            "[VERACORE] add_order SOAP OrderID=%s ship_to=%s items=%d soap_url=%s",
+            order_id, ship_to.get("name", "?"), len(line_items), self.soap_url,
         )
-        raise VeraCoreError(
-            "add_order: VeraCore order creation requires the SOAP AddOrder web service "
-            "which is not yet implemented. The Public REST API has no POST /api/orders "
-            "endpoint. Obtain the SOAP endpoint URL from Brian and implement it here.",
-            status_code=None,
+
+        xml_body = self._build_soap_add_order_xml(
+            order_id, ship_to, line_items, shipping_method, comments
         )
+        response_text = self._soap_request(xml_body, _SOAP_ACTION_ADD_ORDER)
+
+        # Parse SOAP response XML.
+        try:
+            root = ET.fromstring(response_text)
+        except ET.ParseError as exc:
+            raise VeraCoreError(f"SOAP response is not valid XML: {exc}") from exc
+
+        # Check for SOAP Fault.
+        fault = root.find(".//{http://schemas.xmlsoap.org/soap/envelope/}Fault")
+        if fault is None:
+            fault = root.find(".//faultstring")
+        if fault is not None:
+            fs = fault.find("faultstring")
+            fault_msg = (fs.text if fs is not None else ET.tostring(fault, encoding="unicode"))
+            raise VeraCoreError(f"SOAP fault from VeraCore: {fault_msg}")
+
+        # Extract OrderSeqID (their internal PK) and OrderID (our echoed ID).
+        seq_elem = (
+            root.find(f"{{{_SOAP_NS}}}OrderSeqID")
+            or root.find(".//{{{_SOAP_NS}}}OrderSeqID")
+            or root.find(".//OrderSeqID")
+        )
+        oid_elem = (
+            root.find(f"{{{_SOAP_NS}}}OrderID")
+            or root.find(".//{{{_SOAP_NS}}}OrderID")
+            or root.find(".//OrderID")
+        )
+
+        seq_id = int(seq_elem.text) if seq_elem is not None and seq_elem.text else None
+        returned_id = oid_elem.text if oid_elem is not None and oid_elem.text else order_id
+
+        logger.info("[VERACORE] add_order success OrderID=%s OrderSeqID=%s", returned_id, seq_id)
+        return {"order_id": returned_id, "veracore_internal_id": seq_id}
 
     def get_shipments(self, since_iso: str) -> list[dict]:
         """
