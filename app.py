@@ -14,6 +14,7 @@ import logging
 import csv
 import io
 import uuid
+import asyncio
 import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -5301,7 +5302,7 @@ async def veracore_sync_inventory_now(request: Request):
             return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
                                     status_code=303)
         from veracore_sync import run_inventory_sync
-        r = run_inventory_sync(db, vc)
+        r = await asyncio.get_running_loop().run_in_executor(None, run_inventory_sync, db, vc)
         await log_activity("veracore",
                            f"Manual inventory sync: synced={r['synced']} skipped={r['skipped']} alerts={r['alerts_raised']}",
                            (r.get("error") or "")[:200],
@@ -5356,7 +5357,7 @@ async def veracore_sync_expiry_now(request: Request):
             return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
                                     status_code=303)
         from veracore_sync import run_expiry_sync
-        r = run_expiry_sync(db, vc)
+        r = await asyncio.get_running_loop().run_in_executor(None, run_expiry_sync, db, vc)
         await log_activity("veracore",
                            f"Manual expiry sync: updated={r['updated']} no_match={r['skipped_no_match']}",
                            (r.get("error") or "")[:200],

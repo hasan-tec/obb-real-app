@@ -67,9 +67,8 @@ def run_inventory_sync(db, vc_client) -> dict:
     """
     Pull VeraCore inventory → update kits.quantity_available → raise low-stock alerts.
 
-    Args:
-        db:        Supabase client (from get_supabase()).
-        vc_client: VeraCoreClient instance.
+    Optimised: bulk-fetches all kits + existing alerts upfront, does matching in-memory,
+    and only writes rows where quantity actually changed.
 
     Returns: {synced: int, skipped: int, alerts_raised: int, error: str|None}
     """
@@ -77,6 +76,23 @@ def run_inventory_sync(db, vc_client) -> dict:
     started_at = datetime.utcnow()
     logger.info("[VERACORE SYNC] ═══ Inventory sync started at %s UTC ═══", started_at.isoformat())
 
+    # 1. Bulk-fetch all kits and existing unresolved alerts — 2 DB calls total instead of N.
+    try:
+        all_kits    = db.table("kits").select("id, sku, quantity_available, veracore_sku").execute().data or []
+        alerts_data = db.table("kit_stock_alerts").select("kit_id").eq("resolved", False).execute().data or []
+    except Exception as e:
+        err = f"bulk DB fetch failed: {e}"
+        logger.error("[VERACORE SYNC] %s", err, exc_info=True)
+        log_sync(db, "inventory", None, None, None, "fail", err)
+        result["error"] = err
+        return result
+
+    # Build O(1) lookup dicts keyed by upper-cased SKU.
+    kits_by_vc_sku  = {k["veracore_sku"].upper(): k for k in all_kits if k.get("veracore_sku")}
+    kits_by_sku     = {k["sku"].upper(): k for k in all_kits if k.get("sku")}
+    alerted_kit_ids = {r["kit_id"] for r in alerts_data}
+
+    # 2. Pull VeraCore inventory (1 API call).
     try:
         rows = vc_client.get_inventory()
     except Exception as e:
@@ -86,61 +102,47 @@ def run_inventory_sync(db, vc_client) -> dict:
         result["error"] = err
         return result
 
+    # 3. Process in-memory; only DB-write rows where qty actually changed.
     for row in rows:
         sku = row.get("sku")
         if not sku:
             result["skipped"] += 1
             continue
 
-        # VeraCore Id casing is inconsistent ("Kits" vs "KITS") — normalise before matching.
-        # ilike = case-insensitive LIKE in PostgreSQL (no wildcards → behaves as = ignoring case).
         sku_upper = sku.upper()
-        # Match by veracore_sku first (explicit mapping), then fall back to internal SKU.
-        try:
-            kit_res = db.table("kits").select("id, sku, quantity_available, veracore_sku") \
-                                      .ilike("veracore_sku", sku_upper).execute()
-            if not kit_res.data:
-                kit_res = db.table("kits").select(
-                    "id, sku, quantity_available, veracore_sku"
-                ).ilike("sku", sku_upper).execute()
-        except Exception as e:
-            logger.warning("[VERACORE SYNC] DB lookup failed for sku=%s: %s", sku, e)
-            result["skipped"] += 1
-            continue
-
-        if not kit_res.data:
+        kit = kits_by_vc_sku.get(sku_upper) or kits_by_sku.get(sku_upper)
+        if not kit:
             logger.debug("[VERACORE SYNC] No matching kit for VeraCore SKU '%s' — skipping", sku)
             result["skipped"] += 1
             continue
 
-        kit = kit_res.data[0]
         new_qty = max(0, int(row.get("available_balance", 0)))
         old_qty = int(kit.get("quantity_available", 0) or 0)
 
-        try:
-            db.table("kits").update({"quantity_available": new_qty}).eq("id", kit["id"]).execute()
-            result["synced"] += 1
-            if old_qty != new_qty:
-                logger.info("[VERACORE SYNC] Kit %s qty: %d → %d", kit["sku"], old_qty, new_qty)
-        except Exception as e:
-            logger.warning("[VERACORE SYNC] Update failed for kit %s: %s", kit["sku"], e)
-            result["skipped"] += 1
-            continue
-
-        # Raise low-stock alert if needed — only if no unresolved alert already exists.
-        if new_qty < LOW_STOCK_THRESHOLD:
+        if old_qty != new_qty:
             try:
-                existing = db.table("kit_stock_alerts").select("id").eq("kit_id", kit["id"]).eq("resolved", False).execute()
-                if not existing.data:
-                    db.table("kit_stock_alerts").insert({
-                        "kit_id":    kit["id"],
-                        "seen_qty":  new_qty,
-                        "threshold": LOW_STOCK_THRESHOLD,
-                        "note":      f"Auto-raised by inventory sync — VeraCore shows {new_qty} on hand",
-                    }).execute()
-                    result["alerts_raised"] += 1
-                    logger.warning("[VERACORE SYNC] 🚨 LOW STOCK alert raised for %s (qty=%d, threshold=%d)",
-                                   kit["sku"], new_qty, LOW_STOCK_THRESHOLD)
+                db.table("kits").update({"quantity_available": new_qty}).eq("id", kit["id"]).execute()
+                logger.info("[VERACORE SYNC] Kit %s qty: %d → %d", kit["sku"], old_qty, new_qty)
+                kit["quantity_available"] = new_qty  # keep in-memory state current
+            except Exception as e:
+                logger.warning("[VERACORE SYNC] Update failed for kit %s: %s", kit["sku"], e)
+                result["skipped"] += 1
+                continue
+        result["synced"] += 1
+
+        # Alert check is in-memory — no extra DB call per kit.
+        if new_qty < LOW_STOCK_THRESHOLD and kit["id"] not in alerted_kit_ids:
+            try:
+                db.table("kit_stock_alerts").insert({
+                    "kit_id":    kit["id"],
+                    "seen_qty":  new_qty,
+                    "threshold": LOW_STOCK_THRESHOLD,
+                    "note":      f"Auto-raised by inventory sync — VeraCore shows {new_qty} on hand",
+                }).execute()
+                alerted_kit_ids.add(kit["id"])  # prevent double-insert within same run
+                result["alerts_raised"] += 1
+                logger.warning("[VERACORE SYNC] LOW STOCK alert raised for %s (qty=%d, threshold=%d)",
+                               kit["sku"], new_qty, LOW_STOCK_THRESHOLD)
             except Exception as e:
                 logger.warning("[VERACORE SYNC] Failed to raise stock alert for %s: %s", kit["sku"], e)
 
@@ -236,16 +238,10 @@ def run_shipment_poll(db, vc_client, since_iso: Optional[str] = None) -> dict:
 
 def run_expiry_sync(db, vc_client) -> dict:
     """
-    Pull VeraCore GetInventory → parse expiry dates from each offer's Title field
-    → update items.expiry_date in OBB DB.
+    Pull VeraCore GetInventory → parse expiry dates from offer Titles → update items.expiry_date.
 
-    Rules:
-    - Only processes non-kit offers (skips any Id containing "kits").
-    - Matches OBB items by veracore_sku (explicit override) first, then
-      case-insensitive sku match (VeraCore uses mixed-case, OBB uses UPPER).
-    - Some VeraCore Ids embed the EXP date in the Id itself — strips it before matching.
-    - Never creates new items. Never clears an existing expiry_date if no EXP found.
-    - Skips rows where the parsed date is already stored (avoids unnecessary DB writes).
+    Optimised: bulk-fetches all items upfront, does matching in-memory,
+    and only writes rows where the date actually changed.
 
     Returns: {updated, skipped_no_match, skipped_no_expiry, error}
     """
@@ -253,6 +249,20 @@ def run_expiry_sync(db, vc_client) -> dict:
     started_at = datetime.utcnow()
     logger.info("[EXPIRY SYNC] ═══ Expiry sync started at %s UTC ═══", started_at.isoformat())
 
+    # 1. Bulk-fetch all items — 1 DB call instead of 2 per VeraCore row.
+    try:
+        all_items = db.table("items").select("id, sku, expiry_date, veracore_sku").execute().data or []
+    except Exception as e:
+        err = f"bulk items fetch failed: {e}"
+        logger.error("[EXPIRY SYNC] %s", err, exc_info=True)
+        log_sync(db, "expiry_sync", None, None, None, "fail", err)
+        result["error"] = err
+        return result
+
+    items_by_vc_sku = {it["veracore_sku"].upper(): it for it in all_items if it.get("veracore_sku")}
+    items_by_sku    = {it["sku"].upper(): it for it in all_items if it.get("sku")}
+
+    # 2. Pull VeraCore inventory (1 API call).
     try:
         rows = vc_client.get_inventory()
     except Exception as e:
@@ -262,28 +272,25 @@ def run_expiry_sync(db, vc_client) -> dict:
         result["error"] = err
         return result
 
+    # 3. Process in-memory; only write rows where date actually changed.
     for row in rows:
         sku   = row.get("sku", "")
         title = row.get("title", "")
 
-        # Skip kit offers — we sync kit *quantity* separately in run_inventory_sync.
         if "kits" in sku.lower():
             continue
 
-        # Parse EXP from title — handles both numeric (EXP 01/2026) and word-month (EXP January 2026).
         m = _EXP_RE.search(title)
         if not m:
             result["skipped_no_expiry"] += 1
             continue
 
         if m.group(1) is not None:
-            # Numeric format: EXP MM/YYYY or EXP MM/YY
             month = int(m.group(1))
             year  = int(m.group(2))
             if year < 100:
                 year += 2000
         else:
-            # Word-month format: EXP January 2026 / EXP Jan 2026
             month = _MONTH_MAP.get(m.group(3).lower())
             if not month:
                 logger.warning("[EXPIRY SYNC] Unrecognised month name '%s' in title: %s", m.group(3), title)
@@ -292,38 +299,23 @@ def run_expiry_sync(db, vc_client) -> dict:
             year = int(m.group(4))
         expiry_date = f"{year:04d}-{month:02d}-01"
 
-        # Some VeraCore Ids have " EXP MM/YYYY" appended in the Id itself.
-        # Strip it so we can match cleanly against items.sku.
         sku_upper = _EXP_RE.sub("", sku).strip().upper()
+        item = items_by_vc_sku.get(sku_upper) or items_by_sku.get(sku_upper)
 
-        # Look up the item: veracore_sku explicit override first, then sku fallback.
-        # ilike = case-insensitive match (OBB uses UPPER, VeraCore uses mixed case).
-        try:
-            item_res = db.table("items").select("id, sku, expiry_date, veracore_sku") \
-                                        .ilike("veracore_sku", sku_upper).execute()
-            if not item_res.data:
-                item_res = db.table("items").select("id, sku, expiry_date, veracore_sku") \
-                                            .ilike("sku", sku_upper).execute()
-        except Exception as e:
-            logger.warning("[EXPIRY SYNC] DB lookup failed for sku=%s: %s", sku, e)
-            result["skipped_no_match"] += 1
-            continue
-
-        if not item_res.data:
+        if not item:
             logger.debug("[EXPIRY SYNC] No matching item for VeraCore Id '%s' — skipping", sku)
             result["skipped_no_match"] += 1
             continue
 
-        item = item_res.data[0]
-        # Skip if already the same date (avoid unnecessary writes).
         if str(item.get("expiry_date") or "")[:10] == expiry_date:
-            continue
+            continue  # already correct, skip write
 
         try:
             db.table("items").update({"expiry_date": expiry_date}).eq("id", item["id"]).execute()
             result["updated"] += 1
             logger.info("[EXPIRY SYNC] Item %s expiry: %s → %s",
                         item["sku"], item.get("expiry_date") or "none", expiry_date)
+            item["expiry_date"] = expiry_date  # keep in-memory state current
         except Exception as e:
             logger.warning("[EXPIRY SYNC] Update failed for item %s: %s", item["sku"], e)
 
