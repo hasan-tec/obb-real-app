@@ -18,8 +18,20 @@ import re
 from datetime import datetime
 from typing import Optional
 
-# Matches "EXP 10/2026", "EXP 9/22", "Exp. 04/2022" — case-insensitive.
-_EXP_RE = re.compile(r'EXP\.?\s+(\d{1,2})/(\d{2,4})', re.IGNORECASE)
+# Matches "EXP 10/2026", "EXP 9/22", "Exp. 04/2022" AND "EXP January 2026", "EXP Jan 2026".
+_EXP_RE = re.compile(
+    r'EXP\.?\s+(?:(\d{1,2})/(\d{2,4})|([A-Za-z]+)\s+(\d{4}))',
+    re.IGNORECASE
+)
+_MONTH_MAP = {
+    'january': 1, 'jan': 1, 'february': 2, 'feb': 2,
+    'march': 3,   'mar': 3, 'april': 4,    'apr': 4,
+    'may': 5,
+    'june': 6,    'jun': 6, 'july': 7,     'jul': 7,
+    'august': 8,  'aug': 8, 'september': 9,'sep': 9, 'sept': 9,
+    'october': 10,'oct': 10,'november': 11,'nov': 11,
+    'december': 12,'dec': 12,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -258,16 +270,26 @@ def run_expiry_sync(db, vc_client) -> dict:
         if "kits" in sku.lower():
             continue
 
-        # Parse EXP MM/YYYY (or MM/YY) from the title field.
+        # Parse EXP from title — handles both numeric (EXP 01/2026) and word-month (EXP January 2026).
         m = _EXP_RE.search(title)
         if not m:
             result["skipped_no_expiry"] += 1
             continue
 
-        month = int(m.group(1))
-        year  = int(m.group(2))
-        if year < 100:   # handle 2-digit year (e.g. EXP 9/22 → 2022)
-            year += 2000
+        if m.group(1) is not None:
+            # Numeric format: EXP MM/YYYY or EXP MM/YY
+            month = int(m.group(1))
+            year  = int(m.group(2))
+            if year < 100:
+                year += 2000
+        else:
+            # Word-month format: EXP January 2026 / EXP Jan 2026
+            month = _MONTH_MAP.get(m.group(3).lower())
+            if not month:
+                logger.warning("[EXPIRY SYNC] Unrecognised month name '%s' in title: %s", m.group(3), title)
+                result["skipped_no_expiry"] += 1
+                continue
+            year = int(m.group(4))
         expiry_date = f"{year:04d}-{month:02d}-01"
 
         # Some VeraCore Ids have " EXP MM/YYYY" appended in the Id itself.
