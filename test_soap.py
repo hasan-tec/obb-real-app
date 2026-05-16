@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from veracore_client import VeraCoreClient, VeraCoreError
 
 # ── Test payload ───────────────────────────────────────────────────────────
-ORDER_ID      = "TOBB-TEST-0507"        # 14 chars — safely under 20-char limit
+ORDER_ID      = "TOBB-TEST-0509A"       # under 20-char limit
 SHIP_TO       = {
     "name":     "Jane Test Smith",
     "address1": "123 Test Street",
@@ -51,8 +51,9 @@ SHIP_TO       = {
     "country":  "US",
     "phone":    "512-555-0001",
 }
-LINE_ITEMS    = [{"offer_id": "CK21", "quantity": 1}]
-SHIPPING      = "USPS Ground Advantage"
+LINE_ITEMS    = [{"offer_id": "OBB-BQ-11 Kits", "quantity": 1}]
+# OBB uses Pirate Ship — no VeraCore freight needed. Empty = omit Shipping block.
+SHIPPING      = ""
 COMMENTS      = "SOAP format test - do not fulfill"
 
 # ── Build client ───────────────────────────────────────────────────────────

@@ -436,6 +436,8 @@ class VeraCoreClient:
 
         # Build OfferOrdered blocks — Offers is at <order> level, not inside ShipTo.
         # Offer.Header.ID = the kit Offer code in VeraCore (e.g. "CK21").
+        # ShipToKey=0 links each OfferOrdered to the single ShipTo record (Key=0).
+        # Required by VeraCore SOAP spec — "value of 0 can be used for single-shipment orders".
         offers_xml = ""
         for item in line_items:
             offer_sku = item.get("offer_id") or item.get("sku") or ""
@@ -448,6 +450,7 @@ class VeraCoreClient:
             </Header>
           </Offer>
           <Quantity>{qty}</Quantity>
+          <ShipToKey>0</ShipToKey>
         </OfferOrdered>"""
 
         addr2_xml = f"<Address2>{e(ship_to['address2'])}</Address2>" if ship_to.get("address2") else ""
@@ -490,6 +493,7 @@ class VeraCoreClient:
         </OrderedBy>
         <ShipTo>
           <OrderShipTo>
+            <Key>0</Key>
             <Flag>OrderedBy</Flag>
           </OrderShipTo>
         </ShipTo>
