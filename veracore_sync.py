@@ -14,8 +14,12 @@ They never raise — errors are logged + written to veracore_sync_log as 'fail' 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Optional
+
+# Matches "EXP 10/2026", "EXP 9/22", "Exp. 04/2022" — case-insensitive.
+_EXP_RE = re.compile(r'EXP\.?\s+(\d{1,2})/(\d{2,4})', re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -76,14 +80,17 @@ def run_inventory_sync(db, vc_client) -> dict:
             result["skipped"] += 1
             continue
 
+        # VeraCore Id casing is inconsistent ("Kits" vs "KITS") — normalise before matching.
+        # ilike = case-insensitive LIKE in PostgreSQL (no wildcards → behaves as = ignoring case).
+        sku_upper = sku.upper()
         # Match by veracore_sku first (explicit mapping), then fall back to internal SKU.
-        kit_query = db.table("kits").select("id, sku, quantity_available, veracore_sku")
         try:
-            kit_res = kit_query.eq("veracore_sku", sku).execute()
+            kit_res = db.table("kits").select("id, sku, quantity_available, veracore_sku") \
+                                      .ilike("veracore_sku", sku_upper).execute()
             if not kit_res.data:
                 kit_res = db.table("kits").select(
                     "id, sku, quantity_available, veracore_sku"
-                ).eq("sku", sku).execute()
+                ).ilike("sku", sku_upper).execute()
         except Exception as e:
             logger.warning("[VERACORE SYNC] DB lookup failed for sku=%s: %s", sku, e)
             result["skipped"] += 1
@@ -212,4 +219,98 @@ def run_shipment_poll(db, vc_client, since_iso: Optional[str] = None) -> dict:
              "ok")
     logger.info("[VERACORE POLL] ═══ Poll done: matched=%d updated=%d unmatched=%d ═══",
                 result["matched"], result["updated"], result["unmatched"])
+    return result
+
+
+def run_expiry_sync(db, vc_client) -> dict:
+    """
+    Pull VeraCore GetInventory → parse expiry dates from each offer's Title field
+    → update items.expiry_date in OBB DB.
+
+    Rules:
+    - Only processes non-kit offers (skips any Id containing "kits").
+    - Matches OBB items by veracore_sku (explicit override) first, then
+      case-insensitive sku match (VeraCore uses mixed-case, OBB uses UPPER).
+    - Some VeraCore Ids embed the EXP date in the Id itself — strips it before matching.
+    - Never creates new items. Never clears an existing expiry_date if no EXP found.
+    - Skips rows where the parsed date is already stored (avoids unnecessary DB writes).
+
+    Returns: {updated, skipped_no_match, skipped_no_expiry, error}
+    """
+    result = {"updated": 0, "skipped_no_match": 0, "skipped_no_expiry": 0, "error": None}
+    started_at = datetime.utcnow()
+    logger.info("[EXPIRY SYNC] ═══ Expiry sync started at %s UTC ═══", started_at.isoformat())
+
+    try:
+        rows = vc_client.get_inventory()
+    except Exception as e:
+        err = f"get_inventory failed: {e}"
+        logger.error("[EXPIRY SYNC] %s", err, exc_info=True)
+        log_sync(db, "expiry_sync", None, None, None, "fail", err)
+        result["error"] = err
+        return result
+
+    for row in rows:
+        sku   = row.get("sku", "")
+        title = row.get("title", "")
+
+        # Skip kit offers — we sync kit *quantity* separately in run_inventory_sync.
+        if "kits" in sku.lower():
+            continue
+
+        # Parse EXP MM/YYYY (or MM/YY) from the title field.
+        m = _EXP_RE.search(title)
+        if not m:
+            result["skipped_no_expiry"] += 1
+            continue
+
+        month = int(m.group(1))
+        year  = int(m.group(2))
+        if year < 100:   # handle 2-digit year (e.g. EXP 9/22 → 2022)
+            year += 2000
+        expiry_date = f"{year:04d}-{month:02d}-01"
+
+        # Some VeraCore Ids have " EXP MM/YYYY" appended in the Id itself.
+        # Strip it so we can match cleanly against items.sku.
+        sku_upper = _EXP_RE.sub("", sku).strip().upper()
+
+        # Look up the item: veracore_sku explicit override first, then sku fallback.
+        # ilike = case-insensitive match (OBB uses UPPER, VeraCore uses mixed case).
+        try:
+            item_res = db.table("items").select("id, sku, expiry_date, veracore_sku") \
+                                        .ilike("veracore_sku", sku_upper).execute()
+            if not item_res.data:
+                item_res = db.table("items").select("id, sku, expiry_date, veracore_sku") \
+                                            .ilike("sku", sku_upper).execute()
+        except Exception as e:
+            logger.warning("[EXPIRY SYNC] DB lookup failed for sku=%s: %s", sku, e)
+            result["skipped_no_match"] += 1
+            continue
+
+        if not item_res.data:
+            logger.debug("[EXPIRY SYNC] No matching item for VeraCore Id '%s' — skipping", sku)
+            result["skipped_no_match"] += 1
+            continue
+
+        item = item_res.data[0]
+        # Skip if already the same date (avoid unnecessary writes).
+        if str(item.get("expiry_date") or "")[:10] == expiry_date:
+            continue
+
+        try:
+            db.table("items").update({"expiry_date": expiry_date}).eq("id", item["id"]).execute()
+            result["updated"] += 1
+            logger.info("[EXPIRY SYNC] Item %s expiry: %s → %s",
+                        item["sku"], item.get("expiry_date") or "none", expiry_date)
+        except Exception as e:
+            logger.warning("[EXPIRY SYNC] Update failed for item %s: %s", item["sku"], e)
+
+    log_sync(db, "expiry_sync", None,
+             {"scanned_rows": len(rows)},
+             {"updated": result["updated"],
+              "skipped_no_match": result["skipped_no_match"],
+              "skipped_no_expiry": result["skipped_no_expiry"]},
+             "ok")
+    logger.info("[EXPIRY SYNC] ═══ Done: updated=%d no_match=%d no_expiry=%d ═══",
+                result["updated"], result["skipped_no_match"], result["skipped_no_expiry"])
     return result

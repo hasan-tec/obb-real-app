@@ -346,28 +346,30 @@ def _monthly_report_scheduler():
                     db = get_supabase()
                     vc = get_veracore_client()
                     if vc is not None:
-                        from veracore_sync import run_inventory_sync
+                        from veracore_sync import run_inventory_sync, run_expiry_sync
                         inv_result = run_inventory_sync(db, vc)
                         logger.info("[SCHEDULER] Inventory sync result: %s", inv_result)
+                        exp_result = run_expiry_sync(db, vc)
+                        logger.info("[SCHEDULER] Expiry sync result: %s", exp_result)
                     last_inventory_day = current_day_key
                 except Exception as e:
                     logger.error("[SCHEDULER] VeraCore inventory sync failed: %s", e, exc_info=True)
 
-            # Phase 3 — Daily VeraCore shipment poll at ~05:00 UTC (1 hour after inventory).
-            if (veracore_enabled()
-                    and now.hour == 5
-                    and last_shipment_poll_day != current_day_key):
-                logger.info("[SCHEDULER] Daily VeraCore shipment poll triggered for %s", current_day_key)
-                try:
-                    db = get_supabase()
-                    vc = get_veracore_client()
-                    if vc is not None:
-                        from veracore_sync import run_shipment_poll
-                        poll_result = run_shipment_poll(db, vc)
-                        logger.info("[SCHEDULER] Shipment poll result: %s", poll_result)
-                    last_shipment_poll_day = current_day_key
-                except Exception as e:
-                    logger.error("[SCHEDULER] VeraCore shipment poll failed: %s", e, exc_info=True)
+            # DISABLED — shipment poll not in Phase 3 SOW / $1,500 scope. Re-enable when scoped.
+            # if (veracore_enabled()
+            #         and now.hour == 5
+            #         and last_shipment_poll_day != current_day_key):
+            #     logger.info("[SCHEDULER] Daily VeraCore shipment poll triggered for %s", current_day_key)
+            #     try:
+            #         db = get_supabase()
+            #         vc = get_veracore_client()
+            #         if vc is not None:
+            #             from veracore_sync import run_shipment_poll
+            #             poll_result = run_shipment_poll(db, vc)
+            #             logger.info("[SCHEDULER] Shipment poll result: %s", poll_result)
+            #         last_shipment_poll_day = current_day_key
+            #     except Exception as e:
+            #         logger.error("[SCHEDULER] VeraCore shipment poll failed: %s", e, exc_info=True)
         except Exception as e:
             logger.error(f"[SCHEDULER] Scheduler loop error: {e}", exc_info=True)
         _time.sleep(3600)  # Check every hour
@@ -5315,30 +5317,61 @@ async def veracore_sync_inventory_now(request: Request):
         return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
 
 
-@app.post("/veracore/poll-shipments-now")
-async def veracore_poll_shipments_now(request: Request):
-    """Manually poll VeraCore for shipment/tracking updates."""
+# DISABLED — shipment poll not in Phase 3 SOW / $1,500 scope. Re-enable when scoped.
+# @app.post("/veracore/poll-shipments-now")
+# async def veracore_poll_shipments_now(request: Request):
+#     try:
+#         if not veracore_enabled():
+#             return RedirectResponse("/veracore?msg=VeraCore+not+configured&msg_type=error", status_code=303)
+#         db = get_supabase()
+#         vc = get_veracore_client()
+#         if vc is None:
+#             return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error", status_code=303)
+#         from veracore_sync import run_shipment_poll
+#         r = run_shipment_poll(db, vc)
+#         await log_activity("veracore",
+#                            f"Manual shipment poll: matched={r['matched']} updated={r['updated']} unmatched={r['unmatched']}",
+#                            (r.get("error") or "")[:200],
+#                            "error" if r.get("error") else "success")
+#         if r.get("error"):
+#             return RedirectResponse(f"/veracore?msg=Poll+failed:+{r['error'][:100]}&msg_type=error", status_code=303)
+#         return RedirectResponse(
+#             f"/veracore?msg=Poll+done:+{r['updated']}+decisions+updated,+{r['unmatched']}+unmatched&msg_type=success",
+#             status_code=303)
+#     except Exception as e:
+#         logger.error("[VC POLL NOW] %s", e, exc_info=True)
+#         return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
+
+
+@app.post("/veracore/sync-expiry-now")
+async def veracore_sync_expiry_now(request: Request):
+    """Manually trigger a VeraCore expiry-date sync (parses EXP from offer Titles)."""
     try:
         if not veracore_enabled():
-            return RedirectResponse("/veracore?msg=VeraCore+not+configured&msg_type=error", status_code=303)
+            return RedirectResponse("/veracore?msg=VeraCore+not+configured&msg_type=error",
+                                    status_code=303)
         db = get_supabase()
         vc = get_veracore_client()
         if vc is None:
-            return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error", status_code=303)
-        from veracore_sync import run_shipment_poll
-        r = run_shipment_poll(db, vc)
+            return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
+                                    status_code=303)
+        from veracore_sync import run_expiry_sync
+        r = run_expiry_sync(db, vc)
         await log_activity("veracore",
-                           f"Manual shipment poll: matched={r['matched']} updated={r['updated']} unmatched={r['unmatched']}",
+                           f"Manual expiry sync: updated={r['updated']} no_match={r['skipped_no_match']}",
                            (r.get("error") or "")[:200],
                            "error" if r.get("error") else "success")
         if r.get("error"):
-            return RedirectResponse(f"/veracore?msg=Poll+failed:+{r['error'][:100]}&msg_type=error", status_code=303)
+            return RedirectResponse(
+                f"/veracore?msg=Expiry+sync+failed:+{r['error'][:100]}&msg_type=error",
+                status_code=303)
         return RedirectResponse(
-            f"/veracore?msg=Poll+done:+{r['updated']}+decisions+updated,+{r['unmatched']}+unmatched&msg_type=success",
+            f"/veracore?msg=Expiry+synced:+{r['updated']}+items+updated&msg_type=success",
             status_code=303)
     except Exception as e:
-        logger.error("[VC POLL NOW] %s", e, exc_info=True)
-        return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
+        logger.error("[VC EXPIRY NOW] %s", e, exc_info=True)
+        return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error",
+                                status_code=303)
 
 
 @app.post("/decisions/{decision_id}/ship")

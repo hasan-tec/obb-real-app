@@ -99,7 +99,7 @@
             <h3>Scheduled Syncs</h3>
         </div>
         <div style="padding:14px 18px;">
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:18px;">
                 <div style="padding:14px;background:var(--surface2);border-radius:8px;">
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
                         <strong style="font-size:14px;">🔄 Inventory Sync</strong>
@@ -146,6 +146,26 @@
                         <button type="submit" class="btn btn-sm btn-primary" {% if not enabled %}disabled
                             title="VeraCore not configured" {% endif %}>
                             ↻ Poll shipments now
+                        </button>
+                    </form>
+                </div>
+
+                <div style="padding:14px;background:var(--surface2);border-radius:8px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                        <strong style="font-size:14px;">📅 Expiry Sync</strong>
+                        <span class="badge badge-purple">daily · 04:00 UTC</span>
+                    </div>
+                    <div style="font-size:12px;color:var(--text-dim);margin-bottom:4px;">
+                        Reads expiry dates from VeraCore offer Titles ("EXP MM/YYYY") →
+                        updates <code>items.expiry_date</code>. Skips kits and items with no EXP in title.
+                    </div>
+                    <div style="font-size:12px;margin-bottom:10px;">
+                        Runs alongside inventory sync — check the sync log below for last result.
+                    </div>
+                    <form method="POST" action="/veracore/sync-expiry-now" style="display:inline;">
+                        <button type="submit" class="btn btn-sm btn-primary" {% if not enabled %}disabled
+                            title="VeraCore not configured" {% endif %}>
+                            ↻ Sync expiry now
                         </button>
                     </form>
                 </div>

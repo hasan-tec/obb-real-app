@@ -244,9 +244,8 @@
                         <td style="white-space: nowrap;">
                             {% if d.status == 'pending' %}
                             {% if d.kit_sku %}
-                            <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
-                                <button type="submit" class="btn btn-sm btn-primary" title="Approve">✓</button>
-                            </form>
+                            <!-- BLOCKED: VeraCore "Ship To Key" not configured — re-enable once Brian sets it up in VC admin -->
+                            <button disabled title="VeraCore approve blocked — waiting on Brian to configure Ship To Key" class="btn btn-sm btn-primary" style="opacity:0.4;cursor:not-allowed;">✓</button>
                             {% endif %}
                             <form method="POST" action="/decisions/{{ d.id }}/reject" style="display:inline;">
                                 <button type="submit" class="btn btn-sm btn-danger" title="Reject">✕</button>

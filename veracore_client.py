@@ -68,6 +68,38 @@ _SOAP_NS = "http://sma-promail/"
 _SOAP_ACTION_ADD_ORDER = "http://sma-promail/AddOrder"
 ORDER_ID_MAX_LEN = 20  # VeraCore hard limit
 
+# Carrier/service pairs as configured in VeraCore.
+# Source: Brian Alexander email, 2026-05-07.
+# Format: "full shipping method string" -> (FreightCarrier.Name, FreightService.Description)
+_SHIPPING_MAP: dict[str, tuple[str, str]] = {
+    # OBB production carriers
+    "OSM USPS First Class":               ("OSM", "USPS First Class"),
+    "OSM USPS Priority Mail":             ("OSM", "USPS Priority Mail"),
+    "OSM USPS Parcel Select Lightweight": ("OSM", "USPS Parcel Select Lightweight"),
+    "OSM USPS Parcel Select":             ("OSM", "USPS Parcel Select"),
+    "UPS Ground Prepaid":                 ("UPS", "Ground Prepaid"),
+    "UPS Ground Collect":                 ("UPS", "Ground Collect"),
+    "UPS Next Day Standard":              ("UPS", "Next Day Standard"),
+    "UPS Two Day Air":                    ("UPS", "Two Day Air"),
+    "FedEx Ground Collect":               ("FedEx", "Ground Collect"),
+    "FEDEX Ground":                       ("FedEx", "Ground"),
+    # TSTSHM test carriers — carrier code as Description (trying P03 code lookup)
+    "USPS P03":                           ("USPS", "P03"),
+    "USPS Priority Mail":                 ("USPS", "Priority Mail"),
+    "UPS Ground":                         ("UPS", "Ground"),
+    "UPS Next Day Air Letter":            ("UPS", "Next Day Air Letter"),
+    "UPS 2nd Day Air":                    ("UPS", "2nd Day Air"),
+}
+
+
+def _split_shipping_method(shipping_method: str) -> tuple[str, str]:
+    """Map a shipping method string to (FreightCarrier.Name, FreightService.Description)."""
+    if shipping_method in _SHIPPING_MAP:
+        return _SHIPPING_MAP[shipping_method]
+    # Fallback: split on first space (carrier = first word).
+    parts = shipping_method.split(" ", 1)
+    return (parts[0], parts[1]) if len(parts) > 1 else (parts[0], parts[0])
+
 
 class VeraCoreClient:
     """
@@ -322,18 +354,20 @@ class VeraCoreClient:
 
     def get_inventory(self) -> list[dict]:
         """
-        GET {base}/inventory — read live warehouse balances.
+        GET {base}/api/GetInventory — read live warehouse offer balances.
 
-        Returns a normalized list: [{sku, available_balance, on_hand, committed}, ...]
+        Confirmed field names (OhBaby tenant, live-tested 2026-05):
+          Id          — offer SKU  (e.g. "OBB-WK-C3 Kits")
+          Available   — available balance (excluding reserved)
+          Title       — display name; may embed expiry ("... EXP 10/2026")
 
-        ⚠️  Adjust field names below against Ting's Swagger.  Common shapes:
-              [{"Sku": "OBB-CK21", "AvailableBalance": 45, "OnHand": 50, "Committed": 5}]
-            or with different casing.  We normalize to snake_case for our DB.
+        Returns: [{sku, title, available_balance, on_hand, committed}, ...]
+        'title' is included so callers can parse expiry dates without a second API call.
         """
         raw = self._request("GET", self.inventory_path)
-        # Response may be a list or wrapped in {"data": [...]} / {"Products": [...]}
+        # Real response shape: {"Inventory": [...], "Error": null}
         if isinstance(raw, dict):
-            for key in ("data", "Products", "Inventory", "items", "Items"):
+            for key in ("Inventory", "inventory", "data", "Products", "items", "Items"):
                 if key in raw and isinstance(raw[key], list):
                     raw = raw[key]
                     break
@@ -351,21 +385,17 @@ class VeraCoreClient:
             if not sku:
                 continue
             normalized.append({
-                "sku": str(sku),
-                "available_balance": int(
-                    row.get("AvailableBalance")
-                    or row.get("available_balance")
-                    or row.get("Available")
-                    or 0
-                ),
-                "on_hand": int(
-                    row.get("OnHand") or row.get("on_hand") or row.get("Quantity") or 0
-                ),
-                "committed": int(
-                    row.get("Committed") or row.get("committed") or 0
-                ),
+                "sku":               str(sku),
+                "title":             str(row.get("Title") or row.get("title") or ""),
+                # "Available" is the confirmed field name; fallbacks kept for other tenants
+                "available_balance": int(row.get("Available")
+                                         or row.get("AvailableBalance")
+                                         or row.get("available_balance")
+                                         or 0),
+                "on_hand":           int(row.get("OnHand") or row.get("on_hand") or 0),
+                "committed":         int(row.get("Committed") or row.get("committed") or 0),
             })
-        logger.info("[VERACORE] Inventory sync pulled %d SKUs", len(normalized))
+        logger.info("[VERACORE] GetInventory pulled %d SKUs", len(normalized))
         return normalized
 
     # ─────────────────────────────────────────────────────────
@@ -400,13 +430,9 @@ class VeraCoreClient:
         first_name = name_parts[0]
         last_name = name_parts[1] if len(name_parts) > 1 else ""
 
-        # Shipping: FreightCarrier.Name + FreightService.Description.
-        # VeraCore carrier/service must match codes configured in their account.
-        # "USPS Ground Advantage" → carrier="USPS", service="Ground Advantage".
-        carrier, _, service = (shipping_method or "USPS").partition(" ")
-        if not service:
-            service = carrier
-            carrier = "USPS"
+        # FreightService is optional — OBB uses Pirate Ship so VeraCore doesn't need to ship.
+        # Only include Shipping block if shipping_method is provided.
+        carrier, service = _split_shipping_method(shipping_method) if shipping_method else ("", "")
 
         # Build OfferOrdered blocks — Offers is at <order> level, not inside ShipTo.
         # Offer.Header.ID = the kit Offer code in VeraCore (e.g. "CK21").
@@ -427,6 +453,11 @@ class VeraCoreClient:
         addr2_xml = f"<Address2>{e(ship_to['address2'])}</Address2>" if ship_to.get("address2") else ""
         phone_xml = f"<Phone>{e(ship_to['phone'])}</Phone>" if ship_to.get("phone") else ""
         comments_xml = f"<Comments>{e(comments)}</Comments>" if comments else ""
+        freight_service_xml = f"<FreightService><Description>{e(service)}</Description></FreightService>" if service else ""
+        shipping_xml = f"""<Shipping>
+          <FreightCarrier><Name>{e(carrier)}</Name></FreightCarrier>
+          {freight_service_xml}
+        </Shipping>""" if carrier else ""
 
         return f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -445,14 +476,7 @@ class VeraCoreClient:
           <ID>{e(order_id)}</ID>
           {comments_xml}
         </Header>
-        <Shipping>
-          <FreightCarrier>
-            <Name>{e(carrier)}</Name>
-          </FreightCarrier>
-          <FreightService>
-            <Description>{e(service)}</Description>
-          </FreightService>
-        </Shipping>
+        {shipping_xml}
         <OrderedBy>
           <FirstName>{e(first_name)}</FirstName>
           <LastName>{e(last_name)}</LastName>
@@ -697,10 +721,10 @@ def normalize_country(country: Optional[str]) -> str:
 def pick_shipping_method(country: str) -> str:
     """
     Default shipping method per destination.
-    US → USPS Ground Advantage
-    Non-US → USPS Priority Mail International
+    US → OSM USPS Priority Mail (OBB's standard carrier, confirmed by Brian Alexander 2026-05-07)
+    Non-US → ask Brian/Ting for the correct international carrier before going live
     """
-    return "USPS Ground Advantage" if normalize_country(country) == "US" else "USPS Priority Mail International"
+    return "OSM USPS Priority Mail" if normalize_country(country) == "US" else "OSM USPS Priority Mail"
 
 
 def build_customs(kit: dict) -> dict:
