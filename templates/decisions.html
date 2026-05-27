@@ -143,8 +143,7 @@
             <input type="hidden" name="redirect_qs" value="{{ filter_qs or '' }}">
             {# decision_ids injected dynamically by submitBulk() #}
         </form>
-        <!-- BLOCKED: VeraCore "Ship To Key" not configured in VC admin — re-enable once Brian sets it up -->
-        <button disabled title="VeraCore approve blocked — waiting on Brian to configure Ship To Key in VC admin" class="btn btn-sm btn-primary" style="opacity:0.4;cursor:not-allowed;">✓ Approve Selected</button>
+        <button onclick="submitBulk('approve')" class="btn btn-sm btn-primary">✓ Approve Selected</button>
         <button onclick="submitBulk('ship')" class="btn btn-sm btn-secondary">📦 Ship Selected</button>
         <button onclick="submitBulk('reject')" class="btn btn-sm"
             style="background:var(--red);color:#fff;border:none;">✕ Reject Selected</button>
@@ -268,8 +267,10 @@
                     <td style="white-space:nowrap;">
                         {% if d.status == 'pending' %}
                         {% if d.kit_sku %}
-                        <!-- BLOCKED: VeraCore "Ship To Key" not configured — re-enable once Brian sets it up in VC admin -->
-                        <button disabled title="VeraCore approve blocked — waiting on Brian to configure Ship To Key" class="btn btn-sm btn-primary" style="opacity:0.4;cursor:not-allowed;">✓ VC</button>
+                        <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-primary" title="Approve → VeraCore"
+                                onclick="return confirm('Approve and push to VeraCore?')">✓ VC</button>
+                        </form>
                         <form method="POST" action="/decisions/{{ d.id }}/approve?via=pirateship"
                             style="display:inline;">
                             <button type="submit" class="btn btn-sm btn-secondary"
