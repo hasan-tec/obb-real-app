@@ -4875,16 +4875,25 @@ def _build_ship_to_from_customer(c: dict) -> dict:
     """Extract a VeraCore-shaped ship_to block from a customers row."""
     from veracore_client import normalize_country
     name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip() or c.get("email", "")
-    return {
+    raw_country = c.get("country")
+    normalized_country = normalize_country(raw_country)
+    ship_to = {
         "name":     name,
         "address1": c.get("address_line1", "") or "",
         "address2": c.get("address_line2", "") or "",
         "city":     c.get("city", "") or "",
         "state":    c.get("province", "") or "",
         "zip":      c.get("zip") or c.get("zip_code", "") or "",
-        "country":  normalize_country(c.get("country")),
+        "country":  normalized_country,
         "phone":    c.get("phone", "") or "",
     }
+    logger.info(
+        "[VERACORE SUBMIT] ship_to built — name=%s address1=%s city=%s state=%s zip=%s country=%s (raw=%s)",
+        ship_to["name"], ship_to["address1"] or "(missing)",
+        ship_to["city"], ship_to["state"], ship_to["zip"],
+        ship_to["country"], raw_country,
+    )
+    return ship_to
 
 
 def submit_to_veracore(decision_id: str) -> dict:
@@ -4950,8 +4959,28 @@ def submit_to_veracore(decision_id: str) -> dict:
     is_intl         = ship_to["country"] != "US"
     shipping_method = pick_shipping_method(ship_to["country"])
     offer_id        = kit.get("veracore_sku") or kit.get("sku")
-    order_public_id = d.get("order_id") or f"OBB-{decision_id[:8]}"
+    raw_order_id    = d.get("order_id") or f"OBB-{decision_id[:8]}"
+    order_public_id = raw_order_id[:20]  # VeraCore hard limit: 20 chars
+    if len(raw_order_id) > 20:
+        logger.warning("[VERACORE SUBMIT] order_id truncated from %d chars: '%s' → '%s'",
+                       len(raw_order_id), raw_order_id, order_public_id)
     comments        = f"Kit {kit.get('sku','?')} | T{d.get('trimester','?')} | decision {decision_id[:8]}"
+
+    logger.info(
+        "[VERACORE SUBMIT] building order — decision=%s offer_id=%s veracore_sku=%s kit_sku=%s "
+        "order_id=%s intl=%s shipping=%s ship_to_name=%s city=%s state=%s country=%s",
+        decision_id, offer_id,
+        kit.get("veracore_sku") or "(null, using kit.sku)",
+        kit.get("sku"),
+        order_public_id, is_intl, shipping_method,
+        ship_to.get("name"), ship_to.get("city"),
+        ship_to.get("state"), ship_to.get("country"),
+    )
+    if not ship_to.get("address1"):
+        logger.warning("[VERACORE SUBMIT] decision=%s customer has no address1 — order may fail", decision_id)
+    if not offer_id:
+        logger.error("[VERACORE SUBMIT] decision=%s kit has no offer_id/sku — cannot submit", decision_id)
+        return {"status": "failed", "order_id": None, "error": "kit has no offer_id"}
 
     request_payload = {
         "order_id":         order_public_id,
@@ -5012,11 +5041,12 @@ def submit_to_veracore(decision_id: str) -> dict:
 
 
 @app.post("/decisions/{decision_id}/approve")
-async def approve_decision(request: Request, decision_id: str):
+async def approve_decision(request: Request, decision_id: str, background_tasks: BackgroundTasks):
     """
     Approve a pending decision.
     - Changes status from 'pending' to 'approved'
     - Decrements kit quantity_available by 1 (stock sync)
+    - VeraCore push runs in BackgroundTasks (after response) to avoid Heroku 30s timeout
     """
     try:
         db = get_supabase()
@@ -5105,13 +5135,11 @@ async def approve_decision(request: Request, decision_id: str):
             except Exception as ps_err:
                 logger.error("[APPROVE] Failed to mark manual route: %s", ps_err)
         else:
-            try:
-                vc_result = submit_to_veracore(decision_id)
-                logger.info("[APPROVE] VeraCore push: %s", vc_result)
-            except Exception as vc_err:
-                # Never let VeraCore failure break the approve request — helper catches
-                # everything, but double-guard just in case.
-                logger.error("[APPROVE] VeraCore push raised unexpectedly: %s", vc_err, exc_info=True)
+            # Run VC push in background so Heroku 30s request timeout is never hit.
+            # submit_to_veracore is idempotent and writes veracore_sync_log on both
+            # success and failure — staff can see result in the VeraCore dashboard.
+            logger.info("[APPROVE] Queuing VeraCore push for decision=%s (background)", decision_id)
+            background_tasks.add_task(submit_to_veracore, decision_id)
     except Exception as e:
         logger.error(f"[APPROVE] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to approve decision: {e}", "", "error")

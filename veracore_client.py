@@ -450,7 +450,9 @@ class VeraCoreClient:
             </Header>
           </Offer>
           <Quantity>{qty}</Quantity>
-          <ShipToKey>0</ShipToKey>
+          <OrderShipToKey>
+            <Key>0</Key>
+          </OrderShipToKey>
         </OfferOrdered>"""
 
         addr2_xml = f"<Address2>{e(ship_to['address2'])}</Address2>" if ship_to.get("address2") else ""
