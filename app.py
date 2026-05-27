@@ -4899,8 +4899,8 @@ def _build_ship_to_from_customer(c: dict) -> dict:
 def get_app_setting(key: str, default: str = "") -> str:
     try:
         db = get_supabase()
-        row = db.table("app_settings").select("value").eq("key", key).maybe_single().execute()
-        return (row.data or {}).get("value") or default
+        rows = db.table("app_settings").select("value").eq("key", key).limit(1).execute().data or []
+        return rows[0].get("value") or default if rows else default
     except Exception as e:
         logger.warning("[APP SETTINGS] get failed key=%s: %s", key, e)
         return default
