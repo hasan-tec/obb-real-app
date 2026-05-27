@@ -4896,6 +4896,23 @@ def _build_ship_to_from_customer(c: dict) -> dict:
     return ship_to
 
 
+def get_app_setting(key: str, default: str = "") -> str:
+    try:
+        db = get_supabase()
+        row = db.table("app_settings").select("value").eq("key", key).maybe_single().execute()
+        return (row.data or {}).get("value") or default
+    except Exception as e:
+        logger.warning("[APP SETTINGS] get failed key=%s: %s", key, e)
+        return default
+
+
+def set_app_setting(key: str, value: str) -> None:
+    db = get_supabase()
+    db.table("app_settings").upsert(
+        {"key": key, "value": value, "updated_at": datetime.utcnow().isoformat()}
+    ).execute()
+
+
 def submit_to_veracore(decision_id: str) -> dict:
     """
     Push an approved decision to VeraCore as a warehouse order.
@@ -4957,7 +4974,7 @@ def submit_to_veracore(decision_id: str) -> dict:
 
     ship_to         = _build_ship_to_from_customer(customer)
     is_intl         = ship_to["country"] != "US"
-    shipping_method = pick_shipping_method(ship_to["country"])
+    shipping_method = get_app_setting("veracore_freight_service") or None
     offer_id        = kit.get("veracore_sku") or kit.get("sku")
     raw_order_id    = d.get("order_id") or f"OBB-{decision_id[:8]}"
     order_public_id = raw_order_id[:20]  # VeraCore hard limit: 20 chars
@@ -5287,6 +5304,8 @@ async def veracore_ops_page(request: Request):
         except Exception as e:
             logger.warning("[VC OPS] failed decisions fetch failed: %s", e)
 
+        freight_service = get_app_setting("veracore_freight_service")
+
         return templates.TemplateResponse("veracore.html", {
             "request":          request,
             "page":             "veracore",
@@ -5303,6 +5322,7 @@ async def veracore_ops_page(request: Request):
             "shipped_count":    shipped_count,
             "recent_syncs":     recent_syncs,
             "failed_decisions": failed_decisions,
+            "freight_service":  freight_service,
             "msg":              msg,
             "msg_type":         msg_type,
         })
@@ -5315,6 +5335,7 @@ async def veracore_ops_page(request: Request):
             "approved_count": 0, "pending_push_count": 0, "submitted_count": 0,
             "failed_count": 0, "shipped_count": 0,
             "recent_syncs": [], "failed_decisions": [],
+            "freight_service": "",
             "error": str(e), "msg": "", "msg_type": "error",
         })
 
@@ -5346,6 +5367,21 @@ async def veracore_sync_inventory_now(request: Request):
     except Exception as e:
         logger.error("[VC SYNC NOW] %s", e, exc_info=True)
         return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
+
+
+@app.post("/veracore/save-settings")
+async def veracore_save_settings(request: Request):
+    """Save VeraCore order settings (freight service code) from the ops page."""
+    form = await request.form()
+    freight = (form.get("freight_service") or "").strip()
+    try:
+        set_app_setting("veracore_freight_service", freight)
+        logger.info("[VC SETTINGS] veracore_freight_service updated to '%s'", freight)
+    except Exception as e:
+        logger.error("[VC SETTINGS] save failed: %s", e, exc_info=True)
+        return RedirectResponse(f"/veracore?msg=Save+failed:+{str(e)[:100]}&msg_type=error", status_code=303)
+    label = freight or "(blank — VeraCore offer default)"
+    return RedirectResponse(f"/veracore?msg=Freight+service+saved:+{label}&msg_type=success", status_code=303)
 
 
 # DISABLED — shipment poll not in Phase 3 SOW / $1,500 scope. Re-enable when scoped.

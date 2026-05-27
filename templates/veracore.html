@@ -63,6 +63,32 @@
         </div>
     </div>
 
+    {# ─── Order settings ─── #}
+    <div class="card" style="margin-bottom:18px;">
+        <div class="card-header">
+            <h3>⚙️ Order Settings</h3>
+        </div>
+        <div style="padding:14px 18px;">
+            <form method="POST" action="/veracore/save-settings"
+                style="display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;">
+                <div style="flex:1;min-width:260px;">
+                    <label
+                        style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;display:block;margin-bottom:4px;">
+                        Freight Service Code</label>
+                    <input type="text" name="freight_service" value="{{ freight_service or '' }}"
+                        placeholder="e.g. OSM USPS Priority Mail  (blank = VeraCore offer default)"
+                        style="width:100%;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;font-family:monospace;box-sizing:border-box;">
+                </div>
+                <button type="submit" class="btn btn-sm btn-primary" style="white-space:nowrap;">Save</button>
+            </form>
+            <div style="font-size:12px;color:var(--text-dim);margin-top:8px;line-height:1.5;">
+                Sent as <code>FreightService.Description</code> in every VeraCore order push.
+                Leave blank to skip the shipping block — VeraCore uses the offer's default carrier.
+                Ask Brian for the exact code as configured in VeraCore admin (Utilities → Freight).
+            </div>
+        </div>
+    </div>
+
     {# ─── Status tiles ─── #}
     <div class="stat-grid" style="margin-bottom:18px;">
         <div class="stat-card">
