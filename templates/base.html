@@ -506,6 +506,18 @@
                 <span class="icon">🗺️</span> <span>Flow Diagram</span>
             </a>
         </nav>
+        <div style="padding:16px 20px;border-top:1px solid var(--border);margin-top:auto;position:absolute;bottom:0;width:100%;background:var(--surface);">
+            <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{{ request.state.user_email }}">
+                {{ request.state.user_email }}
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;">
+                <span style="font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600;text-transform:uppercase;
+                    {% if request.state.user_role == 'admin' %}background:rgba(108,99,255,0.15);color:#6c63ff;{% else %}background:var(--surface2);color:var(--text-dim);{% endif %}">
+                    {{ request.state.user_role }}
+                </span>
+                <a href="/logout" style="font-size:12px;color:var(--text-dim);">Sign out</a>
+            </div>
+        </div>
     </div>
     <div class="main">
         {% block content %}{% endblock %}

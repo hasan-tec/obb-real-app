@@ -143,12 +143,14 @@
             <input type="hidden" name="redirect_qs" value="{{ filter_qs or '' }}">
             {# decision_ids injected dynamically by submitBulk() #}
         </form>
+        {% if request.state.user_role == 'admin' %}
         <button onclick="submitBulk('approve')" class="btn btn-sm btn-primary">✓ Approve Selected</button>
         <button onclick="submitBulk('ship')" class="btn btn-sm btn-secondary">📦 Ship Selected</button>
         <button onclick="submitBulk('reject')" class="btn btn-sm"
             style="background:var(--red);color:#fff;border:none;">✕ Reject Selected</button>
         <button onclick="submitBulk('recurate')" class="btn btn-sm"
             style="background:var(--yellow);color:#000;border:none;">🔄 Re-curate Selected</button>
+        {% endif %}
         <button onclick="clearBulkSelection()" class="btn btn-sm"
             style="background:var(--surface);border:1px solid var(--border);">✕ Clear</button>
     </div>
@@ -235,11 +237,13 @@
                         {% elif d.veracore_status == 'failed' %}
                         <span class="badge badge-red" title="{{ (d.veracore_last_error or 'unknown error')[:200] }}">✕
                             failed</span>
+                        {% if request.state.user_role == 'admin' %}
                         <form method="POST" action="/decisions/{{ d.id }}/veracore-retry"
                             style="display:inline;margin-left:4px;">
                             <button type="submit" class="btn btn-sm btn-secondary"
                                 title="Retry VeraCore submit (idempotent)">↻ retry</button>
                         </form>
+                        {% endif %}
                         {% elif d.veracore_status == 'manual' %}
                         <span class="badge badge-purple" title="Approved via Pirate Ship — not pushed to VeraCore">🏴
                             Pirate Ship</span>
@@ -265,6 +269,7 @@
                         {% endif %}
                     </td>
                     <td style="white-space:nowrap;">
+                        {% if request.state.user_role == 'admin' %}
                         {% if d.status == 'pending' %}
                         {% if d.kit_sku %}
                         <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
@@ -291,6 +296,9 @@
                         <form method="POST" action="/decisions/{{ d.id }}/ship" style="display:inline;">
                             <button type="submit" class="btn btn-sm btn-secondary" title="Mark Shipped">📦 Ship</button>
                         </form>
+                        {% else %}
+                        <span style="color:var(--text-dim);font-size:11px;">—</span>
+                        {% endif %}
                         {% else %}
                         <span style="color:var(--text-dim);font-size:11px;">—</span>
                         {% endif %}

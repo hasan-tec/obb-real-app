@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import httpx
@@ -285,6 +286,59 @@ def fix_gsheet_headers():
 app = FastAPI(title="OBB Curation Engine")
 _BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
+
+# ─── Auth middleware ───
+_AUTH_PUBLIC = {"/login", "/health"}
+_WEBHOOK_PREFIXES = ("/webhooks/shopify", "/webhooks/cratejoy", "/api/cratejoy/register-webhooks")
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path in _AUTH_PUBLIC or path == "/logout" or any(path.startswith(p) for p in _WEBHOOK_PREFIXES):
+            return await call_next(request)
+
+        token = request.cookies.get("obb_access_token")
+        refresh_token = request.cookies.get("obb_refresh_token")
+        user = None
+        new_tokens = None
+
+        if token:
+            try:
+                user = get_supabase().auth.get_user(token).user
+            except Exception:
+                if refresh_token:
+                    try:
+                        r = get_supabase().auth.refresh_session(refresh_token)
+                        user = r.user
+                        new_tokens = (r.session.access_token, r.session.refresh_token)
+                    except Exception:
+                        pass
+
+        if user is None:
+            return RedirectResponse(url="/login", status_code=302)
+
+        role = (user.user_metadata or {}).get("role", "viewer")
+        request.state.user = user
+        request.state.user_role = role
+        request.state.user_email = user.email or ""
+
+        if request.method in ("POST", "PUT", "DELETE", "PATCH") and role != "admin":
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px;background:#0f1117;color:#e4e6f0'>"
+                "<h2>403 — Viewer Access</h2>"
+                "<p>Your account can view but not modify data. Ask Hasan to upgrade your role.</p>"
+                "<a href='javascript:history.back()' style='color:#6c63ff'>← Go back</a>"
+                "</body></html>",
+                status_code=403,
+            )
+
+        response = await call_next(request)
+        if new_tokens:
+            response.set_cookie("obb_access_token", new_tokens[0], httponly=True, samesite="lax", max_age=3600)
+            response.set_cookie("obb_refresh_token", new_tokens[1], httponly=True, samesite="lax", max_age=86400 * 30)
+        return response
+
+app.add_middleware(AuthMiddleware)
 
 
 # ─── Monthly curation report scheduler ───
@@ -1839,6 +1893,52 @@ async def register_cratejoy_webhooks():
     logger.info(f"[CRATEJOY] Registration complete. {summary}")
     await log_activity("cratejoy", f"Webhook registration: {summary}", json.dumps(results), "success")
     return JSONResponse({"results": results, "summary": summary})
+
+
+# ═══════════════════════════════════════════════════════════
+# AUTH ROUTES
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    # Already logged in → redirect to dashboard
+    if request.cookies.get("obb_access_token"):
+        try:
+            get_supabase().auth.get_user(request.cookies["obb_access_token"])
+            return RedirectResponse(url="/", status_code=302)
+        except Exception:
+            pass
+    return templates.TemplateResponse("login.html", {"request": request})
+
+
+@app.post("/login")
+async def login_submit(request: Request, email: str = Form(...), password: str = Form(...)):
+    try:
+        resp = get_supabase().auth.sign_in_with_password({"email": email, "password": password})
+        session = resp.session
+        user = resp.user
+        role = (user.user_metadata or {}).get("role", "viewer")
+        logger.info("[AUTH] Login success — email=%s role=%s", email, role)
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie("obb_access_token", session.access_token, httponly=True, samesite="lax", max_age=3600)
+        response.set_cookie("obb_refresh_token", session.refresh_token, httponly=True, samesite="lax", max_age=86400 * 30)
+        return response
+    except Exception as e:
+        logger.warning("[AUTH] Login failed — email=%s error=%s", email, str(e))
+        return templates.TemplateResponse(
+            "login.html",
+            {"request": request, "error": "Invalid email or password."},
+            status_code=401,
+        )
+
+
+@app.get("/logout")
+async def logout():
+    response = RedirectResponse(url="/login", status_code=302)
+    response.delete_cookie("obb_access_token")
+    response.delete_cookie("obb_refresh_token")
+    logger.info("[AUTH] User logged out")
+    return response
 
 
 # ═══════════════════════════════════════════════════════════
