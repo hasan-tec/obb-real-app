@@ -151,6 +151,40 @@
                         </select>
                     </div>
                 </div>
+                <div class="form-row" style="margin-top:12px;">
+                    <div class="form-group" style="flex:2;">
+                        <label>Address Line 1</label>
+                        <input type="text" name="address_line1" class="form-control"
+                            value="{{ customer.address_line1 or '' }}"
+                            placeholder="e.g. 123 Main St">
+                    </div>
+                    <div class="form-group">
+                        <label>City</label>
+                        <input type="text" name="city" class="form-control"
+                            value="{{ customer.city or '' }}"
+                            placeholder="e.g. Denver">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>State / Province</label>
+                        <input type="text" name="province" class="form-control"
+                            value="{{ customer.province or '' }}"
+                            placeholder="e.g. CO">
+                    </div>
+                    <div class="form-group">
+                        <label>ZIP Code</label>
+                        <input type="text" name="zip" class="form-control"
+                            value="{{ customer.zip or '' }}"
+                            placeholder="e.g. 80202">
+                    </div>
+                    <div class="form-group">
+                        <label>Country</label>
+                        <input type="text" name="country" class="form-control"
+                            value="{{ customer.country or 'US' }}"
+                            placeholder="e.g. US">
+                    </div>
+                </div>
                 <div style="margin-top: 8px;">
                     <button type="submit" class="btn btn-primary">✓ Save Changes</button>
                     <button type="button" class="btn btn-secondary"
@@ -244,8 +278,14 @@
                         <td style="white-space: nowrap;">
                             {% if d.status == 'pending' %}
                             {% if d.kit_sku %}
-                            <!-- BLOCKED: VeraCore "Ship To Key" not configured — re-enable once Brian sets it up in VC admin -->
-                            <button disabled title="VeraCore approve blocked — waiting on Brian to configure Ship To Key" class="btn btn-sm btn-primary" style="opacity:0.4;cursor:not-allowed;">✓</button>
+                            <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
+                                <button type="submit" class="btn btn-sm btn-primary" title="Approve → VeraCore"
+                                    onclick="return confirm('Approve and push to VeraCore?')">✓</button>
+                            </form>
+                            <form method="POST" action="/decisions/{{ d.id }}/approve?via=pirateship" style="display:inline;">
+                                <button type="submit" class="btn btn-sm btn-secondary" title="Approve via Pirate Ship (no VeraCore push)"
+                                    onclick="return confirm('Approve for Pirate Ship export (no VeraCore push)?')">🏴</button>
+                            </form>
                             {% endif %}
                             <form method="POST" action="/decisions/{{ d.id }}/reject" style="display:inline;">
                                 <button type="submit" class="btn btn-sm btn-danger" title="Reject">✕</button>

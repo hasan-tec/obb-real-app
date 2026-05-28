@@ -341,6 +341,131 @@ class AuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(AuthMiddleware)
 
 
+# ═══════════════════════════════════════════════════════════
+# CRATEJOY MONTHLY DECISION SWEEP
+# ═══════════════════════════════════════════════════════════
+
+async def _cratejoy_monthly_sweep(db, ship_date: date) -> dict:
+    """
+    Fills the months-2/3 gap in Cratejoy prepay cycles.
+
+    Cratejoy only fires webhooks on signup (subscription_new) and on each
+    3-month rebilling (subscription_renewed). Months 2 and 3 within a prepay
+    cycle have no webhook, so no decision is ever created for them automatically.
+
+    This function runs on the 1st of each month and creates a pending decision
+    for every Cratejoy customer (platform='cratejoy'/'both', status active or
+    cancelled-prepaid) who does NOT already have a non-rejected decision with a
+    ship_date in the current month. Shopify customers are excluded — they get
+    decisions via Shopify's monthly $0 order webhooks.
+
+    Idempotent: safe to re-run; skips customers who already have a decision.
+    """
+    month_str = ship_date.strftime("%Y-%m")
+    month_start = date(ship_date.year, ship_date.month, 1)
+    if ship_date.month == 12:
+        month_end_excl = date(ship_date.year + 1, 1, 1)
+    else:
+        month_end_excl = date(ship_date.year, ship_date.month + 1, 1)
+
+    created = skipped_exists = skipped_no_data = error_count = 0
+
+    # Paginate all eligible Cratejoy customers
+    eligible: list = []
+    page_size = 500
+    for status in ("active", "cancelled-prepaid"):
+        offset = 0
+        while True:
+            batch = (
+                db.table("customers")
+                .select("id, email, first_name, last_name, trimester, due_date, subscription_status")
+                .in_("platform", ["cratejoy", "both"])
+                .eq("subscription_status", status)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            eligible.extend(batch.data or [])
+            if len(batch.data or []) < page_size:
+                break
+            offset += page_size
+
+    logger.info(
+        "[CJ SWEEP] Starting monthly sweep for %s — %d eligible Cratejoy customers",
+        month_str, len(eligible)
+    )
+
+    for cust in eligible:
+        cust_id = cust["id"]
+        email = cust.get("email", cust_id)
+        trimester = cust.get("trimester")
+        due_date_val = cust.get("due_date")
+
+        try:
+            # Skip if a non-rejected decision already exists for this month
+            existing = (
+                db.table("decisions")
+                .select("id")
+                .eq("customer_id", cust_id)
+                .gte("ship_date", str(month_start))
+                .lt("ship_date", str(month_end_excl))
+                .neq("status", "rejected")
+                .execute()
+            )
+            if existing.data:
+                skipped_exists += 1
+                continue
+
+            # No decision this month — create one
+            if not trimester or not due_date_val:
+                db.table("decisions").insert({
+                    "customer_id": cust_id,
+                    "kit_id": None,
+                    "kit_sku": None,
+                    "decision_type": "needs-data-entry",
+                    "reason": "Cratejoy monthly sweep: missing due date or trimester. Edit customer, then re-curate.",
+                    "status": "pending",
+                    "platform": "cratejoy",
+                    "trimester": None,
+                    "ship_date": str(ship_date),
+                }).execute()
+                skipped_no_data += 1
+                logger.warning("[CJ SWEEP] %s — needs-data-entry (no trimester/due_date)", email)
+                continue
+
+            kit_decision = await assign_kit(cust_id, ship_date)
+            db.table("decisions").insert({
+                "customer_id": cust_id,
+                "kit_id": kit_decision.get("kit_id"),
+                "kit_sku": kit_decision.get("kit_sku"),
+                "decision_type": kit_decision["decision_type"],
+                "reason": kit_decision["reason"],
+                "status": "pending",
+                "platform": "cratejoy",
+                "trimester": trimester,
+                "ship_date": str(ship_date),
+            }).execute()
+            created += 1
+            logger.info(
+                "[CJ SWEEP] %s — decision: %s kit=%s",
+                email, kit_decision["decision_type"], kit_decision.get("kit_sku", "none")
+            )
+
+        except Exception as e:
+            error_count += 1
+            logger.error("[CJ SWEEP] Error for %s: %s", email, e, exc_info=True)
+
+    logger.info(
+        "[CJ SWEEP] Complete — created=%d skipped_existing=%d needs_data=%d errors=%d",
+        created, skipped_exists, skipped_no_data, error_count
+    )
+    return {
+        "created": created,
+        "skipped_exists": skipped_exists,
+        "skipped_no_data": skipped_no_data,
+        "errors": error_count,
+    }
+
+
 # ─── Monthly curation report scheduler ───
 # Runs on the 1st of each month at ~6 AM UTC. Uses a lightweight background thread.
 _scheduler_started = False
@@ -349,6 +474,7 @@ def _monthly_report_scheduler():
     """Background thread that checks once per hour if it's the 1st and triggers the report."""
     import time as _time
     last_run_month = None
+    last_cj_sweep_month = None  # Cratejoy monthly decision sweep guard
     last_inventory_day = None  # Phase 3 — daily VeraCore inventory sync guard
     last_shipment_poll_day = None  # Phase 3 — daily VeraCore shipment poll guard
     while True:
@@ -389,6 +515,19 @@ def _monthly_report_scheduler():
                     last_run_month = current_month_key
                 except Exception as e:
                     logger.error(f"[SCHEDULER] Failed to auto-generate report: {e}", exc_info=True)
+
+            # Cratejoy monthly decision sweep — fills months 2-3 gap in prepay cycles.
+            # Runs at 7 AM (1 hour after curation report) so it doesn't race with it.
+            if now.day == 1 and now.hour >= 7 and last_cj_sweep_month != current_month_key:
+                logger.info(f"[SCHEDULER] Cratejoy monthly sweep triggered for {current_month_key}")
+                try:
+                    db = get_supabase()
+                    ship_date = date(now.year, now.month, 14)
+                    sweep_result = asyncio.run(_cratejoy_monthly_sweep(db, ship_date))
+                    logger.info(f"[SCHEDULER] Cratejoy sweep complete: {sweep_result}")
+                    last_cj_sweep_month = current_month_key
+                except Exception as e:
+                    logger.error(f"[SCHEDULER] Cratejoy sweep failed: {e}", exc_info=True)
 
             # Phase 3 — Daily VeraCore inventory sync at ~04:00 UTC (≈11 PM ET).
             # Skipped entirely when VeraCore is not configured.
@@ -1261,7 +1400,11 @@ async def cratejoy_order_webhook(request: Request):
     """
     start_time = time.time()
     body = await request.body()
-    logger.info(f"[CRATEJOY WEBHOOK] Received webhook, body size: {len(body)} bytes")
+    logger.info(
+        f"[CRATEJOY WEBHOOK] Received webhook — body_size={len(body)} "
+        f"ip={request.client.host if request.client else 'unknown'} "
+        f"content_type={request.headers.get('content-type', 'none')}"
+    )
 
     # ─── Parse payload ───
     try:
@@ -1276,6 +1419,7 @@ async def cratejoy_order_webhook(request: Request):
             logger.error(f"[CRATEJOY WEBHOOK] Payload parsed but is not a dict: type={type(payload).__name__}")
             payload = {"raw": str(payload)}
         logger.info(f"[CRATEJOY WEBHOOK] Parsed payload keys: {list(payload.keys()) if isinstance(payload, dict) else 'N/A'}")
+        logger.info(f"[CRATEJOY WEBHOOK] Raw payload (first 3000 chars): {raw_text[:3000]}")
     except Exception as e:
         logger.error(f"[CRATEJOY WEBHOOK] Parse error: {e}", exc_info=True)
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
@@ -1345,13 +1489,20 @@ async def cratejoy_order_webhook(request: Request):
         if is_expired:
             logger.info(f"[CRATEJOY WEBHOOK] Subscription is expired. Will skip decision engine.")
 
-    # Use a combo key for idempotency 
+    # Idempotency key — subscription events use sub_id + end_date because the same
+    # subscription ID recurs every billing cycle (every 3 months for a 3-month prepay).
+    # end_date is unique per billing cycle, so sub_6897_2026-07-01 != sub_6897_2026-10-01.
+    # Order events already use the unique order_id so no suffix needed.
     cj_order_id = ""
     if isinstance(payload, dict):
         cj_order_id = str(payload.get("id", payload.get("order", {}).get("id", "")))
 
-    event_id = f"cj_{event_type}_{cj_order_id}" if cj_order_id else None
-    logger.info(f"[CRATEJOY WEBHOOK] Event: {event_type}, CJ Order/Sub ID: {cj_order_id}")
+    end_date_key = ""
+    if isinstance(payload, dict) and payload.get("end_date"):
+        end_date_key = f"_{payload['end_date'][:10]}"  # YYYY-MM-DD only
+
+    event_id = f"cj_{event_type}_{cj_order_id}{end_date_key}" if cj_order_id else None
+    logger.info(f"[CRATEJOY WEBHOOK] Event: {event_type}, CJ Order/Sub ID: {cj_order_id}, end_date_key: '{end_date_key}', event_id: {event_id}")
 
     # Check duplicate
     if event_id:
@@ -1568,8 +1719,54 @@ async def cratejoy_order_webhook(request: Request):
                         survey_gender = None
                         survey_daddy = None
                         survey_past_subscriber = None
+                        update_from_survey = {}
 
                         async with httpx.AsyncClient(timeout=15.0) as client:
+                            # Step 0: fetch shipping address from Cratejoy API
+                            # Address is NOT included in webhook payloads — must be fetched separately
+                            if cratejoy_customer_id:
+                                addr_url = f"https://api.cratejoy.com/v1/customers/{cratejoy_customer_id}/addresses/"
+                                logger.info(f"[CRATEJOY WEBHOOK] Fetching address — url={addr_url}")
+                                try:
+                                    addr_resp = await client.get(addr_url, headers=cj_headers)
+                                    logger.info(
+                                        f"[CRATEJOY WEBHOOK] Address API response — status={addr_resp.status_code} "
+                                        f"body={addr_resp.text[:500]}"
+                                    )
+                                    if addr_resp.status_code == 200:
+                                        addr_results = addr_resp.json().get("results", [])
+                                        if addr_results:
+                                            addr = addr_results[0]
+                                            fetched_street = addr.get("street", "")
+                                            fetched_city = addr.get("city", "")
+                                            fetched_state = addr.get("state", "")
+                                            fetched_zip = addr.get("zip_code", "")
+                                            fetched_country = addr.get("country", "US") or "US"
+                                            if fetched_street:
+                                                update_from_survey["address_line1"] = fetched_street
+                                            if fetched_city:
+                                                update_from_survey["city"] = fetched_city
+                                            if fetched_state:
+                                                update_from_survey["province"] = fetched_state
+                                            if fetched_zip:
+                                                update_from_survey["zip"] = fetched_zip
+                                            if fetched_country:
+                                                update_from_survey["country"] = fetched_country
+                                            logger.info(
+                                                f"[CRATEJOY WEBHOOK] Address fetched — "
+                                                f"street='{fetched_street}' city='{fetched_city}' "
+                                                f"state='{fetched_state}' zip='{fetched_zip}'"
+                                            )
+                                        else:
+                                            logger.info(f"[CRATEJOY WEBHOOK] No addresses found for customer {cratejoy_customer_id}")
+                                    else:
+                                        logger.warning(
+                                            f"[CRATEJOY WEBHOOK] Address API failed — "
+                                            f"status={addr_resp.status_code} body={addr_resp.text[:300]}"
+                                        )
+                                except Exception as addr_err:
+                                    logger.warning(f"[CRATEJOY WEBHOOK] Address fetch error (non-fatal): {addr_err}")
+
                             # Step 1 (customer_new only): resolve subscription_id from customer_id
                             if cj_customer_id_for_lookup and not cj_sub_id_for_survey:
                                 sub_lookup_url = f"https://api.cratejoy.com/v1/subscriptions/?customer.id={cj_customer_id_for_lookup}&limit=1"
@@ -1633,8 +1830,6 @@ async def cratejoy_order_webhook(request: Request):
                                     logger.warning(f"[CRATEJOY WEBHOOK] Survey API returned {survey_resp.status_code}: {survey_resp.text[:300]}")
 
                         # Apply survey data to customer
-                        update_from_survey = {}
-
                         if survey_due_date:
                             parsed_due = parse_due_date(survey_due_date)
                             if parsed_due:
@@ -1825,6 +2020,7 @@ async def register_cratejoy_webhooks():
 
     target_url = f"{BASE_URL}/webhooks/cratejoy/order"
     events_to_register = [
+        ("subscription_new", "OBB Sub New"),
         ("order_new", "OBB Order New"),
         ("subscription_renewed", "OBB Sub Renewed"),
         ("customer_new", "OBB Customer New"),
@@ -3987,6 +4183,11 @@ async def edit_customer(
     platform: str = Form("shopify"),
     subscription_status: str = Form("active"),
     wants_daddy_item: str = Form(""),
+    address_line1: str = Form(""),
+    city: str = Form(""),
+    province: str = Form(""),
+    zip: str = Form(""),
+    country: str = Form(""),
 ):
     """Edit an existing customer's details."""
     try:
@@ -4006,9 +4207,17 @@ async def edit_customer(
             "platform": platform,
             "subscription_status": subscription_status,
             "wants_daddy_item": daddy,
+            "address_line1": address_line1.strip() or None,
+            "city": city.strip() or None,
+            "province": province.strip() or None,
+            "zip": zip.strip() or None,
+            "country": country.strip() or "US",
         }
         db.table("customers").update(record).eq("id", customer_id).execute()
-        logger.info(f"[CUSTOMER EDIT] Updated customer {customer_id}: T{trimester}, {platform}, daddy={daddy}")
+        logger.info(
+            f"[CUSTOMER EDIT] Updated customer {customer_id}: T{trimester}, {platform}, "
+            f"addr='{address_line1.strip()}' {city.strip()} {province.strip()} {zip.strip()}, daddy={daddy}"
+        )
         await log_activity("customer", f"Edited customer {customer_id}", f"T{trimester}, {platform}", "success")
     except Exception as e:
         logger.error(f"[CUSTOMER EDIT] Error: {e}", exc_info=True)
