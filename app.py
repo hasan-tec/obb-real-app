@@ -4623,9 +4623,9 @@ async def settings_page(request: Request):
                     target = f"{BASE_URL}/webhooks/cratejoy/order"
                     our_hooks = [h for h in hooks if h.get("target") == target and h.get("enabled")]
                     cratejoy_hook_count = len(our_hooks)
-                    cratejoy_hook_events = [h.get("event", "") for h in our_hooks]
+                    cratejoy_hook_events = [{"event": h.get("event", ""), "target": h.get("target", "")} for h in our_hooks]
                     cratejoy_hooks_registered = cratejoy_hook_count >= _EXPECTED_CJ_HOOKS
-                    logger.info(f"[SETTINGS] Cratejoy hooks: {cratejoy_hook_count}/{_EXPECTED_CJ_HOOKS} registered: {cratejoy_hook_events}")
+                    logger.info(f"[SETTINGS] Cratejoy hooks: {cratejoy_hook_count}/{_EXPECTED_CJ_HOOKS} registered: {[h['event'] for h in cratejoy_hook_events]}")
         except Exception as e:
             logger.error(f"[SETTINGS] Error checking Cratejoy hooks: {e}")
 

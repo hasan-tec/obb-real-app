@@ -55,7 +55,7 @@
             </div>
             <div class="sub">
                 {% if cratejoy_hook_events %}
-                    {% for ev in cratejoy_hook_events %}✓ {{ ev }}<br>{% endfor %}
+                    {% for h in cratejoy_hook_events %}✓ {{ h.event }}<br>{% endfor %}
                 {% elif cratejoy_hook_count > 0 %}
                     {{ cratejoy_expected_hooks - cratejoy_hook_count }} hook(s) missing
                 {% else %}
@@ -76,11 +76,24 @@
                 <input type="text" class="form-control" value="{{ webhook_url_shopify }}" readonly
                     onclick="this.select()">
             </div>
+            {% if cratejoy_hook_events %}
+            <div class="form-group">
+                <label>Cratejoy Registered Webhooks ({{ cratejoy_hook_count }} active)</label>
+                {% for h in cratejoy_hook_events %}
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                    <span class="badge badge-green" style="min-width:180px; text-align:center; font-size:11px;">{{ h.event }}</span>
+                    <input type="text" class="form-control" value="{{ h.target }}" readonly
+                        onclick="this.select()" style="flex:1; font-size:12px;">
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
             <div class="form-group">
                 <label>Cratejoy Webhook URL</label>
                 <input type="text" class="form-control" value="{{ webhook_url_cratejoy }}" readonly
                     onclick="this.select()">
             </div>
+            {% endif %}
             <div class="form-group">
                 <label>Base URL (ngrok)</label>
                 <input type="text" class="form-control" value="{{ base_url }}" readonly onclick="this.select()">
