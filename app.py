@@ -1722,50 +1722,57 @@ async def cratejoy_order_webhook(request: Request):
                         update_from_survey = {}
 
                         async with httpx.AsyncClient(timeout=15.0) as client:
-                            # Step 0: fetch shipping address from Cratejoy API
-                            # Address is NOT included in webhook payloads — must be fetched separately
-                            if cratejoy_customer_id:
-                                addr_url = f"https://api.cratejoy.com/v1/customers/{cratejoy_customer_id}/addresses/"
-                                logger.info(f"[CRATEJOY WEBHOOK] Fetching address — url={addr_url}")
-                                try:
-                                    addr_resp = await client.get(addr_url, headers=cj_headers)
+                            # Step 0: fetch subscription-specific shipping address.
+                            # The subscription endpoint is authoritative — its `address` field is
+                            # exactly the delivery address for that subscription, not a random entry
+                            # from the customer's address history. Fall back to customer addresses
+                            # only for customer_new events where no sub_id exists yet.
+                            try:
+                                addr = None
+                                if cj_sub_id_for_survey:
+                                    sub_url = f"https://api.cratejoy.com/v1/subscriptions/{cj_sub_id_for_survey}/"
+                                    logger.info(f"[CRATEJOY WEBHOOK] Fetching address via subscription — {sub_url}")
+                                    sub_resp = await client.get(sub_url, headers=cj_headers)
                                     logger.info(
-                                        f"[CRATEJOY WEBHOOK] Address API response — status={addr_resp.status_code} "
-                                        f"body={addr_resp.text[:500]}"
+                                        f"[CRATEJOY WEBHOOK] Subscription API — status={sub_resp.status_code} "
+                                        f"addr_field={str(sub_resp.json().get('address', {}))[:300]}"
                                     )
-                                    if addr_resp.status_code == 200:
-                                        addr_results = addr_resp.json().get("results", [])
-                                        if addr_results:
-                                            addr = addr_results[0]
-                                            fetched_street = addr.get("street", "")
-                                            fetched_city = addr.get("city", "")
-                                            fetched_state = addr.get("state", "")
-                                            fetched_zip = addr.get("zip_code", "")
-                                            fetched_country = addr.get("country", "US") or "US"
-                                            if fetched_street:
-                                                update_from_survey["address_line1"] = fetched_street
-                                            if fetched_city:
-                                                update_from_survey["city"] = fetched_city
-                                            if fetched_state:
-                                                update_from_survey["province"] = fetched_state
-                                            if fetched_zip:
-                                                update_from_survey["zip"] = fetched_zip
-                                            if fetched_country:
-                                                update_from_survey["country"] = fetched_country
-                                            logger.info(
-                                                f"[CRATEJOY WEBHOOK] Address fetched — "
-                                                f"street='{fetched_street}' city='{fetched_city}' "
-                                                f"state='{fetched_state}' zip='{fetched_zip}'"
-                                            )
-                                        else:
-                                            logger.info(f"[CRATEJOY WEBHOOK] No addresses found for customer {cratejoy_customer_id}")
-                                    else:
-                                        logger.warning(
-                                            f"[CRATEJOY WEBHOOK] Address API failed — "
-                                            f"status={addr_resp.status_code} body={addr_resp.text[:300]}"
-                                        )
-                                except Exception as addr_err:
-                                    logger.warning(f"[CRATEJOY WEBHOOK] Address fetch error (non-fatal): {addr_err}")
+                                    if sub_resp.status_code == 200:
+                                        addr = sub_resp.json().get("address") or {}
+                                elif cratejoy_customer_id:
+                                    cust_url = f"https://api.cratejoy.com/v1/customers/{cratejoy_customer_id}/addresses/"
+                                    logger.info(f"[CRATEJOY WEBHOOK] Fetching address via customer (no sub_id) — {cust_url}")
+                                    cust_resp = await client.get(cust_url, headers=cj_headers)
+                                    logger.info(f"[CRATEJOY WEBHOOK] Customer address API — status={cust_resp.status_code}")
+                                    if cust_resp.status_code == 200:
+                                        results = cust_resp.json().get("results", [])
+                                        addr = results[0] if results else {}
+
+                                if addr and isinstance(addr, dict):
+                                    fetched_street = addr.get("street", "")
+                                    fetched_city = addr.get("city", "")
+                                    fetched_state = addr.get("state", "")
+                                    fetched_zip = addr.get("zip_code", "")
+                                    fetched_country = addr.get("country", "US") or "US"
+                                    if fetched_street:
+                                        update_from_survey["address_line1"] = fetched_street
+                                    if fetched_city:
+                                        update_from_survey["city"] = fetched_city
+                                    if fetched_state:
+                                        update_from_survey["province"] = fetched_state
+                                    if fetched_zip:
+                                        update_from_survey["zip"] = fetched_zip
+                                    if fetched_country:
+                                        update_from_survey["country"] = fetched_country
+                                    logger.info(
+                                        f"[CRATEJOY WEBHOOK] Address fetched — "
+                                        f"street='{fetched_street}' city='{fetched_city}' "
+                                        f"state='{fetched_state}' zip='{fetched_zip}'"
+                                    )
+                                else:
+                                    logger.info(f"[CRATEJOY WEBHOOK] No address found for sub={cj_sub_id_for_survey} cust={cratejoy_customer_id}")
+                            except Exception as addr_err:
+                                logger.warning(f"[CRATEJOY WEBHOOK] Address fetch error (non-fatal): {addr_err}")
 
                             # Step 1 (customer_new only): resolve subscription_id from customer_id
                             if cj_customer_id_for_lookup and not cj_sub_id_for_survey:
@@ -2629,49 +2636,55 @@ async def replay_webhook(webhook_id: str):
                             cj_headers = {"Authorization": f"Basic {auth_str}", "Accept": "application/json"}
                             update_from_survey = {}
                             async with httpx.AsyncClient(timeout=15.0) as client:
-                                # Step 0: address — not included in webhook payloads, must call API
-                                if cratejoy_customer_id:
-                                    addr_url = f"https://api.cratejoy.com/v1/customers/{cratejoy_customer_id}/addresses/"
-                                    logger.info(f"[WEBHOOK REPLAY] Fetching CJ address — url={addr_url}")
-                                    try:
-                                        addr_resp = await client.get(addr_url, headers=cj_headers)
+                                # Step 0: fetch subscription-specific address.
+                                # Use subscription endpoint (authoritative) when sub_id available,
+                                # fall back to customer addresses for customer_new events.
+                                try:
+                                    addr = None
+                                    if cj_sub_id:
+                                        sub_url = f"https://api.cratejoy.com/v1/subscriptions/{cj_sub_id}/"
+                                        logger.info(f"[WEBHOOK REPLAY] Fetching address via subscription — {sub_url}")
+                                        sub_resp = await client.get(sub_url, headers=cj_headers)
                                         logger.info(
-                                            f"[WEBHOOK REPLAY] Address API — status={addr_resp.status_code} "
-                                            f"body={addr_resp.text[:500]}"
+                                            f"[WEBHOOK REPLAY] Subscription API — status={sub_resp.status_code} "
+                                            f"addr_field={str(sub_resp.json().get('address', {}))[:300]}"
                                         )
-                                        if addr_resp.status_code == 200:
-                                            addr_results = addr_resp.json().get("results", [])
-                                            if addr_results:
-                                                addr = addr_results[0]
-                                                fetched_street = addr.get("street", "")
-                                                fetched_city = addr.get("city", "")
-                                                fetched_state = addr.get("state", "")
-                                                fetched_zip = addr.get("zip_code", "")
-                                                fetched_country = addr.get("country", "US") or "US"
-                                                if fetched_street:
-                                                    update_from_survey["address_line1"] = fetched_street
-                                                if fetched_city:
-                                                    update_from_survey["city"] = fetched_city
-                                                if fetched_state:
-                                                    update_from_survey["province"] = fetched_state
-                                                if fetched_zip:
-                                                    update_from_survey["zip"] = fetched_zip
-                                                if fetched_country:
-                                                    update_from_survey["country"] = fetched_country
-                                                logger.info(
-                                                    f"[WEBHOOK REPLAY] Address fetched — "
-                                                    f"street='{fetched_street}' city='{fetched_city}' "
-                                                    f"state='{fetched_state}' zip='{fetched_zip}'"
-                                                )
-                                            else:
-                                                logger.info(f"[WEBHOOK REPLAY] No addresses found for CJ customer {cratejoy_customer_id}")
-                                        else:
-                                            logger.warning(
-                                                f"[WEBHOOK REPLAY] Address API failed — "
-                                                f"status={addr_resp.status_code} body={addr_resp.text[:300]}"
-                                            )
-                                    except Exception as addr_err:
-                                        logger.warning(f"[WEBHOOK REPLAY] Address fetch error (non-fatal): {addr_err}")
+                                        if sub_resp.status_code == 200:
+                                            addr = sub_resp.json().get("address") or {}
+                                    elif cratejoy_customer_id:
+                                        cust_url = f"https://api.cratejoy.com/v1/customers/{cratejoy_customer_id}/addresses/"
+                                        logger.info(f"[WEBHOOK REPLAY] Fetching address via customer (no sub_id) — {cust_url}")
+                                        cust_resp = await client.get(cust_url, headers=cj_headers)
+                                        logger.info(f"[WEBHOOK REPLAY] Customer address API — status={cust_resp.status_code}")
+                                        if cust_resp.status_code == 200:
+                                            results = cust_resp.json().get("results", [])
+                                            addr = results[0] if results else {}
+
+                                    if addr and isinstance(addr, dict):
+                                        fetched_street = addr.get("street", "")
+                                        fetched_city = addr.get("city", "")
+                                        fetched_state = addr.get("state", "")
+                                        fetched_zip = addr.get("zip_code", "")
+                                        fetched_country = addr.get("country", "US") or "US"
+                                        if fetched_street:
+                                            update_from_survey["address_line1"] = fetched_street
+                                        if fetched_city:
+                                            update_from_survey["city"] = fetched_city
+                                        if fetched_state:
+                                            update_from_survey["province"] = fetched_state
+                                        if fetched_zip:
+                                            update_from_survey["zip"] = fetched_zip
+                                        if fetched_country:
+                                            update_from_survey["country"] = fetched_country
+                                        logger.info(
+                                            f"[WEBHOOK REPLAY] Address fetched — "
+                                            f"street='{fetched_street}' city='{fetched_city}' "
+                                            f"state='{fetched_state}' zip='{fetched_zip}'"
+                                        )
+                                    else:
+                                        logger.info(f"[WEBHOOK REPLAY] No address found for sub={cj_sub_id} cust={cratejoy_customer_id}")
+                                except Exception as addr_err:
+                                    logger.warning(f"[WEBHOOK REPLAY] Address fetch error (non-fatal): {addr_err}")
 
                                 # Step 1: survey
                                 if cj_sub_id:
