@@ -4606,8 +4606,10 @@ async def settings_page(request: Request):
     supabase_connected = bool(SUPABASE_URL and SUPABASE_KEY)
 
     # Check if Cratejoy webhooks are actually registered
+    _EXPECTED_CJ_HOOKS = 5  # subscription_new, order_new, subscription_renewed, customer_new, subscription_cancelled
     cratejoy_hooks_registered = False
     cratejoy_hook_count = 0
+    cratejoy_hook_events = []
     if cratejoy_connected:
         try:
             auth_str = base64.b64encode(f"{CRATEJOY_CLIENT_ID}:{CRATEJOY_CLIENT_SECRET}".encode()).decode()
@@ -4621,8 +4623,9 @@ async def settings_page(request: Request):
                     target = f"{BASE_URL}/webhooks/cratejoy/order"
                     our_hooks = [h for h in hooks if h.get("target") == target and h.get("enabled")]
                     cratejoy_hook_count = len(our_hooks)
-                    cratejoy_hooks_registered = cratejoy_hook_count >= 4
-                    logger.info(f"[SETTINGS] Cratejoy hooks: {cratejoy_hook_count}/4 registered")
+                    cratejoy_hook_events = [h.get("event", "") for h in our_hooks]
+                    cratejoy_hooks_registered = cratejoy_hook_count >= _EXPECTED_CJ_HOOKS
+                    logger.info(f"[SETTINGS] Cratejoy hooks: {cratejoy_hook_count}/{_EXPECTED_CJ_HOOKS} registered: {cratejoy_hook_events}")
         except Exception as e:
             logger.error(f"[SETTINGS] Error checking Cratejoy hooks: {e}")
 
@@ -4646,6 +4649,8 @@ async def settings_page(request: Request):
         "migration_run": migration_run,
         "cratejoy_hooks_registered": cratejoy_hooks_registered,
         "cratejoy_hook_count": cratejoy_hook_count,
+        "cratejoy_hook_events": cratejoy_hook_events,
+        "cratejoy_expected_hooks": 5,
         "shopify_domain": SHOPIFY_STORE_DOMAIN,
         "base_url": BASE_URL,
         "webhook_url_shopify": f"{BASE_URL}/webhooks/shopify/orders/create",

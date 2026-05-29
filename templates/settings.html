@@ -46,15 +46,22 @@
             <div class="label">Cratejoy Webhooks</div>
             <div class="value" style="font-size:16px;">
                 {% if cratejoy_hooks_registered %}
-                <span class="badge badge-green">{{ cratejoy_hook_count }}/4 Active</span>
+                <span class="badge badge-green">{{ cratejoy_hook_count }}/{{ cratejoy_expected_hooks }} Active</span>
                 {% elif cratejoy_hook_count > 0 %}
-                <span class="badge badge-yellow">{{ cratejoy_hook_count }}/4 Active</span>
+                <span class="badge badge-yellow">{{ cratejoy_hook_count }}/{{ cratejoy_expected_hooks }} Active</span>
                 {% else %}
                 <span class="badge badge-red">Not Registered</span>
                 {% endif %}
             </div>
-            <div class="sub">{% if cratejoy_hooks_registered %}All 4 hooks active{% elif cratejoy_hook_count > 0 %}{{ 4
-                - cratejoy_hook_count }} hooks missing{% else %}Click Register below{% endif %}</div>
+            <div class="sub">
+                {% if cratejoy_hook_events %}
+                    {% for ev in cratejoy_hook_events %}✓ {{ ev }}<br>{% endfor %}
+                {% elif cratejoy_hook_count > 0 %}
+                    {{ cratejoy_expected_hooks - cratejoy_hook_count }} hook(s) missing
+                {% else %}
+                    Click Register below
+                {% endif %}
+            </div>
         </div>
     </div>
 
