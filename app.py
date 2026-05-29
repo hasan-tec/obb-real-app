@@ -984,7 +984,20 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
         return {"decision_type": "incomplete-data", "reason": "Customer not found", "kit_id": None, "kit_sku": None}
 
     cust = customer_result.data
-    trimester = cust.get("trimester")
+
+    # Always recalculate trimester from due_date + ship_date_val so the kit matches
+    # the customer's actual trimester at ship time, not a potentially stale stored value.
+    due_date_raw = cust.get("due_date")
+    if due_date_raw:
+        try:
+            due = date.fromisoformat(str(due_date_raw))
+            trimester = calculate_trimester(due, ship_date_val)
+            logger.info(f"[DECISION ENGINE] Trimester recalculated: T{trimester} (due={due_date_raw}, ship={ship_date_val})")
+        except Exception:
+            trimester = cust.get("trimester")
+    else:
+        trimester = cust.get("trimester")
+
     if not trimester:
         logger.warning(f"[DECISION ENGINE] Customer {customer_id} has no trimester (missing due date)")
         return {"decision_type": "incomplete-data", "reason": "No trimester — missing due date", "kit_id": None, "kit_sku": None}
@@ -1866,8 +1879,9 @@ async def cratejoy_order_webhook(request: Request):
 
                         if survey_daddy:
                             daddy_lower = survey_daddy.lower().strip()
-                            update_from_survey["wants_daddy_item"] = daddy_lower in ("yes", "y", "true", "sure", "ok", "okay")
-                            logger.info(f"[CRATEJOY WEBHOOK] Survey → wants_daddy_item={update_from_survey['wants_daddy_item']}")
+                            # CJ returns values like "Yes, daddy-to-be" not plain "yes" — check startswith
+                            update_from_survey["wants_daddy_item"] = daddy_lower.startswith("yes") or daddy_lower in ("y", "true", "sure", "ok", "okay")
+                            logger.info(f"[CRATEJOY WEBHOOK] Survey → wants_daddy_item={update_from_survey['wants_daddy_item']} (raw='{survey_daddy}')")
 
                         if update_from_survey:
                             db.table("customers").update(update_from_survey).eq("id", cust_id).execute()
@@ -2716,7 +2730,8 @@ async def replay_webhook(webhook_id: str):
                                                     gl = value.lower()
                                                     update_from_survey["baby_gender"] = "boy" if "boy" in gl else ("girl" if "girl" in gl else "unknown")
                                                 elif "second parent" in field_name or "matching apparel" in field_name:
-                                                    update_from_survey["wants_daddy_item"] = value.lower() in ("yes", "y", "true", "sure")
+                                                    dl = value.lower().strip()
+                                                    update_from_survey["wants_daddy_item"] = dl.startswith("yes") or dl in ("y", "true", "sure")
                                     else:
                                         logger.warning(f"[WEBHOOK REPLAY] Survey API returned {survey_resp.status_code}")
 
