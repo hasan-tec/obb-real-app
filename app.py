@@ -924,6 +924,7 @@ def populate_shipment_items(shipment_id: Optional[str], kit_id: Optional[str], m
 
     db = get_supabase()
     added_item_ids: set[str] = set()
+    rows_to_insert: list[dict] = []
     unresolved_refs: list[str] = []
 
     if kit_id:
@@ -931,31 +932,24 @@ def populate_shipment_items(shipment_id: Optional[str], kit_id: Optional[str], m
         logger.info(f"[SHIPMENT ITEMS] Kit {kit_id} has {len(kit_items.data or [])} mapped items")
         for kit_item in (kit_items.data or []):
             item_id = kit_item["item_id"]
-            if item_id in added_item_ids:
-                continue
-            try:
-                db.table("shipment_items").insert({
-                    "shipment_id": shipment_id,
-                    "item_id": item_id,
-                }).execute()
+            if item_id not in added_item_ids:
                 added_item_ids.add(item_id)
-            except Exception as item_err:
-                logger.warning(f"[SHIPMENT ITEMS] Could not add mapped kit item {item_id}: {item_err}")
+                rows_to_insert.append({"shipment_id": shipment_id, "item_id": item_id})
 
     manual_item_ids, unresolved_refs = resolve_history_item_ids(manual_item_refs)
     if manual_item_ids:
         logger.info(f"[SHIPMENT ITEMS] Adding {len(manual_item_ids)} manual history item(s) to shipment {shipment_id}")
     for item_id in manual_item_ids:
-        if item_id in added_item_ids:
-            continue
-        try:
-            db.table("shipment_items").insert({
-                "shipment_id": shipment_id,
-                "item_id": item_id,
-            }).execute()
+        if item_id not in added_item_ids:
             added_item_ids.add(item_id)
-        except Exception as item_err:
-            logger.warning(f"[SHIPMENT ITEMS] Could not add manual history item {item_id}: {item_err}")
+            rows_to_insert.append({"shipment_id": shipment_id, "item_id": item_id})
+
+    # Bulk INSERT all items in one call (Issues 3+4)
+    if rows_to_insert:
+        try:
+            db.table("shipment_items").insert(rows_to_insert).execute()
+        except Exception as insert_err:
+            logger.warning(f"[SHIPMENT ITEMS] Bulk insert failed: {insert_err}")
 
     logger.info(
         f"[SHIPMENT ITEMS] Shipment {shipment_id} now has {len(added_item_ids)} recorded item(s); "
@@ -969,15 +963,29 @@ def load_customer_shipments_with_items(customer_id: str) -> list[dict]:
     db = get_supabase()
     shipments = db.table("shipments").select("*").eq("customer_id", customer_id).order("created_at", desc=True).execute()
     shipment_rows = shipments.data or []
-    enriched_shipments: list[dict] = []
 
+    if not shipment_rows:
+        logger.info(f"[CUSTOMER DETAIL] No shipments for customer {customer_id}")
+        return []
+
+    # Bulk-fetch all shipment_items for all shipments in ONE query (Issue 5)
+    shipment_ids = [s["id"] for s in shipment_rows]
+    all_items_result = db.table("shipment_items").select("shipment_id, item_id, items(*)").in_("shipment_id", shipment_ids).execute()
+
+    items_by_shipment: dict[str, list] = {sid: [] for sid in shipment_ids}
+    for si in (all_items_result.data or []):
+        sid = si.get("shipment_id")
+        if sid in items_by_shipment:
+            items_by_shipment[sid].append(si)
+
+    enriched_shipments: list[dict] = []
     for shipment in shipment_rows:
-        shipment_items = db.table("shipment_items").select("item_id, items(*)").eq("shipment_id", shipment["id"]).execute()
         shipment_row = dict(shipment)
-        shipment_row["shipment_items"] = shipment_items.data or []
+        items = items_by_shipment.get(shipment["id"], [])
+        shipment_row["shipment_items"] = items
         shipment_row["shipment_item_text"] = ", ".join(
             (si.get("items") or {}).get("sku") or (si.get("items") or {}).get("name") or si.get("item_id") or ""
-            for si in shipment_row["shipment_items"]
+            for si in items
             if (si.get("items") or {}).get("sku") or (si.get("items") or {}).get("name") or si.get("item_id")
         )
         enriched_shipments.append(shipment_row)
@@ -1130,8 +1138,12 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
     for ship in (shipments.data or []):
         if ship.get("kit_sku"):
             received_kit_skus.add(ship["kit_sku"])
-        ship_items = db.table("shipment_items").select("item_id").eq("shipment_id", ship["id"]).execute()
-        for si in (ship_items.data or []):
+
+    # Bulk-fetch all shipment_items in one query instead of one per shipment (Issue 6)
+    if shipments.data:
+        ship_ids = [s["id"] for s in shipments.data]
+        all_ship_items = db.table("shipment_items").select("item_id").in_("shipment_id", ship_ids).execute()
+        for si in (all_ship_items.data or []):
             received_item_ids.add(si["item_id"])
 
     logger.info(f"[DECISION ENGINE] History: {len(received_kit_skus)} kits received, {len(received_item_ids)} items received")
@@ -1196,25 +1208,29 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
             "kit_sku": None,
         }
 
-    # 5. Check for duplicate items per kit
+    # 5. Check for duplicate items per kit — bulk-fetch kit_items to avoid N+1 (Issue 7)
+    kit_ids_to_check = [k["id"] for k in filtered]
+    if kit_ids_to_check:
+        bulk_kit_items = db.table("kit_items").select("kit_id, item_id").in_("kit_id", kit_ids_to_check).execute()
+        kit_items_map: dict[str, set] = {}
+        for ki in (bulk_kit_items.data or []):
+            kit_items_map.setdefault(ki["kit_id"], set()).add(ki["item_id"])
+    else:
+        kit_items_map = {}
+
     valid_kits = []
     for kit in filtered:
-        # Skip if already received this exact kit
         if kit["sku"] in received_kit_skus:
             logger.info(f"[DECISION ENGINE] Kit {kit['sku']} excluded: already received by customer")
             continue
 
-        # Get this kit's items
-        kit_items_result = db.table("kit_items").select("item_id").eq("kit_id", kit["id"]).execute()
-        kit_item_ids = {ki["item_id"] for ki in (kit_items_result.data or [])}
+        kit_item_ids = kit_items_map.get(kit["id"], set())
 
-        # If kit has no items mapped yet, allow it (items not set up yet)
         if not kit_item_ids:
             logger.info(f"[DECISION ENGINE] Kit {kit['sku']} has no items mapped — allowing (items not configured)")
             valid_kits.append(kit)
             continue
 
-        # Check item overlap with blocked items
         overlap = kit_item_ids & blocked_item_ids
         if overlap:
             logger.info(f"[DECISION ENGINE] Kit {kit['sku']} excluded: {len(overlap)} duplicate items")
@@ -5661,15 +5677,16 @@ async def approve_decision(request: Request, decision_id: str, background_tasks:
         logger.info(f"[APPROVE] Draft shipment {approve_shipment_id} created — items now visible to duplicate engine")
         if d.get("kit_id") and approve_shipment_id:
             approve_kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
-            for ki in (approve_kit_items.data or []):
+            si_rows = [
+                {"shipment_id": approve_shipment_id, "item_id": ki["item_id"]}
+                for ki in (approve_kit_items.data or [])
+            ]
+            if si_rows:
                 try:
-                    db.table("shipment_items").insert({
-                        "shipment_id": approve_shipment_id,
-                        "item_id": ki["item_id"],
-                    }).execute()
+                    db.table("shipment_items").insert(si_rows).execute()
                 except Exception as si_err:
-                    logger.warning(f"[APPROVE] Could not add shipment_item: {si_err}")
-            logger.info(f"[APPROVE] Populated {len(approve_kit_items.data or [])} item(s) into draft shipment")
+                    logger.warning(f"[APPROVE] Could not bulk-insert shipment_items: {si_err}")
+            logger.info(f"[APPROVE] Populated {len(si_rows)} item(s) into draft shipment")
 
         cust_email = d.get("customers", {}).get("email", decision_id[:8]) if d.get("customers") else decision_id[:8]
         cust_name = ""
@@ -6411,15 +6428,40 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
 
         success = failed = skipped = 0
 
+        # Issue 10 — bulk-fetch all decisions in ONE query instead of one per id
+        all_decisions_result = (
+            db.table("decisions")
+            .select("*, customers(email, first_name, last_name)")
+            .in_("id", decision_ids)
+            .execute()
+        )
+        decisions_map: dict[str, dict] = {d["id"]: d for d in (all_decisions_result.data or [])}
+        logger.info(f"[BULK ACTION] Pre-fetched {len(decisions_map)}/{len(decision_ids)} decisions")
+
+        # Issue 9 — pre-fetch kit_items for all pending kits, then bulk INSERT shipment_items once
+        pending_kit_ids = list({
+            decisions_map[did]["kit_id"]
+            for did in decision_ids
+            if decisions_map.get(did, {}).get("status") == "pending"
+            and decisions_map.get(did, {}).get("kit_id")
+        })
+        if pending_kit_ids:
+            kit_items_bulk = db.table("kit_items").select("kit_id, item_id").in_("kit_id", pending_kit_ids).execute()
+            kit_items_by_kit: dict[str, list[str]] = {}
+            for ki in (kit_items_bulk.data or []):
+                kit_items_by_kit.setdefault(ki["kit_id"], []).append(ki["item_id"])
+        else:
+            kit_items_by_kit = {}
+        pending_shipment_items: list[dict] = []  # collected across all decisions, bulk-inserted after loop
+
         for did in decision_ids:
             try:
-                decision = db.table("decisions").select("*, customers(email, first_name, last_name)").eq("id", did).single().execute()
-                if not decision.data:
+                d = decisions_map.get(did)
+                if not d:
                     logger.warning(f"[BULK ACTION] Decision {did} not found")
                     failed += 1
                     continue
 
-                d              = decision.data
                 current_status = d.get("status")
 
                 if action == "approve":
@@ -6436,7 +6478,7 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                             new_qty = max(0, kit.data["quantity_available"] - 1)
                             db.table("kits").update({"quantity_available": new_qty}).eq("id", kit_id).execute()
                             logger.debug(f"[BULK ACTION] Kit {kit.data['sku']} stock → {new_qty}")
-                    # Create draft shipment + shipment_items
+                    # Create draft shipment; collect shipment_items for bulk insert after loop
                     draft_ship = {
                         "customer_id":      d["customer_id"],
                         "kit_id":           d.get("kit_id"),
@@ -6450,12 +6492,8 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                     ship_result = db.table("shipments").insert(draft_ship).execute()
                     ship_id     = ship_result.data[0]["id"] if ship_result.data else None
                     if kit_id and ship_id:
-                        kit_items = db.table("kit_items").select("item_id").eq("kit_id", kit_id).execute()
-                        for ki in (kit_items.data or []):
-                            try:
-                                db.table("shipment_items").insert({"shipment_id": ship_id, "item_id": ki["item_id"]}).execute()
-                            except Exception:
-                                pass
+                        for item_id in kit_items_by_kit.get(kit_id, []):
+                            pending_shipment_items.append({"shipment_id": ship_id, "item_id": item_id})
                     logger.info(f"[BULK ACTION] Approved {did[:8]}, draft shipment={ship_id[:8] if ship_id else '?'}")
                     # Sync status to Google Sheet (matches single approve flow)
                     cust_email_bulk = (d.get("customers") or {}).get("email", did[:8])
@@ -6466,8 +6504,6 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                         reason_prefix="Bulk-approved",
                     )
                     # Phase 3 — Push to VeraCore in background (matches single-approve flow).
-                    # Keeps bulk-approve well under Heroku's 30s request timeout regardless
-                    # of how many decisions are selected or how slow VeraCore's SOAP endpoint is.
                     logger.info("[BULK ACTION] Queuing VeraCore push for %s (background)", did[:8])
                     background_tasks.add_task(submit_to_veracore, did)
                     success += 1
@@ -6603,6 +6639,14 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
             except Exception as row_err:
                 logger.error(f"[BULK ACTION] Error on decision {did}: {row_err}", exc_info=True)
                 failed += 1
+
+        # Issue 9 — one bulk INSERT for all shipment_items across all approved decisions
+        if pending_shipment_items:
+            try:
+                db.table("shipment_items").insert(pending_shipment_items).execute()
+                logger.info(f"[BULK ACTION] Bulk-inserted {len(pending_shipment_items)} shipment_items in one call")
+            except Exception as si_bulk_err:
+                logger.error(f"[BULK ACTION] Bulk shipment_items insert failed: {si_bulk_err}", exc_info=True)
 
         await log_activity(
             "decision",
