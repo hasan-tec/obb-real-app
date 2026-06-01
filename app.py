@@ -6289,7 +6289,7 @@ async def manual_override_kit(
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/decisions/bulk-action")
-async def bulk_decision_action(request: Request):
+async def bulk_decision_action(request: Request, background_tasks: BackgroundTasks):
     """Bulk approve or ship multiple decisions at once."""
     try:
         db          = get_supabase()
@@ -6364,13 +6364,11 @@ async def bulk_decision_action(request: Request):
                         new_status="approved",
                         reason_prefix="Bulk-approved",
                     )
-                    # Phase 3 — Push to VeraCore (partial-failure safe).
-                    # Succeeded rows stay submitted; failed rows surface in UI for retry.
-                    try:
-                        vc_bulk_result = submit_to_veracore(did)
-                        logger.debug("[BULK ACTION] VeraCore push for %s: %s", did[:8], vc_bulk_result)
-                    except Exception as vc_err:
-                        logger.error("[BULK ACTION] VeraCore push raised for %s: %s", did[:8], vc_err)
+                    # Phase 3 — Push to VeraCore in background (matches single-approve flow).
+                    # Keeps bulk-approve well under Heroku's 30s request timeout regardless
+                    # of how many decisions are selected or how slow VeraCore's SOAP endpoint is.
+                    logger.info("[BULK ACTION] Queuing VeraCore push for %s (background)", did[:8])
+                    background_tasks.add_task(submit_to_veracore, did)
                     success += 1
 
                 elif action == "ship":
