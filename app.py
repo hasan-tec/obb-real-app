@@ -986,6 +986,97 @@ def load_customer_shipments_with_items(customer_id: str) -> list[dict]:
     return enriched_shipments
 
 
+def get_eligible_override_kits(db, cust: dict, enriched_shipments: list, exclude_kit_sku: str | None = None) -> list[dict]:
+    """Return all kits this customer is eligible for using the same logic as the auto-engine,
+    minus the kit already auto-assigned (passed as exclude_kit_sku).
+    Used to populate the Override Kit dropdown so staff only see valid alternatives."""
+
+    # Recalculate trimester live from due_date + today — same as assign_kit does
+    due_date_raw = cust.get("due_date")
+    trimester = cust.get("trimester")
+    if due_date_raw:
+        try:
+            trimester = calculate_trimester(date.fromisoformat(str(due_date_raw)), date.today())
+        except Exception:
+            pass
+
+    if not trimester:
+        logger.info("[OVERRIDE KITS] Customer has no trimester — returning empty list")
+        return []
+
+    clothing_size = cust.get("clothing_size")
+    if clothing_size:
+        clothing_size = normalize_clothing_size(clothing_size) or clothing_size
+
+    # Build item history from the already-loaded enriched shipments (no extra DB calls)
+    received_kit_skus: set[str] = set()
+    received_item_ids: set[str] = set()
+    for ship in enriched_shipments:
+        if ship.get("kit_sku"):
+            received_kit_skus.add(ship["kit_sku"])
+        for si in (ship.get("shipment_items") or []):
+            if si.get("item_id"):
+                received_item_ids.add(si["item_id"])
+
+    # Expand blocked items with alternatives (single bulk fetch)
+    blocked_item_ids: set[str] = set(received_item_ids)
+    if received_item_ids:
+        all_alts = db.table("item_alternatives").select("item_id, alternative_item_id").execute()
+        for alt in (all_alts.data or []):
+            if alt["item_id"] in received_item_ids:
+                blocked_item_ids.add(alt["alternative_item_id"])
+            if alt["alternative_item_id"] in received_item_ids:
+                blocked_item_ids.add(alt["item_id"])
+
+    # Welcome kits for new customers, regular kits for renewals — same rule as engine
+    is_new = len(enriched_shipments) == 0
+    kits_result = (
+        db.table("kits").select("*")
+        .eq("trimester", trimester)
+        .eq("is_welcome_kit", is_new)
+        .gt("quantity_available", 0)
+        .order("age_rank")
+        .execute()
+    )
+    available_kits = kits_result.data or []
+
+    # Size filter — same rule as engine
+    if clothing_size:
+        size_to_variant = {"S": 1, "M": 2, "L": 3, "XL": 4}
+        customer_variant = size_to_variant.get(clothing_size, 1)
+        size_filtered = [k for k in available_kits if k.get("is_universal") or k.get("size_variant") == customer_variant]
+    else:
+        size_filtered = [k for k in available_kits if k.get("is_universal")]
+
+    if not size_filtered:
+        logger.info("[OVERRIDE KITS] No kits after size filter for T%s size=%s", trimester, clothing_size)
+        return []
+
+    # Batch-fetch kit_items for all candidate kits in one query (avoids N+1)
+    kit_ids = [k["id"] for k in size_filtered]
+    all_kit_items = db.table("kit_items").select("kit_id, item_id").in_("kit_id", kit_ids).execute()
+    kit_items_map: dict[str, set[str]] = {}
+    for ki in (all_kit_items.data or []):
+        kit_items_map.setdefault(ki["kit_id"], set()).add(ki["item_id"])
+
+    valid_kits = []
+    for kit in size_filtered:
+        if kit["sku"] in received_kit_skus:
+            continue
+        if exclude_kit_sku and kit["sku"] == exclude_kit_sku:
+            continue
+        kit_item_ids = kit_items_map.get(kit["id"], set())
+        if kit_item_ids and kit_item_ids & blocked_item_ids:
+            continue
+        valid_kits.append(kit)
+
+    logger.info(
+        "[OVERRIDE KITS] customer=%s T%s size=%s → %d valid override kits (excluded auto=%s)",
+        cust.get("email"), trimester, clothing_size, len(valid_kits), exclude_kit_sku or "none",
+    )
+    return valid_kits
+
+
 async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
     """
     Core decision engine: Assign the best kit for a customer.
@@ -3153,8 +3244,16 @@ async def customer_detail(request: Request, customer_id: str):
             except Exception as tri_err:
                 logger.warning(f"[CUSTOMER DETAIL] Could not recalculate trimester: {tri_err}")
 
-        # Get all kits for the shipment form dropdown and override form
+        # All kits for the "Add Shipment History" datalist (needs full list for history entry)
         kits_list = db.table("kits").select("id, sku, trimester, is_welcome_kit, quantity_available").gt("quantity_available", 0).order("sku").execute()
+
+        # Eligible override kits — engine-filtered alternatives, excluding the auto-assigned kit
+        auto_kit_sku = None
+        for d in (decisions.data or []):
+            if d.get("decision_type") == "auto" and d.get("status") == "pending" and d.get("kit_sku"):
+                auto_kit_sku = d["kit_sku"]
+                break
+        override_kits = get_eligible_override_kits(db, cust.data, shipments, exclude_kit_sku=auto_kit_sku)
 
         return templates.TemplateResponse("customer_detail.html", {
             "request": request,
@@ -3162,6 +3261,8 @@ async def customer_detail(request: Request, customer_id: str):
             "decisions": decisions.data or [],
             "shipments": shipments,
             "kits": kits_list.data or [],
+            "override_kits": override_kits,
+            "auto_kit_sku": auto_kit_sku,
             "stored_trimester": stored_trimester,
             "live_trimester": live_trimester,
             "trimester_changed": trimester_changed,

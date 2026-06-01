@@ -497,17 +497,17 @@
         </div>
         <div style="padding: 16px;">
             <p style="font-size:12px; color: var(--text-dim); margin-bottom: 12px;">
-                Bypass the auto-engine and manually pick a kit. Creates a pending decision you still need to Approve.
+                Only kits suitable for this customer are shown — correct trimester, size, and no duplicate items.{% if auto_kit_sku %} The auto-assigned kit (<strong>{{ auto_kit_sku }}</strong>) is excluded since it's already pending.{% endif %}
             </p>
+            {% if override_kits %}
             <form method="POST" action="/customers/{{ customer.id }}/override-kit">
                 <div class="form-row">
                     <div class="form-group" style="flex: 2;">
                         <label>Kit *</label>
                         <select name="kit_id" class="form-control" required>
                             <option value="">— Choose a kit —</option>
-                            {% for k in kits %}
-                            <option value="{{ k.id }}">{{ k.sku }} — T{{ k.trimester }}{% if k.is_welcome_kit %}
-                                (Welcome){% endif %}</option>
+                            {% for k in override_kits %}
+                            <option value="{{ k.id }}">{{ k.sku }} — T{{ k.trimester }}{% if k.is_welcome_kit %} (Welcome){% endif %} — {{ k.quantity_available }} in stock</option>
                             {% endfor %}
                         </select>
                     </div>
@@ -519,6 +519,11 @@
                 </div>
                 <button type="submit" class="btn btn-primary">⚡ Override Kit</button>
             </form>
+            {% else %}
+            <p style="font-size:12px; color: var(--text-dim);">
+                No alternative kits available for this customer's trimester / size right now. Ask Ting to add more kits in the Kits page.
+            </p>
+            {% endif %}
         </div>
     </div>
 
