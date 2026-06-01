@@ -470,6 +470,20 @@ async def _cratejoy_monthly_sweep(db, ship_date: date) -> dict:
 # Runs on the 1st of each month at ~6 AM UTC. Uses a lightweight background thread.
 _scheduler_started = False
 
+
+def _schedule_lock(key: str) -> bool:
+    """Atomic cross-process lock via O_CREAT|O_EXCL (Linux-atomic).
+    Returns True if this process claimed the job, False if another worker already did.
+    /tmp/ files reset on dyno restart, so each fresh boot can still fire once."""
+    lock_path = f"/tmp/obb_sched_{key}.lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
 def _monthly_report_scheduler():
     """Background thread that checks once per hour if it's the 1st and triggers the report."""
     import time as _time
@@ -483,51 +497,57 @@ def _monthly_report_scheduler():
             current_month_key = f"{now.year}-{now.month:02d}"
             # Trigger on 1st of month, after 6 AM UTC, only once per month
             if now.day == 1 and now.hour >= 6 and last_run_month != current_month_key:
-                logger.info(f"[SCHEDULER] Monthly auto-run triggered for {current_month_key}")
-                try:
-                    db = get_supabase()
-                    from curation_report import run_monthly_report as _sched_run
-                    year, month_num = now.year, now.month
-                    ship_date = date(year, month_num, 14)  # default ship day
-                    report = _sched_run(
-                        db=db,
-                        report_month=current_month_key,
-                        ship_date=ship_date,
-                        warehouse_minimum=100,
-                        include_paused=False,
-                        lookback_months=4,
-                        recency_months=3,
-                    )
-                    # Save to DB
-                    run_insert = db.table("curation_runs").insert({
-                        "report_month": current_month_key,
-                        "ship_date": str(ship_date),
-                        "warehouse_minimum": 100,
-                        "include_paused": False,
-                        "lookback_months": 4,
-                        "status": "completed",
-                        "summary_json": report["executive"],
-                        "completed_at": str(date.today()),
-                    }).execute()
-                    run_id = run_insert.data[0]["id"]
-                    _save_report_details(db, run_id, report)
-                    logger.info(f"[SCHEDULER] Auto-generated curation report for {current_month_key}, run_id={run_id}")
-                    last_run_month = current_month_key
-                except Exception as e:
-                    logger.error(f"[SCHEDULER] Failed to auto-generate report: {e}", exc_info=True)
+                if _schedule_lock(f"curation_{current_month_key}"):
+                    logger.info(f"[SCHEDULER] Monthly auto-run triggered for {current_month_key}")
+                    try:
+                        db = get_supabase()
+                        from curation_report import run_monthly_report as _sched_run
+                        year, month_num = now.year, now.month
+                        ship_date = date(year, month_num, 14)  # default ship day
+                        report = _sched_run(
+                            db=db,
+                            report_month=current_month_key,
+                            ship_date=ship_date,
+                            warehouse_minimum=100,
+                            include_paused=False,
+                            lookback_months=4,
+                            recency_months=3,
+                        )
+                        # Save to DB
+                        run_insert = db.table("curation_runs").insert({
+                            "report_month": current_month_key,
+                            "ship_date": str(ship_date),
+                            "warehouse_minimum": 100,
+                            "include_paused": False,
+                            "lookback_months": 4,
+                            "status": "completed",
+                            "summary_json": report["executive"],
+                            "completed_at": str(date.today()),
+                        }).execute()
+                        run_id = run_insert.data[0]["id"]
+                        _save_report_details(db, run_id, report)
+                        logger.info(f"[SCHEDULER] Auto-generated curation report for {current_month_key}, run_id={run_id}")
+                    except Exception as e:
+                        logger.error(f"[SCHEDULER] Failed to auto-generate report: {e}", exc_info=True)
+                else:
+                    logger.info(f"[SCHEDULER] Curation report for {current_month_key} already claimed by another worker, skipping")
+                last_run_month = current_month_key
 
             # Cratejoy monthly decision sweep — fills months 2-3 gap in prepay cycles.
             # Runs at 7 AM (1 hour after curation report) so it doesn't race with it.
             if now.day == 1 and now.hour >= 7 and last_cj_sweep_month != current_month_key:
-                logger.info(f"[SCHEDULER] Cratejoy monthly sweep triggered for {current_month_key}")
-                try:
-                    db = get_supabase()
-                    ship_date = date(now.year, now.month, 14)
-                    sweep_result = asyncio.run(_cratejoy_monthly_sweep(db, ship_date))
-                    logger.info(f"[SCHEDULER] Cratejoy sweep complete: {sweep_result}")
-                    last_cj_sweep_month = current_month_key
-                except Exception as e:
-                    logger.error(f"[SCHEDULER] Cratejoy sweep failed: {e}", exc_info=True)
+                if _schedule_lock(f"cj_sweep_{current_month_key}"):
+                    logger.info(f"[SCHEDULER] Cratejoy monthly sweep triggered for {current_month_key}")
+                    try:
+                        db = get_supabase()
+                        ship_date = date(now.year, now.month, 14)
+                        sweep_result = asyncio.run(_cratejoy_monthly_sweep(db, ship_date))
+                        logger.info(f"[SCHEDULER] Cratejoy sweep complete: {sweep_result}")
+                    except Exception as e:
+                        logger.error(f"[SCHEDULER] Cratejoy sweep failed: {e}", exc_info=True)
+                else:
+                    logger.info(f"[SCHEDULER] CJ sweep for {current_month_key} already claimed by another worker, skipping")
+                last_cj_sweep_month = current_month_key
 
             # Phase 3 — Daily VeraCore inventory sync at ~04:00 UTC (≈11 PM ET).
             # Skipped entirely when VeraCore is not configured.
@@ -535,21 +555,24 @@ def _monthly_report_scheduler():
             if (veracore_enabled()
                     and now.hour == 4
                     and last_inventory_day != current_day_key):
-                logger.info("[SCHEDULER] Daily VeraCore inventory sync triggered for %s", current_day_key)
-                try:
-                    db = get_supabase()
-                    vc = get_veracore_client()
-                    if vc is not None:
-                        from veracore_sync import run_inventory_sync
-                        inv_result = run_inventory_sync(db, vc)
-                        logger.info("[SCHEDULER] Inventory sync result: %s", inv_result)
-                        # DISABLED — undo when paid
-                        # from veracore_sync import run_expiry_sync
-                        # exp_result = run_expiry_sync(db, vc)
-                        # logger.info("[SCHEDULER] Expiry sync result: %s", exp_result)
-                    last_inventory_day = current_day_key
-                except Exception as e:
-                    logger.error("[SCHEDULER] VeraCore inventory sync failed: %s", e, exc_info=True)
+                if _schedule_lock(f"vc_sync_{current_day_key}"):
+                    logger.info("[SCHEDULER] Daily VeraCore inventory sync triggered for %s", current_day_key)
+                    try:
+                        db = get_supabase()
+                        vc = get_veracore_client()
+                        if vc is not None:
+                            from veracore_sync import run_inventory_sync
+                            inv_result = run_inventory_sync(db, vc)
+                            logger.info("[SCHEDULER] Inventory sync result: %s", inv_result)
+                            # DISABLED — undo when paid
+                            # from veracore_sync import run_expiry_sync
+                            # exp_result = run_expiry_sync(db, vc)
+                            # logger.info("[SCHEDULER] Expiry sync result: %s", exp_result)
+                    except Exception as e:
+                        logger.error("[SCHEDULER] VeraCore inventory sync failed: %s", e, exc_info=True)
+                else:
+                    logger.info("[SCHEDULER] VeraCore inventory sync for %s already claimed by another worker, skipping", current_day_key)
+                last_inventory_day = current_day_key
 
             # DISABLED — shipment poll not in Phase 3 SOW / $1,500 scope. Re-enable when scoped.
             # if (veracore_enabled()
@@ -1022,15 +1045,15 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
 
     logger.info(f"[DECISION ENGINE] History: {len(received_kit_skus)} kits received, {len(received_item_ids)} items received")
 
-    # Build blocked items list (received items + their alternatives)
+    # Build blocked items list (received items + their alternatives).
+    # Single bulk fetch instead of 2 queries per item to avoid N+1 under webhook load.
     blocked_item_ids = set(received_item_ids)
     if received_item_ids:
-        for item_id in list(received_item_ids):
-            alts = db.table("item_alternatives").select("alternative_item_id").eq("item_id", item_id).execute()
-            for alt in (alts.data or []):
+        all_alts = db.table("item_alternatives").select("item_id, alternative_item_id").execute()
+        for alt in (all_alts.data or []):
+            if alt["item_id"] in received_item_ids:
                 blocked_item_ids.add(alt["alternative_item_id"])
-            alts_rev = db.table("item_alternatives").select("item_id").eq("alternative_item_id", item_id).execute()
-            for alt in (alts_rev.data or []):
+            if alt["alternative_item_id"] in received_item_ids:
                 blocked_item_ids.add(alt["item_id"])
 
     if blocked_item_ids:
