@@ -6219,7 +6219,7 @@ async def manual_override_kit(
                 status_code=303,
             )
 
-        cust = db.table("customers").select("email, trimester").eq("id", customer_id).single().execute()
+        cust = db.table("customers").select("email, trimester, platform").eq("id", customer_id).single().execute()
         if not cust.data:
             return RedirectResponse(f"/customers?msg={quote('Customer not found')}&msg_type=error", status_code=303)
 
@@ -6234,7 +6234,7 @@ async def manual_override_kit(
             "reason": override_reason,
             "status": "pending",
             "order_id": None,
-            "platform": None,
+            "platform": cust.data.get("platform"),
             "trimester": cust.data.get("trimester"),
             "ship_date": date.today().isoformat(),
         }
