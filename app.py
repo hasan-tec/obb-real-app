@@ -3807,6 +3807,7 @@ def _run_curation_report_job(job_id: str, params: dict):
         ship_date = date(year, month_num, ship_day)
 
         # Create curation_run record (status=running)
+        # job_id persisted so status endpoint can fall back to DB if dyno restarts
         run_insert = db.table("curation_runs").insert({
             "report_month": report_month,
             "ship_date": str(ship_date),
@@ -3814,6 +3815,7 @@ def _run_curation_report_job(job_id: str, params: dict):
             "include_paused": paused,
             "lookback_months": lookback_months,
             "status": "running",
+            "job_id": job_id,
         }).execute()
         run_id = run_insert.data[0]["id"]
         logger.info(f"[CURATION JOB] {job_id} — Created curation_run {run_id}")
@@ -3861,6 +3863,28 @@ async def curation_report_job_page(request: Request, job_id: str):
     """Loading/result page for a curation report background job."""
     job = _get_job(job_id)
     if not job:
+        # Dyno may have restarted — check DB before showing error
+        try:
+            db = get_supabase()
+            run = db.table("curation_runs").select("id, status, error_message").eq("job_id", job_id).limit(1).execute()
+            if run.data:
+                r = run.data[0]
+                if r.get("status") == "completed":
+                    return RedirectResponse(f"/curation-report/{r['id']}?msg=Report+generated+successfully", status_code=303)
+                elif r.get("status") == "error":
+                    return templates.TemplateResponse("job_loading.html", {
+                        "request": request, "job_id": job_id, "job_type": "Curation Report",
+                        "status": "error", "error": r.get("error_message") or "Report failed",
+                        "cancel_url": "/curation-report", "page": "curation-report",
+                    })
+                else:
+                    # Still running on DB — show loading page
+                    return templates.TemplateResponse("job_loading.html", {
+                        "request": request, "job_id": job_id, "job_type": "Curation Report",
+                        "status": "running", "cancel_url": "/curation-report", "page": "curation-report",
+                    })
+        except Exception:
+            pass
         return RedirectResponse("/curation-report?msg=Job+not+found&msg_type=error", status_code=303)
 
     if job["status"] == "done":
@@ -3893,15 +3917,31 @@ async def curation_report_job_page(request: Request, job_id: str):
 
 @app.get("/curation-report/job/{job_id}/status")
 async def curation_report_job_status(job_id: str):
-    """JSON status endpoint for polling. Used by the loading page."""
+    """JSON status endpoint for polling. Used by the loading page.
+    Falls back to DB if the dyno restarted and _jobs was wiped."""
     job = _get_job(job_id)
-    if not job:
-        return JSONResponse({"status": "not_found"}, status_code=404)
-    return JSONResponse({
-        "status": job["status"],
-        "error": job["error"],
-        "redirect_url": f"/curation-report/{job['result']['run_id']}" if job["status"] == "done" else None,
-    })
+    if job:
+        return JSONResponse({
+            "status": job["status"],
+            "error": job["error"],
+            "redirect_url": f"/curation-report/{job['result']['run_id']}" if job["status"] == "done" else None,
+        })
+    # _jobs wiped (dyno restart / redeploy) — check DB
+    try:
+        db = get_supabase()
+        run = db.table("curation_runs").select("id, status, error_message").eq("job_id", job_id).limit(1).execute()
+        if run.data:
+            r = run.data[0]
+            db_status = r.get("status", "")
+            if db_status == "completed":
+                return JSONResponse({"status": "done", "error": None, "redirect_url": f"/curation-report/{r['id']}"})
+            elif db_status == "error":
+                return JSONResponse({"status": "error", "error": r.get("error_message") or "Report failed", "redirect_url": None})
+            else:
+                return JSONResponse({"status": "running", "error": None, "redirect_url": None})
+    except Exception as e:
+        logger.warning(f"[CURATION STATUS] DB fallback failed: {e}")
+    return JSONResponse({"status": "not_found"}, status_code=404)
 
 
 
