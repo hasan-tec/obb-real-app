@@ -454,6 +454,10 @@ def run_offer_sync(db, vc_client) -> dict:
         if not norm or norm in existing:
             result["skipped_existing"] += 1
             continue
+        if o.get("inactive"):
+            logger.info("[OFFER SYNC] Skipping inactive offer %s", raw_id)
+            result["skipped_existing"] += 1
+            continue
         try:
             attrs = parse_kit_attrs_from_sku(raw_id)
             db.table("kits").insert({
