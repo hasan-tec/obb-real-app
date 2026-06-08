@@ -6414,8 +6414,9 @@ async def edit_kit(
             "age_rank": age_rank,
             "age_rank_source": age_rank_source,
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
-            "veracore_sku": veracore_sku.strip() or None,
         }
+        if veracore_sku.strip():
+            record["veracore_sku"] = veracore_sku.strip()
         db.table("kits").update(record).eq("id", kit_id).execute()
         logger.info(f"[KIT EDIT] Updated kit {sku_clean}: T{trimester}, qty={quantity_available}, welcome={welcome}, universal={universal}, age_rank={age_rank}, source={age_rank_source}")
         await log_activity("kit", f"Edited kit {sku_clean}", f"T{trimester}, Qty: {quantity_available}, Age Rank: {age_rank} ({age_rank_source})", "success")
@@ -6455,8 +6456,9 @@ async def edit_item(
             "unit_cost": unit_cost if unit_cost > 0 else None,
             "is_therabox": therabox,
             "expiry_date": expiry_date.strip() if expiry_date and expiry_date.strip() else None,
-            "veracore_sku": veracore_sku.strip() or None,
         }
+        if veracore_sku.strip():
+            record["veracore_sku"] = veracore_sku.strip()
         db.table("items").update(record).eq("id", item_id).execute()
         logger.info(f"[ITEM EDIT] Updated item {item_id}: name='{name_clean}', sku={sku_clean}, therabox={therabox}, expiry={expiry_date}")
         await log_activity("item", f"Edited item '{name_clean}'", f"SKU: {sku_clean}, TheraBox: {therabox}", "success")

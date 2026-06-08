@@ -700,7 +700,7 @@ class VeraCoreClient:
     def get_canceled_orders(self, since_iso: str, until_iso: Optional[str] = None) -> list[dict]:
         """GET /api/GetCanceledOrders?startDate=...&endDate=... — orders cancelled in VeraCore.
         Both startDate AND endDate are required by the API (HTTP 400 otherwise)."""
-        from datetime import datetime, timedelta
+        from datetime import timedelta
         end = until_iso or (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
         raw = self._request("GET", "/api/GetCanceledOrders",
                             params={"startDate": since_iso, "endDate": end})

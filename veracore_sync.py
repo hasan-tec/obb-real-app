@@ -415,6 +415,11 @@ def run_cancellation_sync(db, vc_client, since_iso: Optional[str] = None) -> dic
             except Exception as e:
                 logger.warning("[VERACORE CANCEL] update failed for decision %s: %s", d["id"], e)
 
+    log_sync(db, "cancellation", None,
+             {"since": since_iso},
+             {"matched": result["matched"], "cancelled": result["cancelled"],
+              "shipments_removed": result["shipments_removed"], "unmatched": result["unmatched"]},
+             "ok" if not result["error"] else "fail", result.get("error"))
     logger.info("[VERACORE CANCEL] ═══ done matched=%d cancelled=%d removed=%d unmatched=%d ═══",
                 result["matched"], result["cancelled"], result["shipments_removed"], result["unmatched"])
     return result
@@ -471,6 +476,11 @@ def run_offer_sync(db, vc_client) -> dict:
         except Exception as e:
             logger.warning("[OFFER SYNC] insert failed for offer_id=%s: %s", raw_id, e)
 
+    log_sync(db, "offer_sync", None,
+             {"offers_checked": len(offers)},
+             {"created": result["created"], "skipped_existing": result["skipped_existing"],
+              "needs_review": result["needs_review"]},
+             "ok" if not result["error"] else "fail", result.get("error"))
     logger.info("[OFFER SYNC] ═══ done created=%d skipped=%d review=%d ═══",
                 result["created"], result["skipped_existing"], result["needs_review"])
     return result
