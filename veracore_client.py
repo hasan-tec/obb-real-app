@@ -629,6 +629,7 @@ class VeraCoreClient:
             order_id, ship_to, line_items, shipping_method, comments
         )
         response_text = self._soap_request(xml_body, _SOAP_ACTION_ADD_ORDER)
+        logger.debug("[VERACORE] add_order raw SOAP response: %s", response_text[:1000])
 
         # Parse SOAP response XML.
         try:
@@ -646,16 +647,19 @@ class VeraCoreClient:
             raise VeraCoreError(f"SOAP fault from VeraCore: {fault_msg}")
 
         # Extract OrderSeqID (their internal PK) and OrderID (our echoed ID).
+        # f-prefix required on all searches so _SOAP_NS is interpolated (not literal text).
         seq_elem = (
             root.find(f"{{{_SOAP_NS}}}OrderSeqID")
-            or root.find(".//{{{_SOAP_NS}}}OrderSeqID")
+            or root.find(f".//{{{_SOAP_NS}}}OrderSeqID")
             or root.find(".//OrderSeqID")
         )
         oid_elem = (
             root.find(f"{{{_SOAP_NS}}}OrderID")
-            or root.find(".//{{{_SOAP_NS}}}OrderID")
+            or root.find(f".//{{{_SOAP_NS}}}OrderID")
             or root.find(".//OrderID")
         )
+        if seq_elem is None:
+            logger.warning("[VERACORE] OrderSeqID not found in SOAP response — raw: %s", response_text[:500])
 
         seq_id = int(seq_elem.text) if seq_elem is not None and seq_elem.text else None
         returned_id = oid_elem.text if oid_elem is not None and oid_elem.text else order_id

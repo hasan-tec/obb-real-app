@@ -5531,10 +5531,18 @@ def submit_to_veracore(decision_id: str) -> dict:
     kit      = d.get("kits") or {}
     customer = d.get("customers") or {}
     if not kit:
-        logger.warning("[VERACORE SUBMIT] %s has no kit — cannot submit", decision_id)
+        logger.warning("[VERACORE SUBMIT] %s has no kit — marking skipped", decision_id)
+        try:
+            db.table("decisions").update({"veracore_status": "skipped"}).eq("id", decision_id).execute()
+        except Exception as _e:
+            logger.warning("[VERACORE SUBMIT] Could not mark skipped in DB: %s", _e)
         return {"status": "skipped", "order_id": None, "error": "no kit"}
     if not customer:
-        logger.warning("[VERACORE SUBMIT] %s has no customer — cannot submit", decision_id)
+        logger.warning("[VERACORE SUBMIT] %s has no customer — marking skipped", decision_id)
+        try:
+            db.table("decisions").update({"veracore_status": "skipped"}).eq("id", decision_id).execute()
+        except Exception as _e:
+            logger.warning("[VERACORE SUBMIT] Could not mark skipped in DB: %s", _e)
         return {"status": "skipped", "order_id": None, "error": "no customer"}
 
     vc = get_veracore_client()
@@ -5815,27 +5823,23 @@ async def veracore_ops_page(request: Request):
         msg      = request.query_params.get("msg", "")
         msg_type = request.query_params.get("msg_type", "success")
 
-        # Counts for the status tiles.
+        # Counts for the status tiles — server-side COUNT queries (no 1000-row limit).
         approved_count      = 0
         pending_push_count  = 0
         submitted_count     = 0
         failed_count        = 0
         shipped_count       = 0
         try:
-            status_rows = db.table("decisions").select("status, veracore_status").execute().data or []
-            for r in status_rows:
-                s  = r.get("status")
-                vs = r.get("veracore_status")
-                if s == "approved" and not vs:
-                    pending_push_count += 1
-                if vs == "submitted":
-                    submitted_count += 1
-                elif vs == "failed":
-                    failed_count += 1
-                elif vs == "shipped":
-                    shipped_count += 1
-                if s == "approved":
-                    approved_count += 1
+            approved_count     = (db.table("decisions").select("id", count="exact")
+                                    .eq("status", "approved").execute().count or 0)
+            pending_push_count = (db.table("decisions").select("id", count="exact")
+                                    .eq("status", "approved").is_("veracore_status", "null").execute().count or 0)
+            submitted_count    = (db.table("decisions").select("id", count="exact")
+                                    .eq("veracore_status", "submitted").execute().count or 0)
+            failed_count       = (db.table("decisions").select("id", count="exact")
+                                    .eq("veracore_status", "failed").execute().count or 0)
+            shipped_count      = (db.table("decisions").select("id", count="exact")
+                                    .eq("veracore_status", "shipped").execute().count or 0)
         except Exception as e:
             logger.warning("[VC OPS] counts failed: %s", e)
 
