@@ -579,7 +579,7 @@ class VeraCoreClient:
                 "id":       o.get("Id")    or o.get("id")    or "",
                 "title":    o.get("Title") or o.get("title") or "",
                 "bom_type": o.get("BillOfMaterialsType") or o.get("billOfMaterialsType") or "",
-                "inactive": (o.get("Status") or o.get("status") or {}).get("Inactive") is not None,
+                "inactive": (o.get("Status") or o.get("status") or {}).get("Inactive", {}).get("Indicator", 0) == 1,
             }
             for o in offers if isinstance(o, dict)
         ]

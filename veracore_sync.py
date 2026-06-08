@@ -43,7 +43,7 @@ LOW_STOCK_THRESHOLD = 15
 
 def normalize_sku(raw: str) -> str:
     """Normalize an OBB or VeraCore SKU for matching.
-    'OBB-WK-C3 Kits' and 'WKC3' both → 'WKC3'."""
+    'OBB-WK-C3 Kits', 'OBB-P-11-KITS', and 'WKC3' all → correct short form."""
     if not raw:
         return ""
     s = raw.strip().upper()
@@ -51,8 +51,10 @@ def normalize_sku(raw: str) -> str:
     elif s.startswith("RW"):  s = s[2:]
     if s.startswith("OBB-"):  s = s[4:]
     if s.endswith(" KITS"):   s = s[:-5]
+    elif s.endswith("-KITS"): s = s[:-5]
     elif s.endswith(" KIT"):  s = s[:-4]
-    return s.replace("-", "").replace(" ", "")
+    elif s.endswith("-KIT"):  s = s[:-4]
+    return s.replace("-", "").replace(" ", "").replace("/", "")
 
 
 def log_sync(db, sync_type: str, decision_id: Optional[str],
@@ -448,6 +450,7 @@ def run_offer_sync(db, vc_client) -> dict:
         result["error"] = err
         return result
 
+    _KIT_SUFFIXES = (" KITS", "-KITS", " KIT", "-KIT")
     for o in offers:
         raw_id = o.get("id") or ""
         norm = normalize_sku(raw_id)
@@ -456,6 +459,10 @@ def run_offer_sync(db, vc_client) -> dict:
             continue
         if o.get("inactive"):
             logger.info("[OFFER SYNC] Skipping inactive offer %s", raw_id)
+            result["skipped_existing"] += 1
+            continue
+        if not raw_id.upper().rstrip().endswith(_KIT_SUFFIXES):
+            logger.debug("[OFFER SYNC] Skipping non-kit offer %s", raw_id)
             result["skipped_existing"] += 1
             continue
         try:
