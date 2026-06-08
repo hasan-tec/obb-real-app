@@ -571,13 +571,15 @@ class VeraCoreClient:
         if offer_ids:
             params["offerIds"] = ",".join(offer_ids)
         raw = self._request("GET", "/api/Offers", params=params or None)
-        offers = raw.get("offers", []) if isinstance(raw, dict) else []
+        # API returns PascalCase "Offers" key (confirmed live 2026-06-08)
+        offers = (raw.get("Offers") or raw.get("offers") or []) if isinstance(raw, dict) else []
         logger.info("[VERACORE] get_offers returned %d offers", len(offers))
         return [
             {
-                "id": o.get("id", ""),
-                "title": o.get("title", ""),
-                "inactive": (o.get("status") or {}).get("inactive") is not None,
+                "id":       o.get("Id")    or o.get("id")    or "",
+                "title":    o.get("Title") or o.get("title") or "",
+                "bom_type": o.get("BillOfMaterialsType") or o.get("billOfMaterialsType") or "",
+                "inactive": (o.get("Status") or o.get("status") or {}).get("Inactive") is not None,
             }
             for o in offers if isinstance(o, dict)
         ]
@@ -694,6 +696,31 @@ class VeraCoreClient:
             })
         logger.info("[VERACORE] get_shipments since=%s → %d rows", since_iso, len(normalized))
         return normalized
+
+    def get_canceled_orders(self, since_iso: str, until_iso: Optional[str] = None) -> list[dict]:
+        """GET /api/GetCanceledOrders?startDate=...&endDate=... — orders cancelled in VeraCore.
+        Both startDate AND endDate are required by the API (HTTP 400 otherwise)."""
+        from datetime import datetime, timedelta
+        end = until_iso or (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        raw = self._request("GET", "/api/GetCanceledOrders",
+                            params={"startDate": since_iso, "endDate": end})
+        rows = []
+        if isinstance(raw, dict):
+            rows = raw.get("CanceledOrders") or raw.get("canceledOrders") or []
+        out = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            out.append({
+                "order_id":    (r.get("OrderID")    or r.get("orderID")    or r.get("orderId")    or ""),
+                "status":      (r.get("CurrentOrderStatus") or r.get("currentOrderStatus") or ""),
+                "canceled_at": (
+                    (r.get("OrderDates") or r.get("orderDates") or {}).get("UTCOrderDate") or
+                    (r.get("OrderDates") or r.get("orderDates") or {}).get("utcOrderDate") or ""
+                ),
+            })
+        logger.info("[VERACORE] GetCanceledOrders since=%s → %d rows", since_iso, len(out))
+        return out
 
     def close(self):
         """Close the underlying HTTP client.  Safe to call multiple times."""

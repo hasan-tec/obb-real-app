@@ -491,6 +491,8 @@ def _monthly_report_scheduler():
     last_cj_sweep_month = None  # Cratejoy monthly decision sweep guard
     last_inventory_day = None  # Phase 3 — daily VeraCore inventory sync guard
     last_shipment_poll_day = None  # Phase 3 — daily VeraCore shipment poll guard
+    last_cancel_day = None   # Phase 3 — daily VeraCore cancellation sync guard
+    last_offer_day = None    # Phase 3 — daily VeraCore offer auto-sync guard
     while True:
         try:
             now = datetime.utcnow()
@@ -589,6 +591,45 @@ def _monthly_report_scheduler():
             #         last_shipment_poll_day = current_day_key
             #     except Exception as e:
             #         logger.error("[SCHEDULER] VeraCore shipment poll failed: %s", e, exc_info=True)
+
+            # Phase 3 — Daily VeraCore cancellation sync at 06:00 UTC.
+            if (veracore_enabled()
+                    and now.hour == 6
+                    and last_cancel_day != current_day_key):
+                if _schedule_lock(f"vc_cancel_{current_day_key}"):
+                    logger.info("[SCHEDULER] VeraCore cancellation sync triggered for %s", current_day_key)
+                    try:
+                        db = get_supabase()
+                        vc = get_veracore_client()
+                        if vc is not None:
+                            from veracore_sync import run_cancellation_sync
+                            cancel_result = run_cancellation_sync(db, vc)
+                            logger.info("[SCHEDULER] Cancellation sync result: %s", cancel_result)
+                    except Exception as e:
+                        logger.error("[SCHEDULER] VeraCore cancellation sync failed: %s", e, exc_info=True)
+                else:
+                    logger.info("[SCHEDULER] VC cancellation sync for %s already claimed by another worker, skipping", current_day_key)
+                last_cancel_day = current_day_key
+
+            # Phase 3 — Daily VeraCore offer auto-sync at 07:00 UTC.
+            if (veracore_enabled()
+                    and now.hour == 7
+                    and last_offer_day != current_day_key):
+                if _schedule_lock(f"vc_offer_{current_day_key}"):
+                    logger.info("[SCHEDULER] VeraCore offer sync triggered for %s", current_day_key)
+                    try:
+                        db = get_supabase()
+                        vc = get_veracore_client()
+                        if vc is not None:
+                            from veracore_sync import run_offer_sync
+                            offer_result = run_offer_sync(db, vc)
+                            logger.info("[SCHEDULER] Offer sync result: %s", offer_result)
+                    except Exception as e:
+                        logger.error("[SCHEDULER] VeraCore offer sync failed: %s", e, exc_info=True)
+                else:
+                    logger.info("[SCHEDULER] VC offer sync for %s already claimed by another worker, skipping", current_day_key)
+                last_offer_day = current_day_key
+
         except Exception as e:
             logger.error(f"[SCHEDULER] Scheduler loop error: {e}", exc_info=True)
         _time.sleep(3600)  # Check every hour
@@ -867,6 +908,28 @@ def compute_age_rank_from_sku(sku: str) -> int:
     return 0
 
 
+def parse_kit_attrs_from_sku(sku: str) -> dict:
+    """Derive kit attributes from OBB SKU formula.
+    Returns: {is_welcome_kit, trimester, size_variant, age_rank, needs_review}.
+    needs_review=True when trimester can't be parsed — flags for human review."""
+    from veracore_sync import normalize_sku
+    clean = normalize_sku(sku)                      # 'OBB-CK-21 Kits' → 'CK21'
+    prefix = "".join(ch for ch in clean if ch.isalpha())
+    digits = "".join(ch for ch in clean[len(prefix):] if ch.isdigit())
+    age_rank = compute_age_rank_from_sku(sku)
+    is_welcome = prefix.startswith("WK")
+    trimester = int(digits[0]) if len(digits) >= 1 and digits[0] in "1234" else None
+    size_variant = int(digits[1]) if len(digits) >= 2 and digits[1] in "1234" else 1
+    needs_review = trimester is None                # can't parse → flag for human
+    return {
+        "is_welcome_kit": is_welcome,
+        "trimester":      trimester or 1,
+        "size_variant":   size_variant,
+        "age_rank":       age_rank,
+        "needs_review":   needs_review,
+    }
+
+
 def parse_history_item_refs(raw_value: str) -> list[str]:
     """Split comma/newline separated item refs for manual shipment history entry."""
     if not raw_value:
@@ -1042,6 +1105,7 @@ def get_eligible_override_kits(db, cust: dict, enriched_shipments: list, exclude
         db.table("kits").select("*")
         .eq("trimester", trimester)
         .eq("is_welcome_kit", is_new)
+        .eq("needs_review", False)
         .gt("quantity_available", 0)
         .order("age_rank")
         .execute()
@@ -1167,9 +1231,9 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
     logger.info(f"[DECISION ENGINE] Customer is {'NEW (→ welcome kits)' if is_new else 'RENEWAL (→ regular kits)'}")
 
     if is_new:
-        kits_result = db.table("kits").select("*").eq("trimester", trimester).eq("is_welcome_kit", True).gt("quantity_available", 0).order("age_rank").execute()
+        kits_result = db.table("kits").select("*").eq("trimester", trimester).eq("is_welcome_kit", True).eq("needs_review", False).gt("quantity_available", 0).order("age_rank").execute()
     else:
-        kits_result = db.table("kits").select("*").eq("trimester", trimester).eq("is_welcome_kit", False).gt("quantity_available", 0).order("age_rank").execute()
+        kits_result = db.table("kits").select("*").eq("trimester", trimester).eq("is_welcome_kit", False).eq("needs_review", False).gt("quantity_available", 0).order("age_rank").execute()
 
     available_kits = kits_result.data or []
     logger.info(f"[DECISION ENGINE] Found {len(available_kits)} {'welcome' if is_new else 'regular'} kits for T{trimester} with stock > 0")
@@ -3542,6 +3606,7 @@ async def add_kit(
     quantity_available: int = Form(0),
     age_rank: int = Form(0),
     cost_per_kit: float = Form(0),
+    veracore_sku: str = Form(""),
 ):
     """Add a new kit with optional item selection."""
     try:
@@ -3565,6 +3630,7 @@ async def add_kit(
             "age_rank": age_rank,
             "age_rank_source": "auto",
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
+            "veracore_sku": veracore_sku.strip() or None,
         }).execute()
         kit_id = kit_result.data[0]["id"] if kit_result.data else None
         logger.info(f"[KITS] ✅ Added kit: {sku_clean}, id={kit_id}")
@@ -3636,6 +3702,7 @@ async def add_item(
     unit_cost: float = Form(0),
     is_therabox: str = Form(""),
     expiry_date: str = Form(""),
+    veracore_sku: str = Form(""),
 ):
     """Add a new item."""
     try:
@@ -3650,6 +3717,7 @@ async def add_item(
             "category": category.strip() or None,
             "unit_cost": unit_cost if unit_cost > 0 else None,
             "is_therabox": therabox,
+            "veracore_sku": veracore_sku.strip() or None,
         }
         if expiry_date and expiry_date.strip():
             item_data["expiry_date"] = expiry_date.strip()
@@ -5943,6 +6011,64 @@ async def veracore_sync_inventory_now(request: Request):
         return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
 
 
+@app.post("/veracore/sync-cancellations-now")
+async def veracore_sync_cancellations_now(request: Request):
+    """Manually trigger a VeraCore cancellation sync (off-schedule)."""
+    try:
+        if not veracore_enabled():
+            return RedirectResponse("/veracore?msg=VeraCore+not+configured+(env+vars+missing)&msg_type=error",
+                                    status_code=303)
+        db = get_supabase()
+        vc = get_veracore_client()
+        if vc is None:
+            return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
+                                    status_code=303)
+        from veracore_sync import run_cancellation_sync
+        r = await asyncio.get_running_loop().run_in_executor(None, run_cancellation_sync, db, vc)
+        await log_activity("veracore",
+                           f"Manual cancellation sync: cancelled={r['cancelled']} removed={r['shipments_removed']} unmatched={r['unmatched']}",
+                           (r.get("error") or "")[:200],
+                           "error" if r.get("error") else "success")
+        if r.get("error"):
+            return RedirectResponse(f"/veracore?msg=Cancellation+sync+failed:+{r['error'][:100]}&msg_type=error",
+                                    status_code=303)
+        return RedirectResponse(
+            f"/veracore?msg=Cancellation+sync:+{r['cancelled']}+cancelled,+{r['shipments_removed']}+shipments+removed&msg_type=success",
+            status_code=303)
+    except Exception as e:
+        logger.error("[VC CANCEL NOW] %s", e, exc_info=True)
+        return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
+
+
+@app.post("/veracore/sync-offers-now")
+async def veracore_sync_offers_now(request: Request):
+    """Manually trigger a VeraCore offer auto-sync (off-schedule)."""
+    try:
+        if not veracore_enabled():
+            return RedirectResponse("/veracore?msg=VeraCore+not+configured+(env+vars+missing)&msg_type=error",
+                                    status_code=303)
+        db = get_supabase()
+        vc = get_veracore_client()
+        if vc is None:
+            return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
+                                    status_code=303)
+        from veracore_sync import run_offer_sync
+        r = await asyncio.get_running_loop().run_in_executor(None, run_offer_sync, db, vc)
+        await log_activity("veracore",
+                           f"Manual offer sync: created={r['created']} skipped={r['skipped_existing']} needs_review={r['needs_review']}",
+                           (r.get("error") or "")[:200],
+                           "error" if r.get("error") else "success")
+        if r.get("error"):
+            return RedirectResponse(f"/veracore?msg=Offer+sync+failed:+{r['error'][:100]}&msg_type=error",
+                                    status_code=303)
+        return RedirectResponse(
+            f"/veracore?msg=Offer+sync:+{r['created']}+kits+created,+{r['needs_review']}+need+review&msg_type=success",
+            status_code=303)
+    except Exception as e:
+        logger.error("[VC OFFER NOW] %s", e, exc_info=True)
+        return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
+
+
 @app.post("/veracore/save-settings")
 async def veracore_save_settings(request: Request):
     """Save VeraCore order settings (freight service code) from the ops page."""
@@ -6232,6 +6358,7 @@ async def edit_kit(
     quantity_available: int = Form(0),
     age_rank: int = Form(0),
     cost_per_kit: float = Form(0),
+    veracore_sku: str = Form(""),
 ):
     """Edit an existing kit's details, including SKU."""
     try:
@@ -6287,6 +6414,7 @@ async def edit_kit(
             "age_rank": age_rank,
             "age_rank_source": age_rank_source,
             "cost_per_kit": cost_per_kit if cost_per_kit > 0 else None,
+            "veracore_sku": veracore_sku.strip() or None,
         }
         db.table("kits").update(record).eq("id", kit_id).execute()
         logger.info(f"[KIT EDIT] Updated kit {sku_clean}: T{trimester}, qty={quantity_available}, welcome={welcome}, universal={universal}, age_rank={age_rank}, source={age_rank_source}")
@@ -6310,6 +6438,7 @@ async def edit_item(
     unit_cost: float = Form(0),
     is_therabox: str = Form(""),
     expiry_date: str = Form(""),
+    veracore_sku: str = Form(""),
 ):
     """Edit an existing item's details."""
     try:
@@ -6326,6 +6455,7 @@ async def edit_item(
             "unit_cost": unit_cost if unit_cost > 0 else None,
             "is_therabox": therabox,
             "expiry_date": expiry_date.strip() if expiry_date and expiry_date.strip() else None,
+            "veracore_sku": veracore_sku.strip() or None,
         }
         db.table("items").update(record).eq("id", item_id).execute()
         logger.info(f"[ITEM EDIT] Updated item {item_id}: name='{name_clean}', sku={sku_clean}, therabox={therabox}, expiry={expiry_date}")

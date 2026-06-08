@@ -41,6 +41,20 @@ logger = logging.getLogger(__name__)
 LOW_STOCK_THRESHOLD = 15
 
 
+def normalize_sku(raw: str) -> str:
+    """Normalize an OBB or VeraCore SKU for matching.
+    'OBB-WK-C3 Kits' and 'WKC3' both → 'WKC3'."""
+    if not raw:
+        return ""
+    s = raw.strip().upper()
+    if s.startswith("RW-"):   s = s[3:]
+    elif s.startswith("RW"):  s = s[2:]
+    if s.startswith("OBB-"):  s = s[4:]
+    if s.endswith(" KITS"):   s = s[:-5]
+    elif s.endswith(" KIT"):  s = s[:-4]
+    return s.replace("-", "").replace(" ", "")
+
+
 def log_sync(db, sync_type: str, decision_id: Optional[str],
              request: Optional[dict], response: Optional[dict],
              status: str, error: Optional[str] = None) -> None:
@@ -72,7 +86,7 @@ def run_inventory_sync(db, vc_client) -> dict:
 
     Returns: {synced: int, skipped: int, alerts_raised: int, error: str|None}
     """
-    result = {"synced": 0, "skipped": 0, "alerts_raised": 0, "error": None}
+    result = {"synced": 0, "skipped": 0, "unmatched": 0, "alerts_raised": 0, "error": None}
     started_at = datetime.utcnow()
     logger.info("[VERACORE SYNC] ═══ Inventory sync started at %s UTC ═══", started_at.isoformat())
 
@@ -87,9 +101,9 @@ def run_inventory_sync(db, vc_client) -> dict:
         result["error"] = err
         return result
 
-    # Build O(1) lookup dicts keyed by upper-cased SKU.
-    kits_by_vc_sku  = {k["veracore_sku"].upper(): k for k in all_kits if k.get("veracore_sku")}
-    kits_by_sku     = {k["sku"].upper(): k for k in all_kits if k.get("sku")}
+    # Build O(1) lookup dict keyed by normalized SKU — handles OBB-WK-C3 Kits ↔ WKC3 drift.
+    kits_by_norm    = {normalize_sku(k.get("veracore_sku") or k.get("sku") or ""): k
+                       for k in all_kits if (k.get("veracore_sku") or k.get("sku"))}
     alerted_kit_ids = {r["kit_id"] for r in alerts_data}
 
     # 2. Pull VeraCore inventory (1 API call).
@@ -109,11 +123,11 @@ def run_inventory_sync(db, vc_client) -> dict:
             result["skipped"] += 1
             continue
 
-        sku_upper = sku.upper()
-        kit = kits_by_vc_sku.get(sku_upper) or kits_by_sku.get(sku_upper)
+        kit = kits_by_norm.get(normalize_sku(sku))
         if not kit:
-            logger.debug("[VERACORE SYNC] No matching kit for VeraCore SKU '%s' — skipping", sku)
-            result["skipped"] += 1
+            logger.warning("[VERACORE SYNC] No matching kit for VeraCore SKU '%s' (norm='%s') — skipping",
+                           sku, normalize_sku(sku))
+            result["unmatched"] += 1
             continue
 
         new_qty = max(0, int(row.get("available_balance", 0)))
@@ -149,10 +163,10 @@ def run_inventory_sync(db, vc_client) -> dict:
     log_sync(db, "inventory", None,
              {"pulled_rows": len(rows)},
              {"synced": result["synced"], "skipped": result["skipped"],
-              "alerts_raised": result["alerts_raised"]},
+              "unmatched": result["unmatched"], "alerts_raised": result["alerts_raised"]},
              "ok")
-    logger.info("[VERACORE SYNC] ═══ Inventory sync done: synced=%d skipped=%d alerts=%d ═══",
-                result["synced"], result["skipped"], result["alerts_raised"])
+    logger.info("[VERACORE SYNC] ═══ Inventory sync done: synced=%d skipped=%d unmatched=%d alerts=%d ═══",
+                result["synced"], result["skipped"], result["unmatched"], result["alerts_raised"])
     return result
 
 
@@ -259,8 +273,8 @@ def run_expiry_sync(db, vc_client) -> dict:
         result["error"] = err
         return result
 
-    items_by_vc_sku = {it["veracore_sku"].upper(): it for it in all_items if it.get("veracore_sku")}
-    items_by_sku    = {it["sku"].upper(): it for it in all_items if it.get("sku")}
+    items_by_norm = {normalize_sku(it.get("veracore_sku") or it.get("sku") or ""): it
+                     for it in all_items if (it.get("veracore_sku") or it.get("sku"))}
 
     # 2. Pull VeraCore inventory (1 API call).
     try:
@@ -299,11 +313,12 @@ def run_expiry_sync(db, vc_client) -> dict:
             year = int(m.group(4))
         expiry_date = f"{year:04d}-{month:02d}-01"
 
-        sku_upper = _EXP_RE.sub("", sku).strip().upper()
-        item = items_by_vc_sku.get(sku_upper) or items_by_sku.get(sku_upper)
+        norm_sku = normalize_sku(_EXP_RE.sub("", sku).strip())
+        item = items_by_norm.get(norm_sku)
 
         if not item:
-            logger.debug("[EXPIRY SYNC] No matching item for VeraCore Id '%s' — skipping", sku)
+            logger.warning("[EXPIRY SYNC] No matching item for VeraCore Id '%s' (norm='%s') — skipping",
+                           sku, norm_sku)
             result["skipped_no_match"] += 1
             continue
 
@@ -327,4 +342,135 @@ def run_expiry_sync(db, vc_client) -> dict:
              "ok")
     logger.info("[EXPIRY SYNC] ═══ Done: updated=%d no_match=%d no_expiry=%d ═══",
                 result["updated"], result["skipped_no_match"], result["skipped_no_expiry"])
+    return result
+
+
+def run_cancellation_sync(db, vc_client, since_iso: Optional[str] = None) -> dict:
+    """Detect VeraCore-cancelled orders → mark OBB decision 'cancelled' +
+    delete the matching shipment & shipment_items so duplicate-detection stays clean."""
+    from datetime import timedelta
+    result = {"matched": 0, "cancelled": 0, "shipments_removed": 0, "unmatched": 0, "error": None}
+    if since_iso is None:
+        since_iso = (datetime.utcnow() - timedelta(days=2)).isoformat()
+    logger.info("[VERACORE CANCEL] ═══ Cancellation sync started since=%s ═══", since_iso)
+
+    try:
+        canceled = vc_client.get_canceled_orders(since_iso)
+    except Exception as e:
+        err = f"get_canceled_orders failed: {e}"
+        logger.error("[VERACORE CANCEL] %s", err, exc_info=True)
+        log_sync(db, "cancellation", None, {"since": since_iso}, None, "fail", err)
+        result["error"] = err
+        return result
+
+    for c in canceled:
+        order_ref = c.get("order_id") or ""
+        if not order_ref:
+            result["unmatched"] += 1
+            continue
+
+        # 3-way match: first by public order_id, then by veracore_order_id (same pattern as run_shipment_poll).
+        try:
+            rows = (db.table("decisions")
+                    .select("id, customer_id, status, order_id, veracore_order_id")
+                    .eq("order_id", order_ref).execute().data or [])
+            if not rows:
+                rows = (db.table("decisions")
+                        .select("id, customer_id, status, order_id, veracore_order_id")
+                        .eq("veracore_order_id", order_ref).execute().data or [])
+        except Exception as e:
+            logger.warning("[VERACORE CANCEL] DB lookup failed for order_ref=%s: %s", order_ref, e)
+            result["unmatched"] += 1
+            continue
+
+        if not rows:
+            logger.debug("[VERACORE CANCEL] No decision match for order_ref=%s", order_ref)
+            result["unmatched"] += 1
+            continue
+
+        result["matched"] += len(rows)
+        for d in rows:
+            if d.get("status") == "cancelled":
+                continue  # idempotent — already done
+            try:
+                db.table("decisions").update({
+                    "status": "cancelled",
+                    "veracore_status": "cancelled",
+                }).eq("id", d["id"]).execute()
+                result["cancelled"] += 1
+
+                # Delete matching shipment(s) stamped with this decision's id prefix.
+                ships = (db.table("shipments").select("id")
+                         .eq("customer_id", d["customer_id"])
+                         .ilike("notes", f"%decision {d['id'][:8]}%").execute().data or [])
+                for s in ships:
+                    db.table("shipment_items").delete().eq("shipment_id", s["id"]).execute()
+                    db.table("shipments").delete().eq("id", s["id"]).execute()
+                    result["shipments_removed"] += 1
+
+                log_sync(db, "cancellation", d["id"], {"order_ref": order_ref},
+                         {"removed_shipments": len(ships)}, "ok")
+                logger.info("[VERACORE CANCEL] decision %s cancelled, %d shipment(s) removed",
+                            d["id"], len(ships))
+            except Exception as e:
+                logger.warning("[VERACORE CANCEL] update failed for decision %s: %s", d["id"], e)
+
+    logger.info("[VERACORE CANCEL] ═══ done matched=%d cancelled=%d removed=%d unmatched=%d ═══",
+                result["matched"], result["cancelled"], result["shipments_removed"], result["unmatched"])
+    return result
+
+
+def run_offer_sync(db, vc_client) -> dict:
+    """Detect VeraCore offers with no matching OBB kit → auto-create kit rows
+    with metadata parsed from the SKU. Stock filled from GetInventory."""
+    from app import parse_kit_attrs_from_sku  # local import avoids circular at module load
+    result = {"created": 0, "skipped_existing": 0, "needs_review": 0, "error": None}
+    logger.info("[OFFER SYNC] ═══ Offer sync started ═══")
+
+    try:
+        offers = vc_client.get_offers()
+        inv_rows = vc_client.get_inventory()
+        inv = {normalize_sku(r.get("sku") or ""): int(r.get("available_balance", 0))
+               for r in inv_rows if r.get("sku")}
+        existing = {
+            normalize_sku(k.get("veracore_sku") or k.get("sku") or "")
+            for k in (db.table("kits").select("sku, veracore_sku").execute().data or [])
+        }
+    except Exception as e:
+        err = f"offer/inventory fetch failed: {e}"
+        logger.error("[OFFER SYNC] %s", err, exc_info=True)
+        log_sync(db, "offer_sync", None, None, None, "fail", err)
+        result["error"] = err
+        return result
+
+    for o in offers:
+        raw_id = o.get("id") or ""
+        norm = normalize_sku(raw_id)
+        if not norm or norm in existing:
+            result["skipped_existing"] += 1
+            continue
+        try:
+            attrs = parse_kit_attrs_from_sku(raw_id)
+            db.table("kits").insert({
+                "sku":                norm,
+                "name":               o.get("title") or norm,
+                "veracore_sku":       raw_id,
+                "trimester":          attrs["trimester"],
+                "size_variant":       attrs["size_variant"],
+                "is_welcome_kit":     attrs["is_welcome_kit"],
+                "age_rank":           attrs["age_rank"],
+                "quantity_available": inv.get(norm, 0),
+                "needs_review":       attrs["needs_review"],
+            }).execute()
+            result["created"] += 1
+            if attrs["needs_review"]:
+                result["needs_review"] += 1
+            log_sync(db, "offer_sync", None, {"offer_id": raw_id}, attrs, "ok")
+            logger.info("[OFFER SYNC] created kit %s (T%s sz%s review=%s)",
+                        norm, attrs["trimester"], attrs["size_variant"], attrs["needs_review"])
+        except Exception as e:
+            logger.warning("[OFFER SYNC] insert failed for offer_id=%s: %s", raw_id, e)
+
+    logger.info("[OFFER SYNC] ═══ done created=%d skipped=%d review=%d ═══",
+                result["created"], result["skipped_existing"], result["needs_review"])
     return result
