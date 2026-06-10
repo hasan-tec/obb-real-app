@@ -6768,11 +6768,12 @@ async def export_decisions_csv(request: Request):
         db = get_supabase()
 
         # Re-apply same filter params as decisions page
-        f_trimester = request.query_params.get("trimester", "").strip()
-        f_status    = request.query_params.get("status", "approved").strip()  # default: approved only
-        f_type      = request.query_params.get("type", "").strip()
-        f_platform  = request.query_params.get("platform", "").strip()
-        f_month     = request.query_params.get("month", "").strip()
+        f_trimester  = request.query_params.get("trimester", "").strip()
+        f_status     = request.query_params.get("status", "approved").strip()  # default: approved only
+        f_type       = request.query_params.get("type", "").strip()
+        f_platform   = request.query_params.get("platform", "").strip()
+        f_order_type = request.query_params.get("order_type", "").strip()
+        f_month      = request.query_params.get("month", "").strip()
 
         def _build_export_q():
             qo = db.table("decisions").select("*, customers(*)")
@@ -6787,6 +6788,8 @@ async def export_decisions_csv(request: Request):
                 qo = qo.eq("decision_type", f_type)
             if f_platform:
                 qo = qo.eq("platform", f_platform)
+            if f_order_type:
+                qo = qo.eq("order_type", f_order_type)
             if f_month:
                 try:
                     y, m     = int(f_month[:4]), int(f_month[5:7])
