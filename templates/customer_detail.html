@@ -5,6 +5,7 @@
     <h1>Customer Detail</h1>
     <div class="status">
         <a href="/customers" class="btn btn-sm btn-secondary">← Back</a>
+        <a href="/customers/{{ customer.id }}/export-pirateship" class="btn btn-sm btn-secondary" title="Download Pirate Ship CSV for this customer's approved decisions">📥 Pirate Ship CSV</a>
         <form method="POST" action="/customers/{{ customer.id }}/recurate" style="display:inline;">
             <button type="submit" class="btn btn-sm btn-primary" title="Re-run the decision engine for this customer"
                 onclick="return confirm('Re-run kit assignment for this customer?')">🔄 Re-curate</button>

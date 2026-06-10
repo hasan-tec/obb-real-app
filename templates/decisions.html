@@ -91,6 +91,15 @@
             </div>
             <div style="display:flex;flex-direction:column;gap:3px;">
                 <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Order Type</label>
+                <select name="order_type" class="form-control" style="height:32px;font-size:13px;min-width:100px;">
+                    <option value="">All</option>
+                    <option value="new" {% if filters.order_type=='new' %}selected{% endif %}>New</option>
+                    <option value="renewal" {% if filters.order_type=='renewal' %}selected{% endif %}>Renewal</option>
+                </select>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:3px;">
+                <label
                     style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Month</label>
                 <input type="month" name="month" value="{{ filters.month or '' }}" class="form-control"
                     style="height:32px;font-size:13px;min-width:130px;">
@@ -151,6 +160,8 @@
         <button onclick="submitBulk('recurate')" class="btn btn-sm"
             style="background:var(--yellow);color:#000;border:none;">🔄 Re-curate Selected</button>
         {% endif %}
+        <button onclick="exportSelectedCSV()" class="btn btn-sm"
+            style="background:var(--blue);color:#fff;border:none;">📥 Export Selected CSV</button>
         <button onclick="clearBulkSelection()" class="btn btn-sm"
             style="background:var(--surface);border:1px solid var(--border);">✕ Clear</button>
     </div>
@@ -191,6 +202,8 @@
                         {% if d.customers %}
                         <a href="/customers/{{ d.customer_id }}">
                             {{ d.customers.first_name or '' }} {{ d.customers.last_name or '' }}
+                            {% if d.order_type == 'new' %}<span class="badge badge-green" style="font-size:10px;margin-left:4px;">New</span>
+                            {% elif d.order_type == 'renewal' %}<span class="badge badge-dim" style="font-size:10px;margin-left:4px;">Renewal</span>{% endif %}
                             <br><small style="color:var(--text-dim);">{{ d.customers.email }}</small>
                         </a>
                         {% else %}
@@ -368,6 +381,24 @@
         document.querySelectorAll('.decision-checkbox').forEach(function (cb) { cb.checked = false; });
         if (selectAllEl) selectAllEl.checked = false;
         updateBulkBar();
+    }
+
+    function exportSelectedCSV() {
+        var checked = document.querySelectorAll('.decision-checkbox:checked');
+        if (checked.length === 0) { alert('No decisions selected.'); return; }
+        var form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '/decisions/export-csv-selected';
+        checked.forEach(function (cb) {
+            var inp = document.createElement('input');
+            inp.type = 'hidden';
+            inp.name = 'decision_ids';
+            inp.value = cb.value;
+            form.appendChild(inp);
+        });
+        document.body.appendChild(form);
+        form.submit();
+        document.body.removeChild(form);
     }
 </script>
 {% endblock %}
