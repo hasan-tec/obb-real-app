@@ -571,13 +571,14 @@ class VeraCoreClient:
         if offer_ids:
             params["offerIds"] = ",".join(offer_ids)
         raw = self._request("GET", "/api/Offers", params=params or None)
-        offers = raw.get("offers", []) if isinstance(raw, dict) else []
+        offers = (raw.get("Offers") or raw.get("offers") or []) if isinstance(raw, dict) else []
         logger.info("[VERACORE] get_offers returned %d offers", len(offers))
         return [
             {
-                "id": o.get("id", ""),
-                "title": o.get("title", ""),
-                "inactive": (o.get("status") or {}).get("inactive") is not None,
+                "id":       o.get("Id")    or o.get("id")    or "",
+                "title":    o.get("Title") or o.get("title") or "",
+                "bom_type": o.get("BillOfMaterialsType") or o.get("billOfMaterialsType") or "",
+                "inactive": (o.get("Status") or o.get("status") or {}).get("Inactive", {}).get("Indicator", 0) == 1,
             }
             for o in offers if isinstance(o, dict)
         ]
