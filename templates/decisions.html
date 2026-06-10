@@ -202,8 +202,8 @@
                         {% if d.customers %}
                         <a href="/customers/{{ d.customer_id }}">
                             {{ d.customers.first_name or '' }} {{ d.customers.last_name or '' }}
-                            {% if d.order_type == 'new' %}<span class="badge badge-green" style="font-size:10px;margin-left:4px;">New</span>
-                            {% elif d.order_type == 'renewal' %}<span class="badge badge-dim" style="font-size:10px;margin-left:4px;">Renewal</span>{% endif %}
+                            {% if d._order_type == 'new' %}<span class="badge badge-green" style="font-size:10px;margin-left:4px;">New</span>
+                            {% elif d._order_type == 'renewal' %}<span class="badge badge-dim" style="font-size:10px;margin-left:4px;">Renewal</span>{% endif %}
                             <br><small style="color:var(--text-dim);">{{ d.customers.email }}</small>
                         </a>
                         {% else %}

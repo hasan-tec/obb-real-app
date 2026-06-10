@@ -3415,8 +3415,6 @@ async def decisions_page(request: Request):
                 qo = qo.eq("decision_type", f_type)
             if f_platform:
                 qo = qo.eq("platform", f_platform)
-            if f_order_type:
-                qo = qo.eq("order_type", f_order_type)
             if f_month:
                 try:
                     y2, m2    = int(f_month[:4]), int(f_month[5:7])
@@ -3467,6 +3465,24 @@ async def decisions_page(request: Request):
                 or q in (d.get("kit_sku") or "").lower()
             ]
             logger.info(f"[DECISIONS PAGE] Text search '{q}' → {len(all_decisions)} decisions")
+
+        # Tag each decision with _order_type using shipment history (same logic as customers page)
+        if all_decisions:
+            decision_cids = list({d["customer_id"] for d in all_decisions if d.get("customer_id")})
+            customers_with_shipments: set = set()
+            for i in range(0, len(decision_cids), 200):
+                chunk = decision_cids[i:i + 200]
+                ship_rows = db.table("shipments").select("customer_id").in_("customer_id", chunk).execute()
+                for s in (ship_rows.data or []):
+                    customers_with_shipments.add(s["customer_id"])
+            for d in all_decisions:
+                d["_order_type"] = "renewal" if d.get("customer_id") in customers_with_shipments else "new"
+            if f_order_type == "new":
+                all_decisions = [d for d in all_decisions if d["_order_type"] == "new"]
+                logger.info("[DECISIONS PAGE] order_type=new filter → %d decisions", len(all_decisions))
+            elif f_order_type == "renewal":
+                all_decisions = [d for d in all_decisions if d["_order_type"] == "renewal"]
+                logger.info("[DECISIONS PAGE] order_type=renewal filter → %d decisions", len(all_decisions))
 
         # Build filter query string for sort links and export URLs
         filter_qs_parts = []
