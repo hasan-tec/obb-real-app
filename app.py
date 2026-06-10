@@ -3479,8 +3479,6 @@ async def decisions_page(request: Request):
                 qo = qo.eq("decision_type", f_type)
             if f_platform:
                 qo = qo.eq("platform", f_platform)
-            if f_order_type:
-                qo = qo.eq("order_type", f_order_type)
             if f_month:
                 try:
                     y2, m2    = int(f_month[:4]), int(f_month[5:7])
@@ -3531,6 +3529,25 @@ async def decisions_page(request: Request):
                 or q in (d.get("kit_sku") or "").lower()
             ]
             logger.info(f"[DECISIONS PAGE] Text search '{q}' → {len(all_decisions)} decisions")
+
+        # Tag each decision new/renewal from shipment history (same logic as customers page).
+        # No DB column needed — a customer with ANY prior shipment is a renewal, else new.
+        if all_decisions:
+            decision_cids = list({d["customer_id"] for d in all_decisions if d.get("customer_id")})
+            customers_with_shipments: set = set()
+            for i in range(0, len(decision_cids), 200):
+                chunk = decision_cids[i:i + 200]
+                ship_rows = db.table("shipments").select("customer_id").in_("customer_id", chunk).execute()
+                for s in (ship_rows.data or []):
+                    customers_with_shipments.add(s["customer_id"])
+            for d in all_decisions:
+                d["_order_type"] = "renewal" if d.get("customer_id") in customers_with_shipments else "new"
+            if f_order_type == "new":
+                all_decisions = [d for d in all_decisions if d["_order_type"] == "new"]
+                logger.info("[DECISIONS PAGE] order_type=new filter → %d decisions", len(all_decisions))
+            elif f_order_type == "renewal":
+                all_decisions = [d for d in all_decisions if d["_order_type"] == "renewal"]
+                logger.info("[DECISIONS PAGE] order_type=renewal filter → %d decisions", len(all_decisions))
 
         # Build filter query string for sort links and export URLs
         filter_qs_parts = []
@@ -6007,15 +6024,18 @@ async def veracore_ops_page(request: Request):
         except Exception as e:
             logger.warning("[VC OPS] sync_log fetch failed (migration 012 applied?): %s", e)
 
-        # Last successful inventory + shipment sync timestamps.
+        # Last successful inventory + expiry + shipment sync timestamps.
         last_inventory = None
+        last_expiry    = None
         last_shipment  = None
         for s in recent_syncs:
-            if s["status"] == "ok" and s["sync_type"] == "inventory" and last_inventory is None:
+            if s["status"] == "ok" and s["sync_type"] == "inventory"     and last_inventory is None:
                 last_inventory = s["run_at"]
+            if s["status"] == "ok" and s["sync_type"] == "expiry_sync"   and last_expiry is None:
+                last_expiry = s["run_at"]
             if s["status"] == "ok" and s["sync_type"] == "shipment_poll" and last_shipment is None:
                 last_shipment = s["run_at"]
-            if last_inventory and last_shipment:
+            if last_inventory and last_expiry and last_shipment:
                 break
 
         # Failed submit list w/ retry buttons.
@@ -6041,6 +6061,7 @@ async def veracore_ops_page(request: Request):
             "auth_mode":        VERACORE_AUTH_MODE,
             "system_id":        VERACORE_SYSTEM_ID,
             "last_inventory":   last_inventory,
+            "last_expiry":      last_expiry,
             "last_shipment":    last_shipment,
             "approved_count":   approved_count,
             "pending_push_count": pending_push_count,
@@ -6058,7 +6079,7 @@ async def veracore_ops_page(request: Request):
         return templates.TemplateResponse("veracore.html", {
             "request": request, "page": "veracore",
             "enabled": False, "base_url": "", "auth_mode": "", "system_id": "",
-            "last_inventory": None, "last_shipment": None,
+            "last_inventory": None, "last_expiry": None, "last_shipment": None,
             "approved_count": 0, "pending_push_count": 0, "submitted_count": 0,
             "failed_count": 0, "shipped_count": 0,
             "recent_syncs": [], "failed_decisions": [],
@@ -6920,8 +6941,6 @@ async def export_decisions_csv(request: Request):
                 qo = qo.eq("decision_type", f_type)
             if f_platform:
                 qo = qo.eq("platform", f_platform)
-            if f_order_type:
-                qo = qo.eq("order_type", f_order_type)
             if f_month:
                 try:
                     y, m     = int(f_month[:4]), int(f_month[5:7])
@@ -6946,6 +6965,22 @@ async def export_decisions_csv(request: Request):
             if len(batch_data) < PAGE_SIZE:
                 break
             offset += PAGE_SIZE
+
+        # Python-side new/renewal filter from shipment history (same logic as decisions page)
+        if f_order_type and rows:
+            export_cids = list({d["customer_id"] for d in rows if d.get("customer_id")})
+            cids_with_shipments: set = set()
+            for i in range(0, len(export_cids), 200):
+                chunk = export_cids[i:i + 200]
+                ship_rows = db.table("shipments").select("customer_id").in_("customer_id", chunk).execute()
+                for s in (ship_rows.data or []):
+                    cids_with_shipments.add(s["customer_id"])
+            if f_order_type == "new":
+                rows = [d for d in rows if d.get("customer_id") not in cids_with_shipments]
+            elif f_order_type == "renewal":
+                rows = [d for d in rows if d.get("customer_id") in cids_with_shipments]
+            logger.info("[EXPORT CSV] order_type=%s filter → %d decisions", f_order_type, len(rows))
+
         logger.info(f"[EXPORT CSV] Exporting {len(rows)} decisions (status={f_status})")
 
         output = io.StringIO()
