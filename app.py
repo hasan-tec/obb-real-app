@@ -5939,15 +5939,18 @@ async def veracore_ops_page(request: Request):
         except Exception as e:
             logger.warning("[VC OPS] sync_log fetch failed (migration 012 applied?): %s", e)
 
-        # Last successful inventory + shipment sync timestamps.
+        # Last successful inventory, expiry, and shipment sync timestamps.
         last_inventory = None
+        last_expiry    = None
         last_shipment  = None
         for s in recent_syncs:
-            if s["status"] == "ok" and s["sync_type"] == "inventory" and last_inventory is None:
+            if s["status"] == "ok" and s["sync_type"] == "inventory"    and last_inventory is None:
                 last_inventory = s["run_at"]
+            if s["status"] == "ok" and s["sync_type"] == "expiry_sync"  and last_expiry is None:
+                last_expiry = s["run_at"]
             if s["status"] == "ok" and s["sync_type"] == "shipment_poll" and last_shipment is None:
                 last_shipment = s["run_at"]
-            if last_inventory and last_shipment:
+            if last_inventory and last_expiry and last_shipment:
                 break
 
         # Failed submit list w/ retry buttons.
@@ -5973,6 +5976,7 @@ async def veracore_ops_page(request: Request):
             "auth_mode":        VERACORE_AUTH_MODE,
             "system_id":        VERACORE_SYSTEM_ID,
             "last_inventory":   last_inventory,
+            "last_expiry":      last_expiry,
             "last_shipment":    last_shipment,
             "approved_count":   approved_count,
             "pending_push_count": pending_push_count,

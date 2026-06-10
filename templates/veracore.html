@@ -177,8 +177,7 @@
                     </form>
                 </div> #}
 
-                {# DISABLED — undo when paid #}
-                {# <div style="padding:14px;background:var(--surface2);border-radius:8px;">
+                <div style="padding:14px;background:var(--surface2);border-radius:8px;">
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
                         <strong style="font-size:14px;">📅 Expiry Sync</strong>
                         <span class="badge badge-purple">daily · 04:00 UTC</span>
@@ -188,7 +187,12 @@
                         updates <code>items.expiry_date</code>. Skips kits and items with no EXP in title.
                     </div>
                     <div style="font-size:12px;margin-bottom:10px;">
-                        Runs alongside inventory sync — check the sync log below for last result.
+                        Last success:
+                        {% if last_expiry %}
+                        <strong>{{ last_expiry[:19] | replace('T', ' ') }} UTC</strong>
+                        {% else %}
+                        <span style="color:var(--text-dim);">never</span>
+                        {% endif %}
                     </div>
                     <form method="POST" action="/veracore/sync-expiry-now" style="display:inline;">
                         <button type="submit" class="btn btn-sm btn-primary" {% if not enabled %}disabled
@@ -196,7 +200,7 @@
                             ↻ Sync expiry now
                         </button>
                     </form>
-                </div> #}
+                </div>
             </div>
         </div>
     </div>
