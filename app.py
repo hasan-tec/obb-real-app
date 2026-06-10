@@ -564,10 +564,9 @@ def _monthly_report_scheduler():
                             from veracore_sync import run_inventory_sync
                             inv_result = run_inventory_sync(db, vc)
                             logger.info("[SCHEDULER] Inventory sync result: %s", inv_result)
-                            # DISABLED — undo when paid
-                            # from veracore_sync import run_expiry_sync
-                            # exp_result = run_expiry_sync(db, vc)
-                            # logger.info("[SCHEDULER] Expiry sync result: %s", exp_result)
+                            from veracore_sync import run_expiry_sync
+                            exp_result = run_expiry_sync(db, vc)
+                            logger.info("[SCHEDULER] Expiry sync result: %s", exp_result)
                     except Exception as e:
                         logger.error("[SCHEDULER] VeraCore inventory sync failed: %s", e, exc_info=True)
                 else:
@@ -2958,10 +2957,11 @@ async def customers_page(request: Request):
         msg_type = request.query_params.get("msg_type", "success")
 
         # Parse server-side filters
-        f_trimester = request.query_params.get("trimester", "").strip()
-        f_platform  = request.query_params.get("platform", "").strip()
-        f_status    = request.query_params.get("status", "").strip()
-        f_size      = request.query_params.get("size", "").strip()
+        f_trimester  = request.query_params.get("trimester", "").strip()
+        f_platform   = request.query_params.get("platform", "").strip()
+        f_status     = request.query_params.get("status", "").strip()
+        f_size       = request.query_params.get("size", "").strip()
+        f_order_type = request.query_params.get("order_type", "").strip()
 
         # Parse sort params (whitelist to prevent SQL injection)
         sort     = request.query_params.get("sort", "created_at")
@@ -3036,6 +3036,18 @@ async def customers_page(request: Request):
                     if sd and (cid not in latest_shipment_map or sd > latest_shipment_map[cid]):
                         latest_shipment_map[cid] = sd
 
+        # Tag each customer with shipment flag (used for badge + filter)
+        for c in filtered:
+            c["_has_shipments"] = c.get("id", "") in latest_shipment_map
+
+        # Python-side new/renewal filter (uses shipment data already loaded)
+        if f_order_type == "new":
+            filtered = [c for c in filtered if not c["_has_shipments"]]
+            logger.info("[CUSTOMERS PAGE] order_type=new filter → %d customers", len(filtered))
+        elif f_order_type == "renewal":
+            filtered = [c for c in filtered if c["_has_shipments"]]
+            logger.info("[CUSTOMERS PAGE] order_type=renewal filter → %d customers", len(filtered))
+
         active_customers: list = []
         past_customers:   list = []
         for c in filtered:
@@ -3084,13 +3096,14 @@ async def customers_page(request: Request):
 
         # Build filter query string for sort links
         filter_qs_parts = []
-        if f_trimester: filter_qs_parts.append(f"trimester={f_trimester}")
-        if f_platform:  filter_qs_parts.append(f"platform={f_platform}")
-        if f_status:    filter_qs_parts.append(f"status={f_status}")
-        if f_size:      filter_qs_parts.append(f"size={f_size}")
-        if q:           filter_qs_parts.append(f"q={q}")
+        if f_trimester:  filter_qs_parts.append(f"trimester={f_trimester}")
+        if f_platform:   filter_qs_parts.append(f"platform={f_platform}")
+        if f_status:     filter_qs_parts.append(f"status={f_status}")
+        if f_size:       filter_qs_parts.append(f"size={f_size}")
+        if f_order_type: filter_qs_parts.append(f"order_type={f_order_type}")
+        if q:            filter_qs_parts.append(f"q={q}")
         filter_qs         = "&".join(filter_qs_parts)
-        any_filter_active = bool(f_trimester or f_platform or f_status or f_size or q)
+        any_filter_active = bool(f_trimester or f_platform or f_status or f_size or f_order_type or q)
 
         return templates.TemplateResponse("customers.html", {
             "request":          request,
@@ -3103,10 +3116,11 @@ async def customers_page(request: Request):
             "msg_type":         msg_type,
             "page":             "customers",
             "filters": {
-                "trimester": f_trimester,
-                "platform":  f_platform,
-                "status":    f_status,
-                "size":      f_size,
+                "trimester":  f_trimester,
+                "platform":   f_platform,
+                "status":     f_status,
+                "size":       f_size,
+                "order_type": f_order_type,
             },
             "sort":             sort,
             "sort_dir":         sort_dir,
@@ -3224,6 +3238,72 @@ async def export_customers_csv(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/customers/{customer_id}/export-pirateship")
+async def export_customer_pirateship(request: Request, customer_id: str):
+    """Download a Pirate Ship CSV for a single customer's approved decisions."""
+    try:
+        db = get_supabase()
+        rows = db.table("decisions").select("*, customers(*)").eq("customer_id", customer_id).eq("status", "approved").order("created_at", desc=True).execute().data or []
+        logger.info("[PIRATESHIP SINGLE] customer=%s approved_decisions=%d", customer_id, len(rows))
+
+        from veracore_client import normalize_country as _norm_country, build_customs as _build_customs
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Name", "Email", "Address Line 1", "Address Line 2",
+            "City", "State/Province", "Zip", "Country", "Phone",
+            "Order Number", "Kit SKU", "Trimester",
+            "Weight (oz)", "Length (in)", "Width (in)", "Height (in)",
+            "Customs Description", "Customs Value", "Customs Quantity", "Customs Country of Origin",
+        ])
+        DEFAULT_WEIGHT_OZ = 48
+        DEFAULT_LENGTH_IN = 10
+        DEFAULT_WIDTH_IN  = 7.5
+        DEFAULT_HEIGHT_IN = 4
+        for d in rows:
+            c = d.get("customers") or {}
+            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+            country_iso = _norm_country(c.get("country") or "US")
+            is_intl = country_iso != "US"
+            if is_intl:
+                customs = _build_customs({"cost_per_kit": None})
+                customs_desc   = customs["description"]
+                customs_value  = f"{customs['declared_value']:.2f}"
+                customs_qty    = "1"
+                customs_origin = customs["country_of_origin"]
+            else:
+                customs_desc = customs_value = customs_qty = customs_origin = ""
+            writer.writerow([
+                name,
+                c.get("email", ""),
+                c.get("address_line1", ""),
+                c.get("address_line2") or "",
+                c.get("city", ""),
+                c.get("province", ""),
+                c.get("zip") or c.get("zip_code", ""),
+                country_iso,
+                c.get("phone") or "",
+                d.get("order_id", ""),
+                d.get("kit_sku", ""),
+                f"T{d.get('trimester', '')}",
+                DEFAULT_WEIGHT_OZ, DEFAULT_LENGTH_IN, DEFAULT_WIDTH_IN, DEFAULT_HEIGHT_IN,
+                customs_desc, customs_value, customs_qty, customs_origin,
+            ])
+
+        output.seek(0)
+        cust_slug = customer_id[:8]
+        filename = f"pirateship_{cust_slug}_{date.today().isoformat()}.csv"
+        await log_activity("export", f"Single-customer Pirate Ship CSV: customer={customer_id} rows={len(rows)}", "", "success")
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except Exception as e:
+        logger.error("[PIRATESHIP SINGLE] Error: %s", e, exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/customers/{customer_id}", response_class=HTMLResponse)
 async def customer_detail(request: Request, customer_id: str):
     """View a single customer's details and history."""
@@ -3300,12 +3380,13 @@ async def decisions_page(request: Request):
         msg_type = request.query_params.get("msg_type", "success")
 
         # Parse filters
-        f_trimester = request.query_params.get("trimester", "").strip()
-        f_status    = request.query_params.get("status", "").strip()
-        f_type      = request.query_params.get("type", "").strip()
-        f_platform  = request.query_params.get("platform", "").strip()
-        f_month     = request.query_params.get("month", "").strip()
-        q           = request.query_params.get("q", "").strip().lower()
+        f_trimester   = request.query_params.get("trimester", "").strip()
+        f_status      = request.query_params.get("status", "").strip()
+        f_type        = request.query_params.get("type", "").strip()
+        f_platform    = request.query_params.get("platform", "").strip()
+        f_month       = request.query_params.get("month", "").strip()
+        f_order_type  = request.query_params.get("order_type", "").strip()
+        q             = request.query_params.get("q", "").strip().lower()
 
         # Parse sort (whitelist)
         sort     = request.query_params.get("sort", "created_at")
@@ -3334,6 +3415,8 @@ async def decisions_page(request: Request):
                 qo = qo.eq("decision_type", f_type)
             if f_platform:
                 qo = qo.eq("platform", f_platform)
+            if f_order_type:
+                qo = qo.eq("order_type", f_order_type)
             if f_month:
                 try:
                     y2, m2    = int(f_month[:4]), int(f_month[5:7])
@@ -3387,15 +3470,16 @@ async def decisions_page(request: Request):
 
         # Build filter query string for sort links and export URLs
         filter_qs_parts = []
-        if f_trimester: filter_qs_parts.append(f"trimester={f_trimester}")
-        if f_status:    filter_qs_parts.append(f"status={f_status}")
-        if f_type:      filter_qs_parts.append(f"type={f_type}")
-        if f_platform:  filter_qs_parts.append(f"platform={f_platform}")
-        if f_month:     filter_qs_parts.append(f"month={f_month}")
-        if q:           filter_qs_parts.append(f"q={q}")
+        if f_trimester:  filter_qs_parts.append(f"trimester={f_trimester}")
+        if f_status:     filter_qs_parts.append(f"status={f_status}")
+        if f_type:       filter_qs_parts.append(f"type={f_type}")
+        if f_platform:   filter_qs_parts.append(f"platform={f_platform}")
+        if f_order_type: filter_qs_parts.append(f"order_type={f_order_type}")
+        if f_month:      filter_qs_parts.append(f"month={f_month}")
+        if q:            filter_qs_parts.append(f"q={q}")
         filter_qs = "&".join(filter_qs_parts)
 
-        any_filter_active = bool(f_trimester or f_status or f_type or f_platform or f_month or q)
+        any_filter_active = bool(f_trimester or f_status or f_type or f_platform or f_order_type or f_month or q)
 
         return templates.TemplateResponse("decisions.html", {
             "request":          request,
@@ -3405,12 +3489,13 @@ async def decisions_page(request: Request):
             "msg_type":         msg_type,
             "page":             "decisions",
             "filters": {
-                "trimester": f_trimester,
-                "status":    f_status,
-                "type":      f_type,
-                "platform":  f_platform,
-                "month":     f_month,
-                "q":         q,
+                "trimester":  f_trimester,
+                "status":     f_status,
+                "type":       f_type,
+                "platform":   f_platform,
+                "order_type": f_order_type,
+                "month":      f_month,
+                "q":          q,
             },
             "sort":             sort,
             "sort_dir":         sort_dir,
@@ -5984,36 +6069,35 @@ async def veracore_save_settings(request: Request):
 #         return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
 
 
-# DISABLED — undo when paid
-# @app.post("/veracore/sync-expiry-now")
-# async def veracore_sync_expiry_now(request: Request):
-#     """Manually trigger a VeraCore expiry-date sync (parses EXP from offer Titles)."""
-#     try:
-#         if not veracore_enabled():
-#             return RedirectResponse("/veracore?msg=VeraCore+not+configured&msg_type=error",
-#                                     status_code=303)
-#         db = get_supabase()
-#         vc = get_veracore_client()
-#         if vc is None:
-#             return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
-#                                     status_code=303)
-#         from veracore_sync import run_expiry_sync
-#         r = await asyncio.get_running_loop().run_in_executor(None, run_expiry_sync, db, vc)
-#         await log_activity("veracore",
-#                            f"Manual expiry sync: updated={r['updated']} no_match={r['skipped_no_match']}",
-#                            (r.get("error") or "")[:200],
-#                            "error" if r.get("error") else "success")
-#         if r.get("error"):
-#             return RedirectResponse(
-#                 f"/veracore?msg=Expiry+sync+failed:+{r['error'][:100]}&msg_type=error",
-#                 status_code=303)
-#         return RedirectResponse(
-#             f"/veracore?msg=Expiry+synced:+{r['updated']}+items+updated&msg_type=success",
-#             status_code=303)
-#     except Exception as e:
-#         logger.error("[VC EXPIRY NOW] %s", e, exc_info=True)
-#         return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error",
-#                                 status_code=303)
+@app.post("/veracore/sync-expiry-now")
+async def veracore_sync_expiry_now(request: Request):
+    """Manually trigger a VeraCore expiry-date sync (parses EXP from offer Titles)."""
+    try:
+        if not veracore_enabled():
+            return RedirectResponse("/veracore?msg=VeraCore+not+configured&msg_type=error",
+                                    status_code=303)
+        db = get_supabase()
+        vc = get_veracore_client()
+        if vc is None:
+            return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
+                                    status_code=303)
+        from veracore_sync import run_expiry_sync
+        r = await asyncio.get_running_loop().run_in_executor(None, run_expiry_sync, db, vc)
+        await log_activity("veracore",
+                           f"Manual expiry sync: updated={r['updated']} no_match={r['skipped_no_match']}",
+                           (r.get("error") or "")[:200],
+                           "error" if r.get("error") else "success")
+        if r.get("error"):
+            return RedirectResponse(
+                f"/veracore?msg=Expiry+sync+failed:+{r['error'][:100]}&msg_type=error",
+                status_code=303)
+        return RedirectResponse(
+            f"/veracore?msg=Expiry+synced:+{r['updated']}+items+updated&msg_type=success",
+            status_code=303)
+    except Exception as e:
+        logger.error("[VC EXPIRY NOW] %s", e, exc_info=True)
+        return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error",
+                                status_code=303)
 
 
 @app.post("/decisions/{decision_id}/ship")
@@ -6795,6 +6879,83 @@ async def export_decisions_csv(request: Request):
         )
     except Exception as e:
         logger.error(f"[EXPORT CSV] Error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/decisions/export-csv-selected")
+async def export_decisions_csv_selected(request: Request):
+    """Export a hand-picked set of decisions as a Pirate Ship CSV (row-selection from bulk bar)."""
+    try:
+        db = get_supabase()
+        form = await request.form()
+        decision_ids = form.getlist("decision_ids")
+        if not decision_ids:
+            return JSONResponse({"error": "No decisions selected"}, status_code=400)
+
+        logger.info("[EXPORT CSV SELECTED] Exporting %d selected decisions", len(decision_ids))
+
+        # Fetch only the selected decisions
+        rows: list = []
+        CHUNK = 100
+        from veracore_client import normalize_country as _norm_country, build_customs as _build_customs
+        for chunk_start in range(0, len(decision_ids), CHUNK):
+            chunk = decision_ids[chunk_start:chunk_start + CHUNK]
+            batch = db.table("decisions").select("*, customers(*)").in_("id", chunk).execute()
+            rows.extend(batch.data or [])
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Name", "Email", "Address Line 1", "Address Line 2",
+            "City", "State/Province", "Zip", "Country", "Phone",
+            "Order Number", "Kit SKU", "Trimester",
+            "Weight (oz)", "Length (in)", "Width (in)", "Height (in)",
+            "Customs Description", "Customs Value", "Customs Quantity", "Customs Country of Origin",
+        ])
+        DEFAULT_WEIGHT_OZ = 48
+        DEFAULT_LENGTH_IN = 10
+        DEFAULT_WIDTH_IN  = 7.5
+        DEFAULT_HEIGHT_IN = 4
+        for d in rows:
+            c = d.get("customers") or {}
+            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+            country_iso = _norm_country(c.get("country") or "US")
+            is_intl = country_iso != "US"
+            if is_intl:
+                customs = _build_customs({"cost_per_kit": None})
+                customs_desc   = customs["description"]
+                customs_value  = f"{customs['declared_value']:.2f}"
+                customs_qty    = "1"
+                customs_origin = customs["country_of_origin"]
+            else:
+                customs_desc = customs_value = customs_qty = customs_origin = ""
+            writer.writerow([
+                name,
+                c.get("email", ""),
+                c.get("address_line1", ""),
+                c.get("address_line2") or "",
+                c.get("city", ""),
+                c.get("province", ""),
+                c.get("zip") or c.get("zip_code", ""),
+                country_iso,
+                c.get("phone") or "",
+                d.get("order_id", ""),
+                d.get("kit_sku", ""),
+                f"T{d.get('trimester', '')}",
+                DEFAULT_WEIGHT_OZ, DEFAULT_LENGTH_IN, DEFAULT_WIDTH_IN, DEFAULT_HEIGHT_IN,
+                customs_desc, customs_value, customs_qty, customs_origin,
+            ])
+
+        output.seek(0)
+        filename = f"pirateship_selected_{date.today().isoformat()}.csv"
+        await log_activity("export", f"Pirate Ship CSV (selected): {len(rows)} rows", f"ids={len(decision_ids)}", "success")
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except Exception as e:
+        logger.error("[EXPORT CSV SELECTED] Error: %s", e, exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 

@@ -254,6 +254,14 @@
                     </select>
                 </div>
                 <div style="display:flex;flex-direction:column;gap:3px;">
+                    <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Order Type</label>
+                    <select name="order_type" class="form-control" style="height:32px;font-size:13px;min-width:100px;">
+                        <option value="">All</option>
+                        <option value="new"     {% if filters.order_type == 'new'     %}selected{% endif %}>New</option>
+                        <option value="renewal" {% if filters.order_type == 'renewal' %}selected{% endif %}>Renewal</option>
+                    </select>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:3px;">
                     <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Search</label>
                     <input type="text" name="q" value="{{ search_query or '' }}" placeholder="name or email…"
                            class="form-control" style="height:32px;font-size:13px;min-width:200px;">
@@ -289,7 +297,11 @@
             <tbody>
                 {% for c in active_customers %}
                 <tr>
-                    <td>{{ c.first_name or '' }} {{ c.last_name or '' }}</td>
+                    <td>
+                        <a href="/customers/{{ c.id }}">{{ c.first_name or '' }} {{ c.last_name or '' }}</a>
+                        {% if not c._has_shipments %}<span class="badge badge-green" style="font-size:10px;margin-left:4px;">New</span>
+                        {% else %}<span class="badge badge-dim" style="font-size:10px;margin-left:4px;">Renewal</span>{% endif %}
+                    </td>
                     <td style="font-size:12px;">{{ c.email }}</td>
                     <td>
                         {% if c.platform == 'shopify' %}<span class="badge badge-green">Shopify</span>
@@ -344,7 +356,11 @@
             <tbody>
                 {% for c in past_customers %}
                 <tr style="opacity:0.75;">
-                    <td>{{ c.first_name or '' }} {{ c.last_name or '' }}</td>
+                    <td>
+                        <a href="/customers/{{ c.id }}">{{ c.first_name or '' }} {{ c.last_name or '' }}</a>
+                        {% if not c._has_shipments %}<span class="badge badge-green" style="font-size:10px;margin-left:4px;">New</span>
+                        {% else %}<span class="badge badge-dim" style="font-size:10px;margin-left:4px;">Renewal</span>{% endif %}
+                    </td>
                     <td style="font-size:12px;">{{ c.email }}</td>
                     <td>
                         {% if c.platform == 'shopify' %}<span class="badge badge-green">Shopify</span>
