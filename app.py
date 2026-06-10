@@ -561,13 +561,11 @@ def _monthly_report_scheduler():
                         db = get_supabase()
                         vc = get_veracore_client()
                         if vc is not None:
-                            from veracore_sync import run_inventory_sync
+                            from veracore_sync import run_inventory_sync, run_expiry_sync
                             inv_result = run_inventory_sync(db, vc)
                             logger.info("[SCHEDULER] Inventory sync result: %s", inv_result)
-                            # DISABLED — undo when paid
-                            # from veracore_sync import run_expiry_sync
-                            # exp_result = run_expiry_sync(db, vc)
-                            # logger.info("[SCHEDULER] Expiry sync result: %s", exp_result)
+                            exp_result = run_expiry_sync(db, vc)
+                            logger.info("[SCHEDULER] Expiry sync result: %s", exp_result)
                     except Exception as e:
                         logger.error("[SCHEDULER] VeraCore inventory sync failed: %s", e, exc_info=True)
                 else:
@@ -5854,15 +5852,18 @@ async def veracore_ops_page(request: Request):
         except Exception as e:
             logger.warning("[VC OPS] sync_log fetch failed (migration 012 applied?): %s", e)
 
-        # Last successful inventory + shipment sync timestamps.
+        # Last successful inventory, expiry, and shipment sync timestamps.
         last_inventory = None
+        last_expiry    = None
         last_shipment  = None
         for s in recent_syncs:
-            if s["status"] == "ok" and s["sync_type"] == "inventory" and last_inventory is None:
+            if s["status"] == "ok" and s["sync_type"] == "inventory"     and last_inventory is None:
                 last_inventory = s["run_at"]
+            if s["status"] == "ok" and s["sync_type"] == "expiry_sync"   and last_expiry is None:
+                last_expiry = s["run_at"]
             if s["status"] == "ok" and s["sync_type"] == "shipment_poll" and last_shipment is None:
                 last_shipment = s["run_at"]
-            if last_inventory and last_shipment:
+            if last_inventory and last_expiry and last_shipment:
                 break
 
         # Failed submit list w/ retry buttons.
@@ -5888,6 +5889,7 @@ async def veracore_ops_page(request: Request):
             "auth_mode":        VERACORE_AUTH_MODE,
             "system_id":        VERACORE_SYSTEM_ID,
             "last_inventory":   last_inventory,
+            "last_expiry":      last_expiry,
             "last_shipment":    last_shipment,
             "approved_count":   approved_count,
             "pending_push_count": pending_push_count,
@@ -5905,7 +5907,7 @@ async def veracore_ops_page(request: Request):
         return templates.TemplateResponse("veracore.html", {
             "request": request, "page": "veracore",
             "enabled": False, "base_url": "", "auth_mode": "", "system_id": "",
-            "last_inventory": None, "last_shipment": None,
+            "last_inventory": None, "last_expiry": None, "last_shipment": None,
             "approved_count": 0, "pending_push_count": 0, "submitted_count": 0,
             "failed_count": 0, "shipped_count": 0,
             "recent_syncs": [], "failed_decisions": [],
@@ -5984,36 +5986,35 @@ async def veracore_save_settings(request: Request):
 #         return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error", status_code=303)
 
 
-# DISABLED — undo when paid
-# @app.post("/veracore/sync-expiry-now")
-# async def veracore_sync_expiry_now(request: Request):
-#     """Manually trigger a VeraCore expiry-date sync (parses EXP from offer Titles)."""
-#     try:
-#         if not veracore_enabled():
-#             return RedirectResponse("/veracore?msg=VeraCore+not+configured&msg_type=error",
-#                                     status_code=303)
-#         db = get_supabase()
-#         vc = get_veracore_client()
-#         if vc is None:
-#             return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
-#                                     status_code=303)
-#         from veracore_sync import run_expiry_sync
-#         r = await asyncio.get_running_loop().run_in_executor(None, run_expiry_sync, db, vc)
-#         await log_activity("veracore",
-#                            f"Manual expiry sync: updated={r['updated']} no_match={r['skipped_no_match']}",
-#                            (r.get("error") or "")[:200],
-#                            "error" if r.get("error") else "success")
-#         if r.get("error"):
-#             return RedirectResponse(
-#                 f"/veracore?msg=Expiry+sync+failed:+{r['error'][:100]}&msg_type=error",
-#                 status_code=303)
-#         return RedirectResponse(
-#             f"/veracore?msg=Expiry+synced:+{r['updated']}+items+updated&msg_type=success",
-#             status_code=303)
-#     except Exception as e:
-#         logger.error("[VC EXPIRY NOW] %s", e, exc_info=True)
-#         return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error",
-#                                 status_code=303)
+@app.post("/veracore/sync-expiry-now")
+async def veracore_sync_expiry_now(request: Request):
+    """Manually trigger a VeraCore expiry-date sync (parses EXP from offer Titles)."""
+    try:
+        if not veracore_enabled():
+            return RedirectResponse("/veracore?msg=VeraCore+not+configured&msg_type=error",
+                                    status_code=303)
+        db = get_supabase()
+        vc = get_veracore_client()
+        if vc is None:
+            return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
+                                    status_code=303)
+        from veracore_sync import run_expiry_sync
+        r = await asyncio.get_running_loop().run_in_executor(None, run_expiry_sync, db, vc)
+        await log_activity("veracore",
+                           f"Manual expiry sync: updated={r['updated']} no_match={r['skipped_no_match']}",
+                           (r.get("error") or "")[:200],
+                           "error" if r.get("error") else "success")
+        if r.get("error"):
+            return RedirectResponse(
+                f"/veracore?msg=Expiry+sync+failed:+{r['error'][:100]}&msg_type=error",
+                status_code=303)
+        return RedirectResponse(
+            f"/veracore?msg=Expiry+synced:+{r['updated']}+items+updated&msg_type=success",
+            status_code=303)
+    except Exception as e:
+        logger.error("[VC EXPIRY NOW] %s", e, exc_info=True)
+        return RedirectResponse(f"/veracore?msg=Error:+{str(e)[:100]}&msg_type=error",
+                                status_code=303)
 
 
 @app.post("/decisions/{decision_id}/ship")
