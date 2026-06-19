@@ -136,8 +136,30 @@
                     📊 Push to Sheet
                 </button>
             </form>
+            <!-- Upload PS Tracking CSV → Shopify fulfillment write-back -->
+            <input type="file" id="trackingFileInput" name="file" accept=".csv,.xlsx" style="display:none;"
+                onchange="uploadTrackingCSV(this)">
+            <button type="button" class="btn btn-sm"
+                style="background:#7c3aed;color:white;border:none;"
+                title="Upload Pirate Ship tracking export to mark Shopify orders as Fulfilled"
+                onclick="document.getElementById('trackingFileInput').click()">
+                🚚 Upload PS Tracking
+            </button>
             <span style="font-size:11px;color:var(--text-dim);">CSV &amp; Sheet export default to
                 <strong>approved</strong> status — use Status filter to change</span>
+        </div>
+    </div>
+
+    <!-- Tracking upload result modal -->
+    <div id="trackingModal"
+        style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;">
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;max-width:560px;width:90%;max-height:80vh;overflow-y:auto;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <strong style="font-size:15px;">Tracking Upload Results</strong>
+                <button onclick="document.getElementById('trackingModal').style.display='none'"
+                    style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--text-dim);">✕</button>
+            </div>
+            <div id="trackingModalBody" style="font-size:13px;"></div>
         </div>
     </div>
 
@@ -381,6 +403,56 @@
         document.querySelectorAll('.decision-checkbox').forEach(function (cb) { cb.checked = false; });
         if (selectAllEl) selectAllEl.checked = false;
         updateBulkBar();
+    }
+
+    function uploadTrackingCSV(input) {
+        if (!input.files || !input.files[0]) return;
+        var file = input.files[0];
+        input.value = '';  // reset so same file can be re-uploaded
+        var btn = document.querySelector('[onclick*="trackingFileInput"]');
+        var origText = btn ? btn.innerHTML : '';
+        if (btn) { btn.innerHTML = '⏳ Uploading…'; btn.disabled = true; }
+
+        var fd = new FormData();
+        fd.append('file', file);
+
+        fetch('/decisions/upload-tracking', { method: 'POST', body: fd })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                var s = data.summary || {};
+                var lines = [
+                    '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:14px;">',
+                    '<span style="color:var(--text-dim);">Rows: <strong>' + (s.rows||0) + '</strong></span>',
+                    '<span style="color:#16a34a;">Fulfilled: <strong>' + (s.fulfilled||0) + '</strong></span>',
+                    '<span style="color:var(--text-dim);">Already done: <strong>' + (s.already||0) + '</strong></span>',
+                    '<span style="color:#dc2626;">Failed: <strong>' + (s.failed||0) + '</strong></span>',
+                    '<span style="color:var(--yellow,#ca8a04);">Unmatched: <strong>' + (s.unmatched||0) + '</strong></span>',
+                    '</div>'
+                ];
+                if (data.details && data.details.length) {
+                    lines.push('<table style="width:100%;border-collapse:collapse;font-size:12px;">');
+                    lines.push('<tr style="border-bottom:1px solid var(--border);"><th style="text-align:left;padding:4px 6px;">Order</th><th style="text-align:left;padding:4px 6px;">Tracking</th><th style="text-align:left;padding:4px 6px;">Status</th><th style="text-align:left;padding:4px 6px;">Note</th></tr>');
+                    data.details.forEach(function(row) {
+                        var color = row.status === 'fulfilled' ? '#16a34a' : row.status === 'already' ? 'var(--text-dim)' : '#dc2626';
+                        lines.push('<tr style="border-bottom:1px solid var(--border);">');
+                        lines.push('<td style="padding:4px 6px;">' + (row.order_ref || row.order_id || '—') + '</td>');
+                        lines.push('<td style="padding:4px 6px;">' + (row.tracking || '—') + '</td>');
+                        lines.push('<td style="padding:4px 6px;color:' + color + ';">' + (row.status || '—') + '</td>');
+                        lines.push('<td style="padding:4px 6px;color:var(--text-dim);">' + (row.error || '') + '</td>');
+                        lines.push('</tr>');
+                    });
+                    lines.push('</table>');
+                }
+                document.getElementById('trackingModalBody').innerHTML = lines.join('');
+                var modal = document.getElementById('trackingModal');
+                modal.style.display = 'flex';
+            })
+            .catch(function(err) {
+                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                document.getElementById('trackingModalBody').innerHTML = '<span style="color:#dc2626;">Upload failed: ' + err + '</span>';
+                document.getElementById('trackingModal').style.display = 'flex';
+            });
     }
 
     function exportSelectedCSV() {

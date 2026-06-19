@@ -65,20 +65,22 @@ def log_sync(db, sync_type: str, decision_id: Optional[str],
 
 def run_inventory_sync(db, vc_client) -> dict:
     """
-    Pull VeraCore inventory → update kits.quantity_available → raise low-stock alerts.
+    Pull VeraCore inventory → update kits.quantity_available + items.quantity_available
+    → raise low-stock alerts for kits under LOW_STOCK_THRESHOLD.
 
-    Optimised: bulk-fetches all kits + existing alerts upfront, does matching in-memory,
+    Optimised: bulk-fetches all kits + items + alerts upfront, does matching in-memory,
     and only writes rows where quantity actually changed.
 
-    Returns: {synced: int, skipped: int, alerts_raised: int, error: str|None}
+    Returns: {synced: int, items_synced: int, skipped: int, alerts_raised: int, error: str|None}
     """
-    result = {"synced": 0, "skipped": 0, "alerts_raised": 0, "error": None}
+    result = {"synced": 0, "items_synced": 0, "skipped": 0, "alerts_raised": 0, "error": None}
     started_at = datetime.utcnow()
     logger.info("[VERACORE SYNC] ═══ Inventory sync started at %s UTC ═══", started_at.isoformat())
 
-    # 1. Bulk-fetch all kits and existing unresolved alerts — 2 DB calls total instead of N.
+    # 1. Bulk-fetch kits, items, and existing unresolved alerts — 3 DB calls total.
     try:
         all_kits    = db.table("kits").select("id, sku, quantity_available, veracore_sku").execute().data or []
+        all_items   = db.table("items").select("id, sku, quantity_available, veracore_sku").execute().data or []
         alerts_data = db.table("kit_stock_alerts").select("kit_id").eq("resolved", False).execute().data or []
     except Exception as e:
         err = f"bulk DB fetch failed: {e}"
@@ -88,9 +90,13 @@ def run_inventory_sync(db, vc_client) -> dict:
         return result
 
     # Build O(1) lookup dicts keyed by upper-cased SKU.
-    kits_by_vc_sku  = {k["veracore_sku"].upper(): k for k in all_kits if k.get("veracore_sku")}
-    kits_by_sku     = {k["sku"].upper(): k for k in all_kits if k.get("sku")}
-    alerted_kit_ids = {r["kit_id"] for r in alerts_data}
+    kits_by_vc_sku   = {k["veracore_sku"].upper(): k for k in all_kits if k.get("veracore_sku")}
+    kits_by_sku      = {k["sku"].upper(): k for k in all_kits if k.get("sku")}
+    items_by_vc_sku  = {it["veracore_sku"].upper(): it for it in all_items if it.get("veracore_sku")}
+    items_by_sku     = {it["sku"].upper(): it for it in all_items if it.get("sku")}
+    alerted_kit_ids  = {r["kit_id"] for r in alerts_data}
+
+    logger.info("[VERACORE SYNC] Loaded %d kits, %d items from DB", len(all_kits), len(all_items))
 
     # 2. Pull VeraCore inventory (1 API call).
     try:
@@ -102,6 +108,8 @@ def run_inventory_sync(db, vc_client) -> dict:
         result["error"] = err
         return result
 
+    synced_at_iso = datetime.utcnow().isoformat()
+
     # 3. Process in-memory; only DB-write rows where qty actually changed.
     for row in rows:
         sku = row.get("sku")
@@ -110,49 +118,71 @@ def run_inventory_sync(db, vc_client) -> dict:
             continue
 
         sku_upper = sku.upper()
+        new_qty = max(0, int(row.get("available_balance", 0) or 0))
+
+        # ── Kit match ──
         kit = kits_by_vc_sku.get(sku_upper) or kits_by_sku.get(sku_upper)
-        if not kit:
-            logger.debug("[VERACORE SYNC] No matching kit for VeraCore SKU '%s' — skipping", sku)
-            result["skipped"] += 1
+        if kit:
+            old_qty = int(kit.get("quantity_available", 0) or 0)
+            if old_qty != new_qty:
+                try:
+                    db.table("kits").update({"quantity_available": new_qty}).eq("id", kit["id"]).execute()
+                    logger.info("[VERACORE SYNC] Kit %s qty: %d → %d", kit["sku"], old_qty, new_qty)
+                    kit["quantity_available"] = new_qty
+                except Exception as e:
+                    logger.warning("[VERACORE SYNC] Update failed for kit %s: %s", kit["sku"], e)
+                    result["skipped"] += 1
+                    continue
+            result["synced"] += 1
+
+            # Alert check is in-memory — no extra DB call per kit.
+            if new_qty < LOW_STOCK_THRESHOLD and kit["id"] not in alerted_kit_ids:
+                try:
+                    db.table("kit_stock_alerts").insert({
+                        "kit_id":    kit["id"],
+                        "seen_qty":  new_qty,
+                        "threshold": LOW_STOCK_THRESHOLD,
+                        "note":      f"Auto-raised by inventory sync — VeraCore shows {new_qty} on hand",
+                    }).execute()
+                    alerted_kit_ids.add(kit["id"])
+                    result["alerts_raised"] += 1
+                    logger.warning("[VERACORE SYNC] LOW STOCK alert raised for %s (qty=%d, threshold=%d)",
+                                   kit["sku"], new_qty, LOW_STOCK_THRESHOLD)
+                except Exception as e:
+                    logger.warning("[VERACORE SYNC] Failed to raise stock alert for %s: %s", kit["sku"], e)
             continue
 
-        new_qty = max(0, int(row.get("available_balance", 0)))
-        old_qty = int(kit.get("quantity_available", 0) or 0)
-
-        if old_qty != new_qty:
+        # ── Item match (item-level VC SKUs contain '+') ──
+        item = items_by_vc_sku.get(sku_upper) or items_by_sku.get(sku_upper)
+        if item:
+            old_qty = int(item.get("quantity_available", 0) or 0)
+            patch = {"inventory_synced_at": synced_at_iso}
+            if old_qty != new_qty:
+                patch["quantity_available"] = new_qty
             try:
-                db.table("kits").update({"quantity_available": new_qty}).eq("id", kit["id"]).execute()
-                logger.info("[VERACORE SYNC] Kit %s qty: %d → %d", kit["sku"], old_qty, new_qty)
-                kit["quantity_available"] = new_qty  # keep in-memory state current
+                db.table("items").update(patch).eq("id", item["id"]).execute()
+                if old_qty != new_qty:
+                    logger.info("[VERACORE SYNC] Item %s qty: %d → %d", item["sku"], old_qty, new_qty)
+                    item["quantity_available"] = new_qty
             except Exception as e:
-                logger.warning("[VERACORE SYNC] Update failed for kit %s: %s", kit["sku"], e)
+                logger.warning("[VERACORE SYNC] Item update failed for %s: %s", item["sku"], e)
                 result["skipped"] += 1
                 continue
-        result["synced"] += 1
+            result["items_synced"] += 1
+            continue
 
-        # Alert check is in-memory — no extra DB call per kit.
-        if new_qty < LOW_STOCK_THRESHOLD and kit["id"] not in alerted_kit_ids:
-            try:
-                db.table("kit_stock_alerts").insert({
-                    "kit_id":    kit["id"],
-                    "seen_qty":  new_qty,
-                    "threshold": LOW_STOCK_THRESHOLD,
-                    "note":      f"Auto-raised by inventory sync — VeraCore shows {new_qty} on hand",
-                }).execute()
-                alerted_kit_ids.add(kit["id"])  # prevent double-insert within same run
-                result["alerts_raised"] += 1
-                logger.warning("[VERACORE SYNC] LOW STOCK alert raised for %s (qty=%d, threshold=%d)",
-                               kit["sku"], new_qty, LOW_STOCK_THRESHOLD)
-            except Exception as e:
-                logger.warning("[VERACORE SYNC] Failed to raise stock alert for %s: %s", kit["sku"], e)
+        logger.debug("[VERACORE SYNC] No matching kit or item for VeraCore SKU '%s' — skipping", sku)
+        result["skipped"] += 1
 
     log_sync(db, "inventory", None,
              {"pulled_rows": len(rows)},
-             {"synced": result["synced"], "skipped": result["skipped"],
-              "alerts_raised": result["alerts_raised"]},
+             {"synced": result["synced"], "items_synced": result["items_synced"],
+              "skipped": result["skipped"], "alerts_raised": result["alerts_raised"]},
              "ok")
-    logger.info("[VERACORE SYNC] ═══ Inventory sync done: synced=%d skipped=%d alerts=%d ═══",
-                result["synced"], result["skipped"], result["alerts_raised"])
+    logger.info(
+        "[VERACORE SYNC] ═══ Inventory sync done: kits=%d items=%d skipped=%d alerts=%d ═══",
+        result["synced"], result["items_synced"], result["skipped"], result["alerts_raised"],
+    )
     return result
 
 

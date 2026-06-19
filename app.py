@@ -63,8 +63,36 @@ def get_supabase() -> Client:
 
 # ─── Shopify config ───
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
+SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "")
+# Admin API host (the *.myshopify.com handle, NOT the storefront domain). Required
+# for outbound fulfillment write-back. Falls back to deriving from STORE_DOMAIN.
+SHOPIFY_ADMIN_DOMAIN = os.getenv("SHOPIFY_ADMIN_DOMAIN", "")
+
+_shopify_client = None
+
+def shopify_fulfillment_enabled() -> bool:
+    """True when creds for outbound Shopify Admin API calls are configured."""
+    return bool(SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET and SHOPIFY_ADMIN_DOMAIN)
+
+def get_shopify_client():
+    """
+    Lazy-init outbound Shopify Admin API client. Returns None when creds are
+    missing — callers MUST handle that (the upload-tracking route does).
+    """
+    global _shopify_client
+    if not shopify_fulfillment_enabled():
+        return None
+    if _shopify_client is None:
+        from shopify_client import ShopifyClient
+        logger.info("[SHOPIFY] Initializing outbound client for shop=%s", SHOPIFY_ADMIN_DOMAIN)
+        _shopify_client = ShopifyClient(
+            shop_domain=SHOPIFY_ADMIN_DOMAIN,
+            client_id=SHOPIFY_CLIENT_ID,
+            client_secret=SHOPIFY_CLIENT_SECRET,
+        )
+    return _shopify_client
 
 # ─── Cratejoy config ───
 CRATEJOY_CLIENT_ID = os.getenv("CRATEJOY_CLIENT_ID", "")
@@ -758,6 +786,55 @@ def extract_quiz_data(note_attributes: list, line_items: list) -> dict:
     return quiz
 
 
+def _compute_order_type(db, customer_id: Optional[str]) -> str:
+    """
+    Decide 'new' vs 'renewal' for a decision AT INGEST — the single source of truth.
+
+    Uses the EXACT definition migration 016 backfilled with, so freshly-created
+    decisions are consistent with historical rows:
+        renewal  ⇔  customer has ≥1 REAL prior shipment (ship_date set AND before today)
+        new      ⇔  otherwise
+
+    Why this and not the per-order price/source signal or the Cratejoy event type:
+      - Draft shipments created at approve-time have ship_date = NULL, so the
+        `ship_date IS NOT NULL` filter EXCLUDES them. That is precisely why the
+        value no longer flips New→Renewal the moment staff approve a decision
+        (the original bug). The buggy page render counted ANY shipment row.
+      - Cratejoy webhooks can't distinguish a first subscription from a renewal
+        (both arrive as a `subscription` object), so event-type guessing would
+        mislabel first-time Cratejoy subscribers as 'renewal'. Shipment history
+        is unambiguous for both platforms.
+
+    Never raises — on any error returns 'new' (safe default) and logs it.
+    """
+    if not customer_id:
+        return "new"
+    try:
+        today_iso = date.today().isoformat()
+        res = (
+            db.table("shipments")
+            .select("id", count="exact")
+            .eq("customer_id", customer_id)
+            .not_.is_("ship_date", "null")
+            .lt("ship_date", today_iso)
+            .limit(1)
+            .execute()
+        )
+        prior = res.count or 0
+        order_type = "renewal" if prior > 0 else "new"
+        logger.info(
+            "[ORDER TYPE] customer=%s prior_real_shipments=%d → %s",
+            customer_id, prior, order_type,
+        )
+        return order_type
+    except Exception as e:
+        logger.warning(
+            "[ORDER TYPE] compute failed for customer=%s: %s — defaulting to 'new'",
+            customer_id, str(e),
+        )
+        return "new"
+
+
 def parse_due_date(due_date_str: str) -> Optional[date]:
     """Parse due date from various formats."""
     if not due_date_str:
@@ -1354,6 +1431,19 @@ async def shopify_order_webhook(request: Request):
         country = shipping.get("country_code", "US")
         logger.info(f"[SHOPIFY WEBHOOK] shipping_address present: {bool(shipping)}")
 
+        # Recipient name (may differ from account holder for gift orders)
+        ship_first_name = shipping.get("first_name") or first_name
+        ship_last_name = shipping.get("last_name") or last_name
+        # Buyer's billing address (for VeraCore Ordered By)
+        billing = payload.get("billing_address") or {}
+        billing_first_name = billing.get("first_name") or first_name
+        billing_last_name = billing.get("last_name") or last_name
+        billing_address1 = billing.get("address1", "")
+        billing_city = billing.get("city", "")
+        billing_state = billing.get("province", "")
+        billing_zip = billing.get("zip", "")
+        billing_country = billing.get("country_code", "US")
+
         # Extract quiz data using helper (handles q_due_date, q_size, q_expecting, etc.)
         line_items = payload.get("line_items", [])
         note_attributes = payload.get("note_attributes", [])
@@ -1477,9 +1567,19 @@ async def shopify_order_webhook(request: Request):
                     "platform": "shopify",
                     "trimester": trimester,
                     "ship_date": date.today().isoformat(),
+                    "order_type": _compute_order_type(db, cust_id),
+                    "ship_first_name": ship_first_name or None,
+                    "ship_last_name": ship_last_name or None,
+                    "billing_first_name": billing_first_name or None,
+                    "billing_last_name": billing_last_name or None,
+                    "billing_address1": billing_address1 or None,
+                    "billing_city": billing_city or None,
+                    "billing_state": billing_state or None,
+                    "billing_zip": billing_zip or None,
+                    "billing_country": billing_country or None,
                 }
                 db.table("decisions").insert(decision).execute()
-                logger.info(f"[SHOPIFY WEBHOOK] Saved decision: {kit_decision['decision_type']}, kit: {kit_decision.get('kit_sku', 'none')}")
+                logger.info(f"[SHOPIFY WEBHOOK] Saved decision: {kit_decision['decision_type']}, kit: {kit_decision.get('kit_sku', 'none')}, order_type={decision['order_type']}, ship_to={ship_first_name} {ship_last_name}, ordered_by={billing_first_name} {billing_last_name}")
 
                 # ─── Write to Google Sheets ───
                 write_decision_to_sheet({
@@ -2036,6 +2136,7 @@ async def cratejoy_order_webhook(request: Request):
                         "platform": "cratejoy",
                         "trimester": db_trimester if db_due_date else None,
                         "ship_date": date.today().isoformat(),
+                        "order_type": _compute_order_type(db, cust_id),
                     }
                     db.table("decisions").insert(cancel_decision).execute()
                     logger.info(f"[CRATEJOY WEBHOOK] Saved skipped decision for cancelled/expired subscription")
@@ -2069,6 +2170,7 @@ async def cratejoy_order_webhook(request: Request):
                         "platform": "cratejoy",
                         "trimester": None,
                         "ship_date": date.today().isoformat(),
+                        "order_type": _compute_order_type(db, cust_id),
                     }
                     db.table("decisions").insert(needs_data_decision).execute()
                     logger.info(f"[CRATEJOY WEBHOOK] Saved needs-data-entry decision — waiting for manual data entry")
@@ -2104,9 +2206,10 @@ async def cratejoy_order_webhook(request: Request):
                         "platform": "cratejoy",
                         "trimester": db_trimester,
                         "ship_date": date.today().isoformat(),
+                        "order_type": _compute_order_type(db, cust_id),
                     }
                     db.table("decisions").insert(decision).execute()
-                    logger.info(f"[CRATEJOY WEBHOOK] Saved decision: {kit_decision['decision_type']}, kit: {kit_decision.get('kit_sku', 'none')}")
+                    logger.info(f"[CRATEJOY WEBHOOK] Saved decision: {kit_decision['decision_type']}, kit: {kit_decision.get('kit_sku', 'none')}, order_type={decision['order_type']}")
 
                     # ─── Write to Google Sheets ───
                     write_decision_to_sheet({
@@ -2484,6 +2587,19 @@ async def replay_webhook(webhook_id: str):
             country = shipping.get("country_code", "US")
             logger.info(f"[WEBHOOK REPLAY] shipping_address present: {bool(shipping)}")
 
+            # Recipient name (may differ from account holder for gift orders)
+            ship_first_name = shipping.get("first_name") or first_name
+            ship_last_name = shipping.get("last_name") or last_name
+            # Buyer's billing address (for VeraCore Ordered By)
+            billing = payload.get("billing_address") or {}
+            billing_first_name = billing.get("first_name") or first_name
+            billing_last_name = billing.get("last_name") or last_name
+            billing_address1 = billing.get("address1", "")
+            billing_city = billing.get("city", "")
+            billing_state = billing.get("province", "")
+            billing_zip = billing.get("zip", "")
+            billing_country = billing.get("country_code", "US")
+
             line_items = payload.get("line_items", [])
             note_attributes = payload.get("note_attributes", [])
             quiz = extract_quiz_data(note_attributes, line_items)
@@ -2584,9 +2700,19 @@ async def replay_webhook(webhook_id: str):
                         "platform": "shopify",
                         "trimester": trimester,
                         "ship_date": date.today().isoformat(),
+                        "order_type": _compute_order_type(db, cust_id),
+                        "ship_first_name": ship_first_name or None,
+                        "ship_last_name": ship_last_name or None,
+                        "billing_first_name": billing_first_name or None,
+                        "billing_last_name": billing_last_name or None,
+                        "billing_address1": billing_address1 or None,
+                        "billing_city": billing_city or None,
+                        "billing_state": billing_state or None,
+                        "billing_zip": billing_zip or None,
+                        "billing_country": billing_country or None,
                     }
                     db.table("decisions").insert(decision).execute()
-                    logger.info(f"[WEBHOOK REPLAY] Saved Shopify decision")
+                    logger.info(f"[WEBHOOK REPLAY] Saved Shopify decision, order_type={decision['order_type']}, ship_to={ship_first_name} {ship_last_name}, ordered_by={billing_first_name} {billing_last_name}")
 
                     write_decision_to_sheet({
                         "date": date.today().isoformat(),
@@ -2871,6 +2997,7 @@ async def replay_webhook(webhook_id: str):
 
                 # Decision
                 if cust_id:
+                    _cj_order_type = _compute_order_type(db, cust_id)
                     if (is_cancelled and not is_prepaid) or is_expired:
                         db.table("decisions").insert({
                             "customer_id": cust_id, "kit_id": None, "kit_sku": None,
@@ -2878,6 +3005,7 @@ async def replay_webhook(webhook_id: str):
                             "reason": f"Subscription {sub_status_str} — no prepaid remaining",
                             "status": "rejected", "order_id": cj_order_id, "platform": "cratejoy",
                             "trimester": db_trimester, "ship_date": date.today().isoformat(),
+                            "order_type": _cj_order_type,
                         }).execute()
                         logger.info(f"[WEBHOOK REPLAY] Saved skipped decision for cancelled CJ sub")
                     elif not db_trimester:
@@ -2887,6 +3015,7 @@ async def replay_webhook(webhook_id: str):
                             "reason": "Missing quiz data — add due date & size manually, then re-curate",
                             "status": "pending", "order_id": cj_order_id, "platform": "cratejoy",
                             "trimester": None, "ship_date": date.today().isoformat(),
+                            "order_type": _cj_order_type,
                         }).execute()
                         logger.info(f"[WEBHOOK REPLAY] Saved needs-data-entry decision for CJ customer")
                     else:
@@ -2900,6 +3029,7 @@ async def replay_webhook(webhook_id: str):
                             "reason": kit_decision["reason"],
                             "status": "pending", "order_id": cj_order_id, "platform": "cratejoy",
                             "trimester": db_trimester, "ship_date": date.today().isoformat(),
+                            "order_type": _cj_order_type,
                         }).execute()
                         write_decision_to_sheet({
                             "date": date.today().isoformat(),
@@ -3465,17 +3595,21 @@ async def decisions_page(request: Request):
             ]
             logger.info(f"[DECISIONS PAGE] Text search '{q}' → {len(all_decisions)} decisions")
 
-        # Tag each decision with _order_type using shipment history (same logic as customers page)
+        # Tag each decision with _order_type — use stored column; shipment scan only for legacy NULLs
         if all_decisions:
-            decision_cids = list({d["customer_id"] for d in all_decisions if d.get("customer_id")})
-            customers_with_shipments: set = set()
-            for i in range(0, len(decision_cids), 200):
-                chunk = decision_cids[i:i + 200]
-                ship_rows = db.table("shipments").select("customer_id").in_("customer_id", chunk).execute()
-                for s in (ship_rows.data or []):
-                    customers_with_shipments.add(s["customer_id"])
+            legacy_cids = list({d["customer_id"] for d in all_decisions if d.get("customer_id") and not d.get("order_type")})
+            if legacy_cids:
+                legacy_with_shipments: set = set()
+                for i in range(0, len(legacy_cids), 200):
+                    chunk = legacy_cids[i:i + 200]
+                    ship_rows = db.table("shipments").select("customer_id").in_("customer_id", chunk).execute()
+                    for s in (ship_rows.data or []):
+                        legacy_with_shipments.add(s["customer_id"])
+                logger.info("[DECISIONS PAGE] legacy shipment fallback for %d customers without order_type", len(legacy_cids))
+            else:
+                legacy_with_shipments = set()
             for d in all_decisions:
-                d["_order_type"] = "renewal" if d.get("customer_id") in customers_with_shipments else "new"
+                d["_order_type"] = d.get("order_type") or ("renewal" if d.get("customer_id") in legacy_with_shipments else "new")
             if f_order_type == "new":
                 all_decisions = [d for d in all_decisions if d["_order_type"] == "new"]
                 logger.info("[DECISIONS PAGE] order_type=new filter → %d decisions", len(all_decisions))
@@ -4284,7 +4418,7 @@ async def view_curation_report(request: Request, run_id: str, msg: str = "", msg
         item_rows = []
         offset = 0
         while True:
-            batch = db.table("curation_run_items").select("*, items(name, sku, category, unit_cost)").eq("run_id", run_id).range(offset, offset + 999).execute()
+            batch = db.table("curation_run_items").select("*, items(name, sku, category, unit_cost, quantity_available, inventory_synced_at)").eq("run_id", run_id).range(offset, offset + 999).execute()
             item_rows.extend(batch.data or [])
             if len(batch.data or []) < 1000:
                 break
@@ -4348,6 +4482,8 @@ async def view_curation_report(request: Request, run_id: str, msg: str = "", msg
                         "group_size": ir["group_size"],
                         "blocked_pct": ir["blocked_pct"],
                         "risk_level": ir["risk_level"],
+                        "quantity_available": item_info.get("quantity_available") or 0,
+                        "inventory_synced_at": item_info.get("inventory_synced_at"),
                     }
                     if ir["risk_level"] in ("HIGH", "MEDIUM"):
                         tri_do_not_use.append(entry)
@@ -5582,9 +5718,25 @@ def set_app_setting(key: str, value: str) -> None:
     ).execute()
 
 
-def submit_to_veracore(decision_id: str) -> dict:
+def _make_batch_ref() -> str:
+    """
+    Build a per-approval-run batch tag for VeraCore's ReferenceNumber field.
+
+    Format: OBB-{MMDDYY}-{HHMM}  (e.g. 'OBB-061526-1422')
+    Mirrors the warehouse's Pirate Ship batch naming (e.g. 'WKE1 061526 SF') so staff can
+    sort/group a single approval run in VeraCore Order Inquiry's "Reference No." column.
+    One bulk-approve run shares one tag; a single approve gets its own (batch of one).
+    """
+    now = datetime.now()
+    return f"OBB-{now.strftime('%m%d%y')}-{now.strftime('%H%M')}"
+
+
+def submit_to_veracore(decision_id: str, batch_ref: Optional[str] = None) -> dict:
     """
     Push an approved decision to VeraCore as a warehouse order.
+
+    batch_ref: shared VeraCore ReferenceNumber tag for an approval run (groups orders in
+               Order Inquiry). When None (e.g. retry path), a fresh per-call tag is minted.
 
     Guarantees:
       - No-op when VERACORE_BASE_URL is empty → CSV fallback picks it up later.
@@ -5650,6 +5802,32 @@ def submit_to_veracore(decision_id: str) -> dict:
         return {"status": "noop", "order_id": None, "error": None}
 
     ship_to         = _build_ship_to_from_customer(customer)
+
+    # Override ship_to name with recipient's snapshot (gift orders have different first/last than account holder)
+    ship_first = d.get("ship_first_name") or customer.get("first_name", "") or ""
+    ship_last  = d.get("ship_last_name")  or customer.get("last_name", "")  or ""
+    ship_to["name"] = f"{ship_first} {ship_last}".strip() or customer.get("email", "")
+
+    # Build Ordered By from buyer's billing snapshot.
+    # None = self-purchase (Cratejoy or no billing data) → SOAP falls back to ship_to for both blocks.
+    ordered_by = None
+    if d.get("billing_first_name") or d.get("billing_address1"):
+        from veracore_client import normalize_country
+        ordered_by = {
+            "name":     f"{d.get('billing_first_name') or ''} {d.get('billing_last_name') or ''}".strip(),
+            "address1": d.get("billing_address1") or "",
+            "address2": "",
+            "city":     d.get("billing_city") or "",
+            "state":    d.get("billing_state") or "",
+            "zip":      d.get("billing_zip") or "",
+            "country":  normalize_country(d.get("billing_country") or "US"),
+            "phone":    customer.get("phone", "") or "",
+        }
+        logger.info(
+            "[VERACORE SUBMIT] gift/split order — ordered_by=%s ship_to=%s",
+            ordered_by["name"], ship_to["name"],
+        )
+
     is_intl         = ship_to["country"] != "US"
     shipping_method = get_app_setting("veracore_freight_service") or None
     offer_id        = kit.get("veracore_sku") or kit.get("sku")
@@ -5658,6 +5836,9 @@ def submit_to_veracore(decision_id: str) -> dict:
     if len(raw_order_id) > 20:
         logger.warning("[VERACORE SUBMIT] order_id truncated from %d chars: '%s' → '%s'",
                        len(raw_order_id), raw_order_id, order_public_id)
+    # Batch grouping (Issue #2): ReferenceNumber = shared run tag, PONumber = Shopify order #.
+    reference_number = batch_ref or _make_batch_ref()
+    po_number        = d.get("order_id") or ""   # real Shopify order # ("" for OBB- fallback)
     comments        = f"Kit {kit.get('sku','?')} | T{d.get('trimester','?')} | decision {decision_id[:8]}"
 
     logger.info(
@@ -5682,6 +5863,8 @@ def submit_to_veracore(decision_id: str) -> dict:
         "line_items":       [{"offer_id": offer_id, "quantity": 1}],
         "shipping_method":  shipping_method,
         "comments":         comments,
+        "reference_number": reference_number,
+        "po_number":        po_number,
         "is_international": is_intl,
     }
 
@@ -5693,6 +5876,9 @@ def submit_to_veracore(decision_id: str) -> dict:
             shipping_method=shipping_method,
             comments=comments,
             customs=build_customs(kit) if is_intl else None,
+            reference_number=reference_number,
+            po_number=po_number,
+            ordered_by=ordered_by,
         )
         internal_id = resp.get("veracore_internal_id") or order_public_id
         db.table("decisions").update({
@@ -6033,7 +6219,7 @@ async def veracore_sync_inventory_now(request: Request):
         from veracore_sync import run_inventory_sync
         r = await asyncio.get_running_loop().run_in_executor(None, run_inventory_sync, db, vc)
         await log_activity("veracore",
-                           f"Manual inventory sync: synced={r['synced']} skipped={r['skipped']} alerts={r['alerts_raised']}",
+                           f"Manual inventory sync: kits={r['synced']} items={r.get('items_synced', 0)} skipped={r['skipped']} alerts={r['alerts_raised']}",
                            (r.get("error") or "")[:200],
                            "error" if r.get("error") else "success")
         if r.get("error"):
@@ -6534,6 +6720,9 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
             return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=No+decisions+selected&msg_type=error", status_code=303)
 
         success = failed = skipped = 0
+        # Issue #2 — one shared VeraCore ReferenceNumber tag for this whole approval run,
+        # so warehouse can group/sort the batch in Order Inquiry.
+        bulk_batch_ref = _make_batch_ref()
 
         # Issue 10 — bulk-fetch all decisions in ONE query instead of one per id
         all_decisions_result = (
@@ -6611,8 +6800,9 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                         reason_prefix="Bulk-approved",
                     )
                     # Phase 3 — Push to VeraCore in background (matches single-approve flow).
-                    logger.info("[BULK ACTION] Queuing VeraCore push for %s (background)", did[:8])
-                    background_tasks.add_task(submit_to_veracore, did)
+                    # Pass the shared batch tag so this run groups under one ReferenceNumber.
+                    logger.info("[BULK ACTION] Queuing VeraCore push for %s (background, batch=%s)", did[:8], bulk_batch_ref)
+                    background_tasks.add_task(submit_to_veracore, did, bulk_batch_ref)
                     success += 1
 
                 elif action == "ship":
@@ -6777,6 +6967,143 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
 
 
 # ═══════════════════════════════════════════════════════════
+# SHOPIFY FULFILLMENT WRITE-BACK (Issue #1 — tracking → Shopify)
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/decisions/upload-tracking")
+async def upload_tracking(request: Request):
+    """
+    Push Pirate Ship tracking back to Shopify so processed orders flip to "Fulfilled"
+    and customers get their tracking email.
+
+    Accepts the Pirate Ship "Export Tracking Data" CSV as multipart form field 'file'.
+    For each row: resolve the Shopify order (by order number, else by email), then create
+    a fulfillment with the tracking number via the Admin API.
+
+    Idempotent / retry-safe: an order with no open fulfillment orders is already fulfilled
+    and is counted as 'already' (no duplicate fulfillment). Returns a JSON summary.
+    """
+    try:
+        sc = get_shopify_client()
+        if sc is None:
+            logger.warning("[UPLOAD TRACKING] Shopify outbound not configured — aborting")
+            return JSONResponse(
+                {"error": "Shopify fulfillment not configured — set SHOPIFY_CLIENT_ID, "
+                          "SHOPIFY_CLIENT_SECRET, SHOPIFY_ADMIN_DOMAIN"},
+                status_code=400,
+            )
+
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            return JSONResponse({"error": "No file uploaded (multipart form field 'file')"}, status_code=400)
+        notify = (form.get("notify", "1").strip() != "0")  # default: email the customer
+
+        raw = await upload.read()
+        filename = (getattr(upload, "filename", "") or "").lower()
+        # Pirate Ship "Export Tracking Data" is .xlsx natively; also accept hand-saved .csv.
+        is_xlsx = filename.endswith(".xlsx") or raw[:2] == b"PK"  # xlsx is a ZIP (starts with PK)
+
+        if is_xlsx:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            ws = wb.active
+            sheet_rows = list(ws.iter_rows(values_only=True))
+            wb.close()
+            if not sheet_rows:
+                return JSONResponse({"error": "Empty spreadsheet"}, status_code=400)
+            headers = [str(h).strip() if h is not None else "" for h in sheet_rows[0]]
+            records = [
+                {headers[i]: ("" if v is None else str(v)) for i, v in enumerate(r) if i < len(headers)}
+                for r in sheet_rows[1:]
+            ]
+            logger.info("[UPLOAD TRACKING] XLSX parsed — headers=%s rows=%d notify=%s",
+                        headers, len(records), notify)
+        else:
+            text = raw.decode("utf-8-sig", errors="replace")
+            reader = csv.DictReader(io.StringIO(text))
+            headers = reader.fieldnames or []
+            records = list(reader)
+            logger.info("[UPLOAD TRACKING] CSV parsed — headers=%s rows=%d notify=%s",
+                        headers, len(records), notify)
+
+        def find_col(cands: list[str]):
+            for h in headers:
+                hl = (h or "").strip().lower()
+                for c in cands:
+                    if c in hl:
+                        return h
+            return None
+
+        col_track   = find_col(["tracking number", "tracking_no", "tracking #", "tracking"])
+        col_order   = find_col(["order number", "order id", "order #", "order_no", "order", "reference"])
+        col_carrier = find_col(["carrier", "service", "provider"])
+        col_email   = find_col(["email", "e-mail"])
+        col_url     = find_col(["tracking url", "tracking link", "url"])
+        logger.info("[UPLOAD TRACKING] columns mapped — track=%s order=%s carrier=%s email=%s url=%s",
+                    col_track, col_order, col_carrier, col_email, col_url)
+        if not col_track:
+            return JSONResponse(
+                {"error": f"No tracking-number column found. Headers seen: {headers}"},
+                status_code=400,
+            )
+
+        from shopify_client import normalize_carrier
+        summary = {"rows": 0, "fulfilled": 0, "already": 0, "failed": 0, "unmatched": 0}
+        details: list[dict] = []
+
+        for row in records:
+            summary["rows"] += 1
+            tracking = (row.get(col_track) or "").strip()
+            order_ref = (row.get(col_order) or "").strip() if col_order else ""
+            email     = (row.get(col_email) or "").strip() if col_email else ""
+            carrier   = normalize_carrier(row.get(col_carrier)) if col_carrier else None
+            url       = (row.get(col_url) or "").strip() if col_url else ""
+            label     = order_ref or email or f"row{summary['rows']}"
+
+            if not tracking:
+                summary["unmatched"] += 1
+                details.append({"ref": label, "status": "skipped", "reason": "no tracking number"})
+                continue
+
+            # Resolve Shopify order id: numeric ref → direct; name → lookup; else email lookup.
+            order_id = None
+            try:
+                if order_ref:
+                    order_id = order_ref if order_ref.isdigit() else sc.find_order_id_by_name(order_ref)
+                if not order_id and email:
+                    order_id = sc.find_order_id_by_email(email)
+            except Exception as e:
+                logger.warning("[UPLOAD TRACKING] order resolve failed for %s: %s", label, e)
+
+            if not order_id:
+                summary["unmatched"] += 1
+                details.append({"ref": label, "tracking": tracking, "status": "unmatched",
+                                "reason": "no Shopify order found"})
+                continue
+
+            res = sc.fulfill_order(order_id, tracking_number=tracking, carrier=carrier,
+                                   tracking_url=url or None, notify_customer=notify)
+            st = res.get("status")
+            summary[st if st in ("fulfilled", "already") else "failed"] += 1
+            details.append({"ref": label, "order_id": order_id, "tracking": tracking,
+                            "status": st, "error": res.get("error")})
+
+        logger.info("[UPLOAD TRACKING] done — %s", summary)
+        await log_activity(
+            "fulfillment",
+            f"Shopify tracking upload: {summary['fulfilled']} fulfilled, "
+            f"{summary['already']} already, {summary['failed']} failed, {summary['unmatched']} unmatched",
+            f"rows={summary['rows']}",
+            "success" if summary["failed"] == 0 else "warning",
+        )
+        return JSONResponse({"summary": summary, "details": details})
+    except Exception as e:
+        logger.error("[UPLOAD TRACKING] fatal error: %s", e, exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ═══════════════════════════════════════════════════════════
 # PIRATE SHIP CSV EXPORT + GOOGLE SHEET EXPORT
 # ═══════════════════════════════════════════════════════════
 
@@ -6832,19 +7159,24 @@ async def export_decisions_csv(request: Request):
                 break
             offset += PAGE_SIZE
 
-        # Python-side new/renewal filter from shipment history (same logic as decisions page)
+        # Python-side new/renewal filter — use stored order_type; shipment scan only for legacy NULLs
         if f_order_type and rows:
-            export_cids = list({d["customer_id"] for d in rows if d.get("customer_id")})
-            cids_with_shipments: set = set()
-            for i in range(0, len(export_cids), 200):
-                chunk = export_cids[i:i + 200]
-                ship_rows = db.table("shipments").select("customer_id").in_("customer_id", chunk).execute()
-                for s in (ship_rows.data or []):
-                    cids_with_shipments.add(s["customer_id"])
+            legacy_export_cids = list({d["customer_id"] for d in rows if d.get("customer_id") and not d.get("order_type")})
+            if legacy_export_cids:
+                export_cids_with_shipments: set = set()
+                for i in range(0, len(legacy_export_cids), 200):
+                    chunk = legacy_export_cids[i:i + 200]
+                    ship_rows = db.table("shipments").select("customer_id").in_("customer_id", chunk).execute()
+                    for s in (ship_rows.data or []):
+                        export_cids_with_shipments.add(s["customer_id"])
+            else:
+                export_cids_with_shipments = set()
+            def _export_order_type(d):
+                return d.get("order_type") or ("renewal" if d.get("customer_id") in export_cids_with_shipments else "new")
             if f_order_type == "new":
-                rows = [d for d in rows if d.get("customer_id") not in cids_with_shipments]
+                rows = [d for d in rows if _export_order_type(d) == "new"]
             elif f_order_type == "renewal":
-                rows = [d for d in rows if d.get("customer_id") in cids_with_shipments]
+                rows = [d for d in rows if _export_order_type(d) == "renewal"]
             logger.info("[EXPORT CSV] order_type=%s filter → %d decisions", f_order_type, len(rows))
 
         logger.info(f"[EXPORT CSV] Exporting {len(rows)} decisions (status={f_status})")
