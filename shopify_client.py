@@ -157,12 +157,18 @@ class ShopifyClient:
         return nodes[0]["id"].rsplit("/", 1)[-1] if nodes else None
 
     def find_order_id_by_email(self, email: str) -> Optional[str]:
-        """Resolve the most recent *unfulfilled* order for an email -> numeric id."""
+        """
+        Resolve the most recent not-yet-fully-fulfilled order for an email -> numeric id.
+        Includes UNFULFILLED and PARTIALLY_FULFILLED — both have open fulfillment orders.
+        FULFILLED orders are skipped; downstream get_open_fulfillment_orders handles the rest.
+        """
         q = ("query($q:String!){orders(first:5,query:$q,sortKey:CREATED_AT,reverse:true)"
              "{nodes{id name displayFulfillmentStatus}}}")
-        qstr = f"email:{email} fulfillment_status:unfulfilled"
-        nodes = (self._graphql(q, {"q": qstr}).get("orders") or {}).get("nodes") or []
-        return nodes[0]["id"].rsplit("/", 1)[-1] if nodes else None
+        nodes = (self._graphql(q, {"q": f"email:{email}"}).get("orders") or {}).get("nodes") or []
+        for node in nodes:
+            if node.get("displayFulfillmentStatus") != "FULFILLED":
+                return node["id"].rsplit("/", 1)[-1]
+        return None
 
     # ─────────────────────────────────────────────────────────
     # Fulfillment
