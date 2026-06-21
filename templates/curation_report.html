@@ -205,6 +205,15 @@
     {% endfor %}
 </div>
 
+<!-- ── Min Stock Filter ── -->
+<div style="display: flex; align-items: center; gap: 12px; margin-bottom: 16px; padding: 12px 16px; background: var(--surface2); border-radius: 8px; border: 1px solid var(--border);">
+    <label style="font-size: 0.9em; color: var(--text-dim); white-space: nowrap;">Min Stock for CAN USE:</label>
+    <input type="number" id="minStockInput" min="0" value="0" placeholder="e.g. 100"
+        style="width: 100px; background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 6px; font-size: 0.9em;"
+        oninput="applyStockFilter()">
+    <span id="minStockLabel" style="font-size: 0.85em; color: var(--text-dim);"></span>
+</div>
+
 <!-- ── Trimester Tabs ── -->
 <div style="display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">
     {% for tri in [1, 2, 3, 4] %}
@@ -276,6 +285,7 @@
                     <th>Category</th>
                     <th>Blocked By</th>
                     <th>Blocked %</th>
+                    <th>Stock</th>
                     <th>Risk</th>
                 </tr>
             </thead>
@@ -291,6 +301,9 @@
                             style="color: {% if item.blocked_pct >= 60 %}var(--red){% else %}var(--yellow){% endif %};">
                             {{ item.blocked_pct }}%
                         </strong>
+                    </td>
+                    <td style="text-align: right; font-variant-numeric: tabular-nums;">
+                        {% if item.inventory_synced_at %}{{ item.quantity_available }}{% else %}<span style="color: var(--text-dim);">—</span>{% endif %}
                     </td>
                     <td>
                         {% if item.risk_level == 'HIGH' %}
@@ -325,17 +338,21 @@
                     <th>Category</th>
                     <th>Cost</th>
                     <th>Blocked %</th>
+                    <th>Stock</th>
                     <th>Safety</th>
                 </tr>
             </thead>
             <tbody>
                 {% for item in tr.can_use %}
-                <tr>
+                <tr class="can-use-row" data-stock="{{ item.quantity_available or 0 }}">
                     <td><strong>{{ item.name }}</strong></td>
                     <td style="color: var(--text-dim); font-size: 0.9em;">{{ item.sku }}</td>
                     <td>{{ item.category or '—' }}</td>
                     <td>{% if item.unit_cost %}${{ "%.2f" | format(item.unit_cost) }}{% else %}—{% endif %}</td>
                     <td>{{ item.blocked_pct }}%</td>
+                    <td style="text-align: right; font-variant-numeric: tabular-nums;">
+                        {% if item.inventory_synced_at %}{{ item.quantity_available }}{% else %}<span style="color: var(--text-dim);">—</span>{% endif %}
+                    </td>
                     <td><span class="badge badge-green">LOW</span></td>
                 </tr>
                 {% endfor %}
@@ -552,6 +569,20 @@
 {% endif %}
 
 <script>
+    function applyStockFilter() {
+        const min = parseInt(document.getElementById('minStockInput').value) || 0;
+        const rows = document.querySelectorAll('.can-use-row');
+        let hidden = 0;
+        rows.forEach(row => {
+            const stock = parseInt(row.dataset.stock) || 0;
+            const show = min === 0 || stock >= min;
+            row.style.display = show ? '' : 'none';
+            if (!show) hidden++;
+        });
+        const label = document.getElementById('minStockLabel');
+        label.textContent = min > 0 ? `Hiding ${hidden} item(s) with stock < ${min}` : '';
+    }
+
     function switchTrimester(tri) {
         // Hide all panels
         document.querySelectorAll('.trimester-panel').forEach(p => p.style.display = 'none');

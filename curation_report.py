@@ -474,6 +474,8 @@ def generate_item_risk_report(
             "unit_cost": item.get("unit_cost"),
             "category": item.get("category"),
             "is_expired": is_expired,
+            "quantity_available": item.get("quantity_available") or 0,
+            "inventory_synced_at": item.get("inventory_synced_at"),
         }
 
         if risk in ("HIGH", "MEDIUM"):

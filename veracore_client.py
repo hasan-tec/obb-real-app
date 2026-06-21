@@ -409,6 +409,9 @@ class VeraCoreClient:
         line_items: list[dict],
         shipping_method: str,
         comments: str,
+        reference_number: str = "",
+        po_number: str = "",
+        ordered_by: Optional[dict] = None,
     ) -> str:
         """
         Return a SOAP 1.1 envelope for AddOrder, matching the actual WSDL schema.
@@ -418,8 +421,14 @@ class VeraCoreClient:
           FirstName, LastName, Address1, Address2, City, State, PostalCode, Country, Phone, Email
         - Offers is a direct child of <order>, NOT nested inside ShipTo
         - Shipping carrier/service goes in <Shipping><FreightCarrier><Name> + <FreightService><Description>
-        - Flag=OrderedBy on OrderShipTo means "ship to same address as OrderedBy"
+        - OrderShipTo: full address block (same fields as OrderedBy); Flag=OrderedBy is NOT used — emitting the real address avoids VeraCore printing "SAME AS ORDERED BY" in Ship To column
         - AuthenticationHeader and AddOrder use xmlns="http://sma-promail/" default namespace (no prefix)
+        - OrderHeader sequence (confirmed WSDL OrderHeader + official AddOrder PDF p.7):
+          ID -> EntryDate -> OrderEntryView -> ReferenceNumber -> PONumber -> Comments.
+          ReferenceNumber populates VeraCore's "Reference No." column (used as the batch
+          tag so warehouse can group/sort an approval run); PONumber surfaces the Shopify
+          order number in the "Purchase Order No." column. Both are optional (minOccurs=0)
+          and MUST appear before <Comments> to satisfy the schema sequence.
         """
 
         def e(v) -> str:
@@ -429,6 +438,14 @@ class VeraCoreClient:
         name_parts = (ship_to.get("name") or "").strip().split(" ", 1)
         first_name = name_parts[0]
         last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+        # OrderedBy = buyer (purchaser). Falls back to ship_to for self-purchases.
+        ob = ordered_by or ship_to
+        ob_name_parts = (ob.get("name") or "").strip().split(" ", 1)
+        ob_first = ob_name_parts[0]
+        ob_last = ob_name_parts[1] if len(ob_name_parts) > 1 else ""
+        ob_addr2_xml = f"<Address2>{e(ob['address2'])}</Address2>" if ob.get("address2") else ""
+        ob_phone_xml = f"<Phone>{e(ob['phone'])}</Phone>" if ob.get("phone") else ""
 
         # FreightService is optional — OBB uses Pirate Ship so VeraCore doesn't need to ship.
         # Only include Shipping block if shipping_method is provided.
@@ -457,6 +474,9 @@ class VeraCoreClient:
 
         addr2_xml = f"<Address2>{e(ship_to['address2'])}</Address2>" if ship_to.get("address2") else ""
         phone_xml = f"<Phone>{e(ship_to['phone'])}</Phone>" if ship_to.get("phone") else ""
+        # OrderHeader fields — sequence order matters: ReferenceNumber + PONumber BEFORE Comments.
+        reference_xml = f"<ReferenceNumber>{e(reference_number)}</ReferenceNumber>" if reference_number else ""
+        ponumber_xml = f"<PONumber>{e(po_number)}</PONumber>" if po_number else ""
         comments_xml = f"<Comments>{e(comments)}</Comments>" if comments else ""
         freight_service_xml = f"<FreightService><Description>{e(service)}</Description></FreightService>" if service else ""
         shipping_xml = f"""<Shipping>
@@ -479,24 +499,34 @@ class VeraCoreClient:
       <order>
         <Header>
           <ID>{e(order_id)}</ID>
+          {reference_xml}
+          {ponumber_xml}
           {comments_xml}
         </Header>
         {shipping_xml}
         <OrderedBy>
-          <FirstName>{e(first_name)}</FirstName>
-          <LastName>{e(last_name)}</LastName>
-          <Address1>{e(ship_to.get("address1"))}</Address1>
-          {addr2_xml}
-          <City>{e(ship_to.get("city"))}</City>
-          <State>{e(ship_to.get("state"))}</State>
-          <PostalCode>{e(ship_to.get("zip"))}</PostalCode>
-          <Country>{e(ship_to.get("country", "US"))}</Country>
-          {phone_xml}
+          <FirstName>{e(ob_first)}</FirstName>
+          <LastName>{e(ob_last)}</LastName>
+          <Address1>{e(ob.get("address1"))}</Address1>
+          {ob_addr2_xml}
+          <City>{e(ob.get("city"))}</City>
+          <State>{e(ob.get("state"))}</State>
+          <PostalCode>{e(ob.get("zip"))}</PostalCode>
+          <Country>{e(ob.get("country", "US"))}</Country>
+          {ob_phone_xml}
         </OrderedBy>
         <ShipTo>
           <OrderShipTo>
             <Key>0</Key>
-            <Flag>OrderedBy</Flag>
+            <FirstName>{e(first_name)}</FirstName>
+            <LastName>{e(last_name)}</LastName>
+            <Address1>{e(ship_to.get("address1"))}</Address1>
+            {addr2_xml}
+            <City>{e(ship_to.get("city"))}</City>
+            <State>{e(ship_to.get("state"))}</State>
+            <PostalCode>{e(ship_to.get("zip"))}</PostalCode>
+            <Country>{e(ship_to.get("country", "US"))}</Country>
+            {phone_xml}
           </OrderShipTo>
         </ShipTo>
         <Offers>{offers_xml}
@@ -591,6 +621,9 @@ class VeraCoreClient:
         shipping_method: str,
         comments: str = "",
         customs: Optional[dict] = None,
+        reference_number: str = "",
+        po_number: str = "",
+        ordered_by: Optional[dict] = None,
     ) -> dict:
         """
         Submit a new customer order to VeraCore via SOAP AddOrder web service.
@@ -622,12 +655,15 @@ class VeraCoreClient:
             )
 
         logger.info(
-            "[VERACORE] add_order SOAP OrderID=%s ship_to=%s items=%d soap_url=%s",
-            order_id, ship_to.get("name", "?"), len(line_items), self.soap_url,
+            "[VERACORE] add_order SOAP OrderID=%s ship_to=%s items=%d ref=%s po=%s soap_url=%s",
+            order_id, ship_to.get("name", "?"), len(line_items),
+            reference_number or "(none)", po_number or "(none)", self.soap_url,
         )
 
         xml_body = self._build_soap_add_order_xml(
-            order_id, ship_to, line_items, shipping_method, comments
+            order_id, ship_to, line_items, shipping_method, comments,
+            reference_number=reference_number, po_number=po_number,
+            ordered_by=ordered_by,
         )
         response_text = self._soap_request(xml_body, _SOAP_ACTION_ADD_ORDER)
         logger.debug("[VERACORE] add_order raw SOAP response: %s", response_text[:1000])

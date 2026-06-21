@@ -73,6 +73,7 @@
                     <th>Cost</th>
                     <th>Source</th>
                     <th>Expiry</th>
+                    <th style="text-align: right;">Stock</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -94,6 +95,9 @@
                         {% if i.expiry_date %}
                         <span style="{% if i.expiry_date < today_str %}color: var(--red); font-weight: 600;{% endif %}">{{ i.expiry_date }}</span>
                         {% else %}—{% endif %}
+                    </td>
+                    <td style="text-align: right; font-variant-numeric: tabular-nums;">
+                        {% if i.inventory_synced_at %}{{ i.quantity_available }}{% else %}<span style="color: var(--text-dim);">—</span>{% endif %}
                     </td>
                     <td style="white-space: nowrap;">
                         <button type="button" class="btn btn-sm btn-secondary"
