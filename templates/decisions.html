@@ -432,13 +432,15 @@
                 ];
                 if (data.details && data.details.length) {
                     lines.push('<table style="width:100%;border-collapse:collapse;font-size:12px;">');
-                    lines.push('<tr style="border-bottom:1px solid var(--border);"><th style="text-align:left;padding:4px 6px;">Order</th><th style="text-align:left;padding:4px 6px;">Tracking</th><th style="text-align:left;padding:4px 6px;">Status</th><th style="text-align:left;padding:4px 6px;">Note</th></tr>');
+                    lines.push('<tr style="border-bottom:1px solid var(--border);"><th style="text-align:left;padding:4px 6px;">Order</th><th style="text-align:left;padding:4px 6px;">Tracking</th><th style="text-align:left;padding:4px 6px;">Status</th><th style="text-align:left;padding:4px 6px;">Platform</th><th style="text-align:left;padding:4px 6px;">Note</th></tr>');
                     data.details.forEach(function(row) {
                         var color = row.status === 'fulfilled' ? '#16a34a' : row.status === 'already' ? 'var(--text-dim)' : '#dc2626';
+                        var platColor = row.platform === 'cratejoy' ? '#7c3aed' : 'var(--text-dim)';
                         lines.push('<tr style="border-bottom:1px solid var(--border);">');
                         lines.push('<td style="padding:4px 6px;">' + (row.order_ref || row.order_id || '—') + '</td>');
                         lines.push('<td style="padding:4px 6px;">' + (row.tracking || '—') + '</td>');
                         lines.push('<td style="padding:4px 6px;color:' + color + ';">' + (row.status || '—') + '</td>');
+                        lines.push('<td style="padding:4px 6px;color:' + platColor + ';font-weight:500;">' + (row.platform || '—') + '</td>');
                         lines.push('<td style="padding:4px 6px;color:var(--text-dim);">' + (row.error || '') + '</td>');
                         lines.push('</tr>');
                     });

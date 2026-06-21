@@ -98,6 +98,25 @@ def get_shopify_client():
 CRATEJOY_CLIENT_ID = os.getenv("CRATEJOY_CLIENT_ID", "")
 CRATEJOY_CLIENT_SECRET = os.getenv("CRATEJOY_CLIENT_SECRET", "")
 
+_cratejoy_client = None
+
+def get_cratejoy_client():
+    """
+    Lazy-init outbound Cratejoy Merchant API client. Returns None when creds are
+    missing — callers MUST handle that (the upload-tracking route does).
+    """
+    global _cratejoy_client
+    if not (CRATEJOY_CLIENT_ID and CRATEJOY_CLIENT_SECRET):
+        return None
+    if _cratejoy_client is None:
+        from cratejoy_client import CratejoyClient
+        logger.info("[CRATEJOY] Initializing outbound client")
+        _cratejoy_client = CratejoyClient(
+            client_id=CRATEJOY_CLIENT_ID,
+            client_secret=CRATEJOY_CLIENT_SECRET,
+        )
+    return _cratejoy_client
+
 # ─── VeraCore config (Phase 3 — fulfillment push) ───
 # When VERACORE_BASE_URL is empty/unset, all VeraCore calls become no-ops and
 # the app routes approved decisions to the CSV fallback instead.  This is how
@@ -7049,6 +7068,7 @@ async def upload_tracking(request: Request):
             )
 
         from shopify_client import normalize_carrier
+        cj = get_cratejoy_client()
         summary = {"rows": 0, "fulfilled": 0, "already": 0, "failed": 0, "unmatched": 0}
         details: list[dict] = []
 
@@ -7074,12 +7094,22 @@ async def upload_tracking(request: Request):
                 if not order_id and email:
                     order_id = sc.find_order_id_by_email(email)
             except Exception as e:
-                logger.warning("[UPLOAD TRACKING] order resolve failed for %s: %s", label, e)
+                logger.warning("[UPLOAD TRACKING] Shopify order resolve failed for %s: %s", label, e)
 
             if not order_id:
-                summary["unmatched"] += 1
-                details.append({"ref": label, "tracking": tracking, "status": "unmatched",
-                                "reason": "no Shopify order found"})
+                # Not a Shopify order — try Cratejoy fallback (email required)
+                if cj and email:
+                    logger.info("[UPLOAD TRACKING] Shopify unmatched for %s — trying Cratejoy", label)
+                    cj_res = cj.mark_tracking_by_email(email, tracking, carrier=carrier,
+                                                       tracking_url=url or None)
+                    cj_st = cj_res.get("status")
+                    summary[cj_st if cj_st in ("fulfilled", "already") else "failed"] += 1
+                    details.append({"ref": label, "tracking": tracking, "status": cj_st,
+                                    "platform": "cratejoy", "error": cj_res.get("error")})
+                else:
+                    summary["unmatched"] += 1
+                    details.append({"ref": label, "tracking": tracking, "status": "unmatched",
+                                    "platform": "shopify", "reason": "no Shopify order found"})
                 continue
 
             res = sc.fulfill_order(order_id, tracking_number=tracking, carrier=carrier,
@@ -7087,7 +7117,7 @@ async def upload_tracking(request: Request):
             st = res.get("status")
             summary[st if st in ("fulfilled", "already") else "failed"] += 1
             details.append({"ref": label, "order_id": order_id, "tracking": tracking,
-                            "status": st, "error": res.get("error")})
+                            "status": st, "platform": "shopify", "error": res.get("error")})
 
         logger.info("[UPLOAD TRACKING] done — %s", summary)
         await log_activity(
