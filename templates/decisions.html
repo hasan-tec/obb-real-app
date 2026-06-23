@@ -175,6 +175,9 @@
             {# decision_ids injected dynamically by submitBulk() #}
         </form>
         {% if request.state.user_role == 'admin' %}
+        <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;color:var(--text);" title="When checked, Ship To = Ordered By (billing) address in VeraCore">
+            <input type="checkbox" id="shipToOBCheckbox" style="cursor:pointer;"> Ship To: OB
+        </label>
         <button onclick="submitBulk('approve')" class="btn btn-sm btn-primary">✓ Approve Selected</button>
         <button onclick="submitBulk('ship')" class="btn btn-sm btn-secondary">📦 Ship Selected</button>
         <button onclick="submitBulk('reject')" class="btn btn-sm"
@@ -308,8 +311,14 @@
                         {% if d.status == 'pending' %}
                         {% if d.kit_sku %}
                         <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
-                            <button type="submit" class="btn btn-sm btn-primary" title="Approve → VeraCore"
+                            <button type="submit" class="btn btn-sm btn-primary" title="Approve → VeraCore (ship to customer address)"
                                 onclick="return confirm('Approve and push to VeraCore?')">✓ VC</button>
+                        </form>
+                        <form method="POST" action="/decisions/{{ d.id }}/approve?ship_to_ordered_by=1" style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-primary"
+                                style="background:var(--purple,#7c3aed);border-color:var(--purple,#7c3aed);"
+                                title="Approve → VeraCore (Ship To = Ordered By / billing address)"
+                                onclick="return confirm('Approve → VeraCore with Ship To = Ordered By (billing address)?')">✓ OB</button>
                         </form>
                         <form method="POST" action="/decisions/{{ d.id }}/approve?via=pirateship"
                             style="display:inline;">
@@ -387,6 +396,7 @@
         var form = document.getElementById('bulkForm');
         form.querySelector('[name=action]').value = action;
         form.querySelectorAll('[name=decision_ids]').forEach(function (el) { el.remove(); });
+        form.querySelectorAll('[name=ship_to_ordered_by]').forEach(function (el) { el.remove(); });
         var checked = document.querySelectorAll('.decision-checkbox:checked');
         if (checked.length === 0) { alert('No decisions selected.'); return; }
         checked.forEach(function (cb) {
@@ -396,6 +406,16 @@
             inp.value = cb.value;
             form.appendChild(inp);
         });
+        if (action === 'approve') {
+            var obCheckbox = document.getElementById('shipToOBCheckbox');
+            if (obCheckbox && obCheckbox.checked) {
+                var obInp = document.createElement('input');
+                obInp.type = 'hidden';
+                obInp.name = 'ship_to_ordered_by';
+                obInp.value = '1';
+                form.appendChild(obInp);
+            }
+        }
         form.submit();
     }
 

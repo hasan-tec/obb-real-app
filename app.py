@@ -5750,12 +5750,15 @@ def _make_batch_ref() -> str:
     return f"OBB-{now.strftime('%m%d%y')}-{now.strftime('%H%M')}"
 
 
-def submit_to_veracore(decision_id: str, batch_ref: Optional[str] = None) -> dict:
+def submit_to_veracore(decision_id: str, batch_ref: Optional[str] = None,
+                       ship_to_ordered_by: bool = False) -> dict:
     """
     Push an approved decision to VeraCore as a warehouse order.
 
     batch_ref: shared VeraCore ReferenceNumber tag for an approval run (groups orders in
                Order Inquiry). When None (e.g. retry path), a fresh per-call tag is minted.
+    ship_to_ordered_by: when True, overrides ship_to with the ordered_by (billing) address —
+               used for renewals where the subscriber receives their own box.
 
     Guarantees:
       - No-op when VERACORE_BASE_URL is empty → CSV fallback picks it up later.
@@ -5846,6 +5849,15 @@ def submit_to_veracore(decision_id: str, batch_ref: Optional[str] = None) -> dic
             "[VERACORE SUBMIT] gift/split order — ordered_by=%s ship_to=%s",
             ordered_by["name"], ship_to["name"],
         )
+
+    # "Ship To Ordered By" mode: override ship_to with billing/purchaser address.
+    # Used for renewals where the subscriber receives their own box.
+    if ship_to_ordered_by:
+        if ordered_by:
+            ship_to = dict(ordered_by)
+            logger.info("[VERACORE SUBMIT] ship_to_ordered_by=True — ship_to overridden with ordered_by=%s", ordered_by["name"])
+        else:
+            logger.warning("[VERACORE SUBMIT] ship_to_ordered_by=True but no billing data — using customer address unchanged")
 
     is_intl         = ship_to["country"] != "US"
     shipping_method = get_app_setting("veracore_freight_service") or None
@@ -6020,7 +6032,10 @@ async def approve_decision(request: Request, decision_id: str, background_tasks:
         # Staff can explicitly route to Pirate Ship CSV by adding ?via=pirateship
         # to the approve URL — in that case we skip VC and mark status='manual'
         # so the CSV export picks it up and the VeraCore column shows it clearly.
+        # ?ship_to_ordered_by=1 tells VeraCore to ship to the purchaser's billing address
+        # (used for renewals where subscriber receives their own box).
         via = (request.query_params.get("via") or "").lower()
+        ship_to_ob = (request.query_params.get("ship_to_ordered_by") == "1")
         if via == "pirateship":
             try:
                 db.table("decisions").update({
@@ -6038,8 +6053,8 @@ async def approve_decision(request: Request, decision_id: str, background_tasks:
             # Run VC push in background so Heroku 30s request timeout is never hit.
             # submit_to_veracore is idempotent and writes veracore_sync_log on both
             # success and failure — staff can see result in the VeraCore dashboard.
-            logger.info("[APPROVE] Queuing VeraCore push for decision=%s (background)", decision_id)
-            background_tasks.add_task(submit_to_veracore, decision_id)
+            logger.info("[APPROVE] Queuing VeraCore push for decision=%s (background, ship_to_ob=%s)", decision_id, ship_to_ob)
+            background_tasks.add_task(submit_to_veracore, decision_id, None, ship_to_ob)
     except Exception as e:
         logger.error(f"[APPROVE] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to approve decision: {e}", "", "error")
@@ -6727,7 +6742,8 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
         action      = form.get("action", "").strip()
         decision_ids = form.getlist("decision_ids")
         redirect_qs = form.get("redirect_qs", "")
-        logger.info(f"[BULK ACTION] action={action}, count={len(decision_ids)}, ids={decision_ids[:5]}")
+        ship_to_ob  = (form.get("ship_to_ordered_by") == "1")
+        logger.info(f"[BULK ACTION] action={action}, count={len(decision_ids)}, ship_to_ob={ship_to_ob}, ids={decision_ids[:5]}")
 
         if action not in ("approve", "ship", "reject", "recurate"):
             logger.warning(f"[BULK ACTION] Invalid action: '{action}'")
@@ -6820,8 +6836,8 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                     )
                     # Phase 3 — Push to VeraCore in background (matches single-approve flow).
                     # Pass the shared batch tag so this run groups under one ReferenceNumber.
-                    logger.info("[BULK ACTION] Queuing VeraCore push for %s (background, batch=%s)", did[:8], bulk_batch_ref)
-                    background_tasks.add_task(submit_to_veracore, did, bulk_batch_ref)
+                    logger.info("[BULK ACTION] Queuing VeraCore push for %s (background, batch=%s, ship_to_ob=%s)", did[:8], bulk_batch_ref, ship_to_ob)
+                    background_tasks.add_task(submit_to_veracore, did, bulk_batch_ref, ship_to_ob)
                     success += 1
 
                 elif action == "ship":
