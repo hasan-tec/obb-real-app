@@ -310,15 +310,30 @@
                         {% if request.state.user_role == 'admin' %}
                         {% if d.status == 'pending' %}
                         {% if d.kit_sku %}
+                        {% set vc_name = ((d.ship_first_name or d.customers.first_name or '') ~ ' ' ~ (d.ship_last_name or d.customers.last_name or '')).strip() %}
+                        {% set vc_line = (d.customers.address_line1 or '(no address)') ~ ', ' ~ (d.customers.city or '') ~ ', ' ~ (d.customers.province or '') ~ ' ' ~ (d.customers.zip or d.customers.zip_code or '') %}
+                        {% set ob_name = ((d.billing_first_name or '') ~ ' ' ~ (d.billing_last_name or '')).strip() %}
+                        {% set ob_line = (d.billing_address1 or '(no billing address)') ~ ', ' ~ (d.billing_city or '') ~ ', ' ~ (d.billing_state or '') ~ ' ' ~ (d.billing_zip or '') %}
                         <form method="POST" action="/decisions/{{ d.id }}/approve" style="display:inline;">
-                            <button type="submit" class="btn btn-sm btn-primary" title="Approve → VeraCore (ship to customer address)"
-                                onclick="return confirm('Approve and push to VeraCore?')">✓ VC</button>
+                            <button type="submit" class="btn btn-sm btn-primary"
+                                title="Ship To: {{ vc_name }} — {{ vc_line }}"
+                                data-addr="{{ vc_name }} — {{ vc_line }}"
+                                onclick="return confirm('Approve → VeraCore\n\nShip To:\n' + this.getAttribute('data-addr'))">✓ VC</button>
                         </form>
                         <form method="POST" action="/decisions/{{ d.id }}/approve?ship_to_ordered_by=1" style="display:inline;">
+                            {% if ob_name and ob_line and ob_line != '(no billing address), ,  ' %}
                             <button type="submit" class="btn btn-sm btn-primary"
                                 style="background:var(--purple,#7c3aed);border-color:var(--purple,#7c3aed);"
-                                title="Approve → VeraCore (Ship To = Ordered By / billing address)"
-                                onclick="return confirm('Approve → VeraCore with Ship To = Ordered By (billing address)?')">✓ OB</button>
+                                title="Ship To (Ordered By): {{ ob_name }} — {{ ob_line }}"
+                                data-addr="{{ ob_name }} — {{ ob_line }}"
+                                onclick="return confirm('Approve → VeraCore (Ship To = Ordered By)\n\nShip To:\n' + this.getAttribute('data-addr'))">✓ OB</button>
+                            {% else %}
+                            <button type="submit" class="btn btn-sm btn-primary"
+                                style="background:var(--purple,#7c3aed);border-color:var(--purple,#7c3aed);"
+                                title="No billing data — will use shipping address: {{ vc_name }} — {{ vc_line }}"
+                                data-addr="{{ vc_name }} — {{ vc_line }}"
+                                onclick="return confirm('Approve → VeraCore (Ship To = Ordered By)\n\nNo billing data stored — will fall back to shipping address:\n' + this.getAttribute('data-addr'))">✓ OB</button>
+                            {% endif %}
                         </form>
                         <form method="POST" action="/decisions/{{ d.id }}/approve?via=pirateship"
                             style="display:inline;">

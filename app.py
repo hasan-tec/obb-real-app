@@ -3551,7 +3551,7 @@ async def decisions_page(request: Request):
 
         # Build Supabase query with server-side filters — helper to rebuild for pagination
         def _build_q():
-            qo = db.table("decisions").select("*, customers(email, first_name, last_name)")
+            qo = db.table("decisions").select("*, customers(email, first_name, last_name, address_line1, city, province, zip)")
             if f_trimester:
                 try:
                     qo = qo.eq("trimester", int(f_trimester))
