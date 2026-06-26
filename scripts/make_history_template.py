@@ -37,7 +37,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 ROOT = Path(__file__).parent.parent
 CSV_IN = ROOT / "CRATEJOY_BACKFILL_LIST.csv"
-XLSX_OUT = ROOT / "CRATEJOY_HISTORY_TEMPLATE.xlsx"
+XLSX_OUT = ROOT / "CRATEJOY_HISTORY_TEMPLATE_NEW.xlsx"
 
 load_dotenv()
 CID = os.getenv("CRATEJOY_CLIENT_ID", "")
@@ -67,41 +67,51 @@ with open(CSV_IN, encoding="utf-8") as f:
         custs.append(r)
 print(f"customers from list: {len(custs)}")
 
-# 2. per customer, pull SHIPPED boxes (date + cycle), chronological
-# NOTE: query by SUBSCRIPTION_ID with pagination — ?customer_id= returns an
-# INCOMPLETE set (Cratejoy quirk). subscription_id paginated returns every box
-# across all auto-renewed terms (e.g. Rob Nielsen: 18 total, 15 shipped).
+# 2. per customer, pull SHIPPED boxes across ALL their subscriptions
+# Strategy: fetch all sub IDs via ?customer_id= then paginate each sub's
+# shipments — captures multi-term renewals. De-dupe by shipment ID.
 box_rows = []
 for i, c in enumerate(custs):
-    sub = c["subscription_id"]
     cid = c["cratejoy_customer_id"]
-    results = []
-    url = f"https://api.cratejoy.com/v1/shipments/?subscription_id={sub}&limit=100"
-    while url:
-        s, d = get(url, CJ)
-        if not isinstance(d, dict):
-            break
-        results.extend(d.get("results", []))
-        nx = d.get("next")
-        url = urljoin("https://api.cratejoy.com/v1/shipments/", nx) if nx else None
+    csv_sub = c["subscription_id"]
+
+    s, sd = get(f"https://api.cratejoy.com/v1/subscriptions/?customer_id={cid}&limit=50", CJ)
+    all_sub_ids = [sub["id"] for sub in (sd.get("results", []) if isinstance(sd, dict) else [])]
+    if not all_sub_ids:
+        all_sub_ids = [int(csv_sub)]
+
+    seen_ids = set()
+    all_results = []
+    for sub_id in all_sub_ids:
+        url = f"https://api.cratejoy.com/v1/shipments/?subscription_id={sub_id}&limit=100"
+        while url:
+            s2, d2 = get(url, CJ)
+            if not isinstance(d2, dict):
+                break
+            for r in d2.get("results", []):
+                if r["id"] not in seen_ids:
+                    seen_ids.add(r["id"])
+                    all_results.append(r)
+            nx = d2.get("next")
+            url = urljoin("https://api.cratejoy.com/v1/shipments/", nx) if nx else None
+        time.sleep(0.05)
+
     boxes = []
-    for r in results:
+    for r in all_results:
         if r.get("status") != "shipped":
             continue
         dt = str(r.get("adjusted_ordered_at") or r.get("shipped_at") or "")[:10]
-        cyc = None
         ff = r.get("fulfillments") or []
-        if ff:
-            cyc = ff[0].get("cycle_number")
-        boxes.append((dt, cyc, r.get("id")))
+        r_sub = ff[0].get("subscription_id") if ff else csv_sub
+        boxes.append((dt, r.get("id"), r_sub))
     boxes.sort(key=lambda z: z[0])
     name = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip()
-    for rank, (dt, cyc, sid) in enumerate(boxes, start=1):
+    for rank, (dt, sid, r_sub) in enumerate(boxes, start=1):
         box_rows.append({
             "name": name,
             "email": c["email"],
             "cj_cust": cid,
-            "sub": c["subscription_id"],
+            "sub": r_sub,
             "box_no": rank,
             "ship_date": dt,
             "cj_shipment_id": sid,
@@ -218,7 +228,7 @@ try:
     wb.save(XLSX_OUT)
     saved = XLSX_OUT
 except PermissionError:
-    saved = XLSX_OUT.with_name("CRATEJOY_HISTORY_TEMPLATE_NEW.xlsx")
+    saved = XLSX_OUT.with_name("CRATEJOY_HISTORY_TEMPLATE_NEW_v2.xlsx")
     wb.save(saved)
-    print("(original file was locked/open in Excel — wrote a new copy instead)")
+    print("(file was locked/open in Excel — wrote to _v2 copy instead)")
 print(f"\nSaved {saved.name}  ({len(box_rows)} fill-in rows across {len(custs)} customers)")
