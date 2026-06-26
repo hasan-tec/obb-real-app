@@ -428,6 +428,10 @@ async def _cratejoy_monthly_sweep(db, ship_date: date) -> dict:
                 .select("id, email, first_name, last_name, trimester, due_date, subscription_status")
                 .in_("platform", ["cratejoy", "both"])
                 .eq("subscription_status", status)
+                # Skip backlog customers imported WITHOUT their real kit history (migration 020).
+                # Creating a decision for them now would assign a duplicate welcome kit — they
+                # stay off until Sheena/Ting's kit history is imported and history_pending cleared.
+                .neq("history_pending", True)
                 .range(offset, offset + page_size - 1)
                 .execute()
             )
