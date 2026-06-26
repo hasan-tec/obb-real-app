@@ -389,7 +389,9 @@ app.add_middleware(AuthMiddleware)
 
 
 # ═══════════════════════════════════════════════════════════
-# CRATEJOY MONTHLY DECISION SWEEP
+# CRATEJOY MONTHLY DECISION SWEEP — RETIRED 2026-06-26 (no longer scheduled)
+# Superseded by the daily shipment-driven sync (_cratejoy_daily_sync) below; the scheduler
+# no longer calls this. Kept for reference/history only.
 # ═══════════════════════════════════════════════════════════
 
 async def _cratejoy_monthly_sweep(db, ship_date: date) -> dict:
@@ -517,6 +519,257 @@ async def _cratejoy_monthly_sweep(db, ship_date: date) -> dict:
     }
 
 
+# ═══════════════════════════════════════════════════════════
+# CRATEJOY DAILY SYNC  (replaces the retired monthly sweep)
+# ═══════════════════════════════════════════════════════════
+# Polls the Cratejoy unshipped-shipment queue once a day and creates ONE pending decision
+# per box whose ship date has arrived (pull-not-push — same timing as Shopify's per-renewal
+# webhook, but polled because prepaid Cratejoy subs fire no monthly billing event).
+# Idempotent: decisions.cratejoy_shipment_id unique index (one decision per shipment) PLUS a
+# one-decision-per-customer-per-month guard. Backlog customers flagged history_pending are
+# skipped until their real kit history is imported (migration 020).
+
+# Never create decisions for boxes older than this — pre-cutover unshipped boxes belong to
+# the one-time Sheena/Ting history backfill, not the live cron.
+CRATEJOY_DAILY_SYNC_CUTOVER = date(2026, 6, 1)
+# 0 = decision created on the box's ship date (matches Shopify). Increase to give staff
+# curation runway before the ship date.
+CRATEJOY_LEAD_DAYS = 0
+
+
+def _cj_basic_headers() -> dict:
+    auth = base64.b64encode(f"{CRATEJOY_CLIENT_ID}:{CRATEJOY_CLIENT_SECRET}".encode()).decode()
+    return {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+
+
+def _cj_shipment_ship_date(shipment: dict):
+    """Authoritative ship/target date for a Cratejoy shipment, as a date (or None)."""
+    raw = shipment.get("target_at") or shipment.get("adjusted_ordered_at")
+    if not raw:
+        ff = shipment.get("fulfillments") or []
+        raw = ff[0].get("adjusted_fulfillment_date") if ff else None
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+    except Exception:
+        return None
+
+
+async def _cj_enrich_new_customer(client, sub_id: str, ship_address: dict) -> dict:
+    """Survey (due/size/gender/daddy) + address for a brand-new customer. Mirrors the webhook."""
+    fields: dict = {}
+    headers = _cj_basic_headers()
+    addr = ship_address if isinstance(ship_address, dict) else {}
+    if not addr.get("street") and sub_id:
+        try:
+            r = await client.get(f"https://api.cratejoy.com/v1/subscriptions/{sub_id}/", headers=headers)
+            if r.status_code == 200:
+                addr = r.json().get("address") or {}
+        except Exception as e:
+            logger.warning("[CJ DAILY] address fetch failed for sub %s: %s", sub_id, e)
+    if isinstance(addr, dict):
+        if addr.get("street"):
+            fields["address_line1"] = addr["street"]
+        if addr.get("city"):
+            fields["city"] = addr["city"]
+        if addr.get("state"):
+            fields["province"] = addr["state"]
+        if addr.get("zip_code"):
+            fields["zip"] = addr["zip_code"]
+        fields["country"] = addr.get("country") or "US"
+    if sub_id:
+        try:
+            r = await client.get(
+                f"https://api.cratejoy.com/v1/product_survey_results/?subscription_id={sub_id}",
+                headers=headers,
+            )
+            if r.status_code == 200:
+                for sr in r.json().get("results", []):
+                    for ans in sr.get("answers", []):
+                        fld = ans.get("field", {})
+                        fname = (fld.get("name", "") if isinstance(fld, dict) else "").lower().strip()
+                        val = str(ans.get("value", "")).strip()
+                        if not val:
+                            continue
+                        if "due date" in fname:
+                            due = parse_due_date(val)
+                            if due:
+                                fields["due_date"] = due.isoformat()
+                                fields["trimester"] = calculate_trimester(due, date.today())
+                        elif "clothing size" in fname:
+                            sz = normalize_clothing_size(val)
+                            if sz:
+                                fields["clothing_size"] = sz
+                        elif "expecting" in fname or "whom" in fname:
+                            gl = val.lower()
+                            fields["baby_gender"] = "boy" if "boy" in gl else ("girl" if "girl" in gl else "unknown")
+                        elif "second parent" in fname or "matching apparel" in fname:
+                            fields["wants_daddy_item"] = val.lower().startswith("yes")
+        except Exception as e:
+            logger.warning("[CJ DAILY] survey fetch failed for sub %s: %s", sub_id, e)
+    return fields
+
+
+async def process_cratejoy_box(db, client, shipment: dict, today: date, dry_run: bool = False) -> str:
+    """
+    Onboard/locate the customer for one unshipped Cratejoy box and create exactly one
+    decision for it. Idempotent. Returns an outcome tag for counting.
+    """
+    cust = shipment.get("customer") or {}
+    email = (cust.get("email", "") or "").strip().lower()
+    cj_cust_id = str(cust.get("id", "") or "")
+    ff = shipment.get("fulfillments") or []
+    sub_id = str((ff[0].get("subscription_id") if ff else "") or "")
+    cycle = ff[0].get("cycle_number") if ff else None
+    ship_id = str(shipment.get("id", "") or "")
+    ship_date = _cj_shipment_ship_date(shipment) or today
+    ship_addr = shipment.get("ship_address") or {}
+
+    if not email or not ship_id:
+        return "skip_no_data"
+
+    # Idempotency #1 — a decision already exists for this exact Cratejoy shipment
+    if db.table("decisions").select("id").eq("cratejoy_shipment_id", ship_id).limit(1).execute().data:
+        return "skip_exists"
+
+    # Locate customer (cratejoy_customer_id first, then email)
+    cust_row = None
+    if cj_cust_id:
+        r = db.table("customers").select("*").eq("cratejoy_customer_id", cj_cust_id).limit(1).execute()
+        cust_row = r.data[0] if r.data else None
+    if not cust_row and email:
+        r = db.table("customers").select("*").ilike("email", email).limit(1).execute()
+        cust_row = r.data[0] if r.data else None
+
+    if cust_row is None:
+        # Brand-new signup — onboard fresh (genuinely new → welcome-kit path in assign_kit)
+        rec = {
+            "email": email,
+            "first_name": cust.get("first_name") or None,
+            "last_name": cust.get("last_name") or None,
+            "cratejoy_customer_id": cj_cust_id or None,
+            "platform": "cratejoy",
+            "subscription_status": "active",
+            "history_pending": False,
+        }
+        rec.update(await _cj_enrich_new_customer(client, sub_id, ship_addr))
+        if dry_run:
+            logger.info("[CJ DAILY] WOULD onboard NEW customer %s + create decision (ship_id=%s)", email, ship_id)
+            return "create_new"
+        ins = db.table("customers").insert(rec).execute()
+        cust_row = ins.data[0] if ins.data else None
+        if not cust_row:
+            return "error"
+        logger.info("[CJ DAILY] onboarded new customer %s (sub=%s)", email, sub_id)
+
+    cust_id = cust_row["id"]
+
+    # Backlog customer without real kit history → never auto-decide yet
+    if cust_row.get("history_pending"):
+        return "skip_history_pending"
+
+    # Idempotency #2 — one decision per customer per box-month (covers the sweep transition)
+    month_start = date(ship_date.year, ship_date.month, 1)
+    if ship_date.month == 12:
+        month_end = date(ship_date.year + 1, 1, 1)
+    else:
+        month_end = date(ship_date.year, ship_date.month + 1, 1)
+    already = (
+        db.table("decisions").select("id")
+        .eq("customer_id", cust_id)
+        .gte("ship_date", str(month_start)).lt("ship_date", str(month_end))
+        .neq("status", "rejected").limit(1).execute()
+    )
+    if already.data:
+        return "skip_month_exists"
+
+    if dry_run:
+        logger.info("[CJ DAILY] WOULD create decision — %s ship_id=%s cycle=%s ship_date=%s",
+                    email, ship_id, cycle, ship_date)
+        return "create_existing"
+
+    # Decision engine (trimester recomputed inside assign_kit for this box's ship date)
+    kit = await assign_kit(cust_id, ship_date)
+    decision = {
+        "customer_id": cust_id,
+        "kit_id": kit.get("kit_id"),
+        "kit_sku": kit.get("kit_sku"),
+        "decision_type": kit.get("decision_type", "needs-curation"),
+        "reason": kit.get("reason", ""),
+        "status": "pending",
+        "order_id": sub_id or ship_id,
+        "platform": "cratejoy",
+        "trimester": cust_row.get("trimester"),
+        "ship_date": str(ship_date),
+        "order_type": _compute_order_type(db, cust_id),
+        "cratejoy_shipment_id": ship_id,
+    }
+    # Gift-aware ship-to recipient name for VeraCore split-address (best-effort)
+    recipient = ""
+    if isinstance(ship_addr, dict):
+        recipient = str(ship_addr.get("to") or ship_addr.get("name") or "").strip()
+    if recipient:
+        parts = recipient.split(" ", 1)
+        decision["ship_first_name"] = parts[0]
+        decision["ship_last_name"] = parts[1] if len(parts) > 1 else None
+    db.table("decisions").insert(decision).execute()
+    logger.info("[CJ DAILY] decision created — %s kit=%s type=%s ship_id=%s",
+                email, kit.get("kit_sku", "none"), decision["decision_type"], ship_id)
+    return "created"
+
+
+async def _cratejoy_daily_sync(db, today: date, dry_run: bool = False) -> dict:
+    """
+    Daily Cratejoy reconciliation — pulls the unshipped-shipment queue and creates one
+    decision per box whose ship date has arrived (CUTOVER <= ship_date <= today + lead).
+    Replaces the retired monthly sweep. Idempotent and retry-safe.
+    """
+    if not CRATEJOY_CLIENT_ID or not CRATEJOY_CLIENT_SECRET:
+        logger.info("[CJ DAILY] Cratejoy creds not set — skipping")
+        return {"skipped": "no_creds"}
+
+    hi = today + timedelta(days=CRATEJOY_LEAD_DAYS)
+    counts: dict = {}
+    pulled = 0
+    headers = _cj_basic_headers()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        url = "https://api.cratejoy.com/v1/shipments/?status=unshipped&limit=100"
+        while url:
+            try:
+                resp = await client.get(url, headers=headers)
+            except Exception as e:
+                logger.error("[CJ DAILY] shipments pull failed: %s", e)
+                break
+            if resp.status_code != 200:
+                logger.error("[CJ DAILY] shipments HTTP %s: %s", resp.status_code, resp.text[:200])
+                break
+            data = resp.json()
+            for sh in data.get("results", []):
+                pulled += 1
+                sd = _cj_shipment_ship_date(sh)
+                if not sd or sd < CRATEJOY_DAILY_SYNC_CUTOVER or sd > hi:
+                    counts["skip_not_due"] = counts.get("skip_not_due", 0) + 1
+                    continue
+                try:
+                    tag = await process_cratejoy_box(db, client, sh, today, dry_run)
+                except Exception as e:
+                    tag = "error"
+                    logger.error("[CJ DAILY] box error (ship %s): %s", sh.get("id"), e, exc_info=True)
+                counts[tag] = counts.get(tag, 0) + 1
+            nxt = data.get("next")
+            if not nxt:
+                url = None
+            elif nxt.startswith("http"):
+                url = nxt
+            elif nxt.startswith("/"):
+                url = "https://api.cratejoy.com" + nxt
+            else:
+                url = "https://api.cratejoy.com/v1/shipments/" + nxt
+    logger.info("[CJ DAILY] %s — pulled=%d %s", "DRY RUN" if dry_run else "done", pulled, counts)
+    return {"pulled": pulled, "dry_run": dry_run, **counts}
+
+
 # ─── Monthly curation report scheduler ───
 # Runs on the 1st of each month at ~6 AM UTC. Uses a lightweight background thread.
 _scheduler_started = False
@@ -539,13 +792,14 @@ def _monthly_report_scheduler():
     """Background thread that checks once per hour if it's the 1st and triggers the report."""
     import time as _time
     last_run_month = None
-    last_cj_sweep_month = None  # Cratejoy monthly decision sweep guard
+    last_cj_daily_day = None  # Cratejoy daily sync guard (replaces the retired monthly sweep)
     last_inventory_day = None  # Phase 3 — daily VeraCore inventory sync guard
     last_shipment_poll_day = None  # Phase 3 — daily VeraCore shipment poll guard
     while True:
         try:
             now = datetime.utcnow()
             current_month_key = f"{now.year}-{now.month:02d}"
+            current_day_key = now.strftime("%Y-%m-%d")
             # Trigger on 1st of month, after 6 AM UTC, only once per month
             if now.day == 1 and now.hour >= 6 and last_run_month != current_month_key:
                 if _schedule_lock(f"curation_{current_month_key}"):
@@ -584,25 +838,23 @@ def _monthly_report_scheduler():
                     logger.info(f"[SCHEDULER] Curation report for {current_month_key} already claimed by another worker, skipping")
                 last_run_month = current_month_key
 
-            # Cratejoy monthly decision sweep — fills months 2-3 gap in prepay cycles.
-            # Runs at 7 AM (1 hour after curation report) so it doesn't race with it.
-            if now.day == 1 and now.hour >= 7 and last_cj_sweep_month != current_month_key:
-                if _schedule_lock(f"cj_sweep_{current_month_key}"):
-                    logger.info(f"[SCHEDULER] Cratejoy monthly sweep triggered for {current_month_key}")
+            # Cratejoy daily sync — polls the unshipped shipment queue and creates one decision
+            # per due box (pull-not-push). Replaces the retired monthly sweep. Once/day after 7 AM UTC.
+            if now.hour >= 7 and last_cj_daily_day != current_day_key:
+                if _schedule_lock(f"cj_daily_{current_day_key}"):
+                    logger.info("[SCHEDULER] Cratejoy daily sync triggered for %s", current_day_key)
                     try:
                         db = get_supabase()
-                        ship_date = date(now.year, now.month, 14)
-                        sweep_result = asyncio.run(_cratejoy_monthly_sweep(db, ship_date))
-                        logger.info(f"[SCHEDULER] Cratejoy sweep complete: {sweep_result}")
+                        sync_result = asyncio.run(_cratejoy_daily_sync(db, now.date()))
+                        logger.info("[SCHEDULER] Cratejoy daily sync complete: %s", sync_result)
                     except Exception as e:
-                        logger.error(f"[SCHEDULER] Cratejoy sweep failed: {e}", exc_info=True)
+                        logger.error("[SCHEDULER] Cratejoy daily sync failed: %s", e, exc_info=True)
                 else:
-                    logger.info(f"[SCHEDULER] CJ sweep for {current_month_key} already claimed by another worker, skipping")
-                last_cj_sweep_month = current_month_key
+                    logger.info("[SCHEDULER] CJ daily sync for %s already claimed by another worker, skipping", current_day_key)
+                last_cj_daily_day = current_day_key
 
             # Phase 3 — Daily VeraCore inventory sync at ~04:00 UTC (≈11 PM ET).
             # Skipped entirely when VeraCore is not configured.
-            current_day_key = now.strftime("%Y-%m-%d")
             if (veracore_enabled()
                     and now.hour == 4
                     and last_inventory_day != current_day_key):
@@ -2279,6 +2531,15 @@ async def cratejoy_order_webhook(request: Request):
 # ═══════════════════════════════════════════════════════════
 # CRATEJOY WEBHOOK REGISTRATION (run once)
 # ═══════════════════════════════════════════════════════════
+
+@app.post("/api/cratejoy/daily-sync")
+async def run_cratejoy_daily_sync(request: Request):
+    """Manually trigger the Cratejoy daily sync. ?dry_run=true previews without writing."""
+    dry = str(request.query_params.get("dry_run", "false")).lower() in ("1", "true", "yes")
+    db = get_supabase()
+    result = await _cratejoy_daily_sync(db, date.today(), dry_run=dry)
+    return JSONResponse({"dry_run": dry, "result": result})
+
 
 @app.post("/api/cratejoy/register-webhooks")
 async def register_cratejoy_webhooks():
