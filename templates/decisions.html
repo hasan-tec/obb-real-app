@@ -230,6 +230,11 @@
                             {% if d._order_type == 'new' %}<span class="badge badge-green" style="font-size:10px;margin-left:4px;">New</span>
                             {% elif d._order_type == 'renewal' %}<span class="badge badge-dim" style="font-size:10px;margin-left:4px;">Renewal</span>{% endif %}
                             <br><small style="color:var(--text-dim);">{{ d.customers.email }}</small>
+                            {% set _recip = ((d.ship_first_name or '') ~ ' ' ~ (d.ship_last_name or '')).strip() %}
+                            {% set _acct = ((d.customers.first_name or '') ~ ' ' ~ (d.customers.last_name or '')).strip() %}
+                            {% if _recip and _recip.lower() != _acct.lower() %}
+                            <br><small style="color:var(--accent);">→ ships to: {{ _recip }}</small>
+                            {% endif %}
                         </a>
                         {% else %}
                         {{ d.customer_id[:8] }}…

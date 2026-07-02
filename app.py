@@ -770,6 +770,176 @@ async def _cratejoy_daily_sync(db, today: date, dry_run: bool = False) -> dict:
     return {"pulled": pulled, "dry_run": dry_run, **counts}
 
 
+# ═══════════════════════════════════════════════════════════
+# CRATEJOY DAILY RECONCILIATION  (Threads 7 + 10 — daily-only, no approve-time call)
+# ═══════════════════════════════════════════════════════════
+# Runs once/day, after _cratejoy_daily_sync. Two jobs:
+#  1. Pending decisions with a cratejoy_shipment_id: re-check that exact shipment.
+#     - cancelled  -> auto-reject the decision (a box that will never ship stays out
+#       of the Decisions queue instead of being approvable).
+#     - not cancelled -> refresh ship_to (recipient) + ordered_by (buyer) snapshot from
+#       Cratejoy's CURRENT ship_address/customer, so the Decisions page and any later
+#       VeraCore push reflect Cratejoy's latest state rather than a stale first-seen value.
+#  2. Broader customer subscription_status refresh for all active/cancelled-prepaid
+#     Cratejoy customers, so the Customers page doesn't keep saying "active" long after
+#     Cratejoy shows cancelled. Classification for cancelled/expired subs is based on
+#     whether the customer has any real *unshipped* future shipment, not the
+#     num_cycles/end_date heuristic alone — that heuristic mislabels a customer whose
+#     entire renewal term got cancelled/refunded after the fact (end_date isn't rolled
+#     back when that happens) as still having boxes coming. Verified against a live
+#     example (a customer whose second 6-month term was refunded+cancelled one day
+#     after renewal, all 6 shipments cancelled, yet end_date still showed 5 months out).
+#
+# Known limitation (accepted trade-off, by design): this only runs once/day, so a
+# cancellation or correction that happens AFTER today's run and BEFORE staff approves
+# won't be caught until tomorrow's run. There is deliberately no live check at Approve
+# time — see SLACK_THREADS_PLAN.md Thread 7/11 for the reasoning.
+
+async def _cj_reconcile_pending_decisions(db, client, dry_run: bool = False) -> dict:
+    """Job 1: re-check the live Cratejoy shipment behind every pending decision."""
+    headers = _cj_basic_headers()
+    counts: dict = {}
+    decisions = (
+        db.table("decisions").select("id, customer_id, cratejoy_shipment_id, ship_first_name, ship_last_name")
+        .eq("platform", "cratejoy").eq("status", "pending")
+        .not_.is_("cratejoy_shipment_id", "null")
+        .execute().data or []
+    )
+    for d in decisions:
+        ship_id = d["cratejoy_shipment_id"]
+        try:
+            r = await client.get(f"https://api.cratejoy.com/v1/shipments/{ship_id}/", headers=headers)
+        except Exception as e:
+            logger.error("[CJ RECONCILE] shipment fetch failed decision=%s ship=%s: %s", d["id"], ship_id, e)
+            counts["error"] = counts.get("error", 0) + 1
+            continue
+        if r.status_code != 200:
+            logger.warning("[CJ RECONCILE] shipment %s returned %s — skipping", ship_id, r.status_code)
+            counts["skip_http_error"] = counts.get("skip_http_error", 0) + 1
+            continue
+        sh = r.json()
+        status = (sh.get("status") or "").lower()
+
+        if status == "cancelled":
+            counts["rejected"] = counts.get("rejected", 0) + 1
+            if dry_run:
+                logger.info("[CJ RECONCILE] WOULD reject decision=%s — shipment %s is cancelled in Cratejoy", d["id"], ship_id)
+                continue
+            db.table("decisions").update({
+                "status": "rejected",
+                "reason": f"Auto-rejected: Cratejoy shipment {ship_id} is cancelled (daily reconciliation).",
+            }).eq("id", d["id"]).execute()
+            logger.info("[CJ RECONCILE] rejected decision=%s — shipment %s cancelled in Cratejoy", d["id"], ship_id)
+            await log_activity("decision", f"Auto-rejected decision {d['id'][:8]} — Cratejoy shipment cancelled", f"shipment={ship_id}", "success")
+            continue
+
+        # Not cancelled — refresh ship_to (recipient) + ordered_by (buyer) snapshot.
+        addr = sh.get("ship_address") or {}
+        cust = sh.get("customer") or {}
+        recipient = str(addr.get("to") or addr.get("name") or "").strip()
+        update: dict = {}
+        if recipient:
+            parts = recipient.split(" ", 1)
+            update["ship_first_name"] = parts[0]
+            update["ship_last_name"] = parts[1] if len(parts) > 1 else None
+        # Prefer first_name/last_name over the composite "name" field — Cratejoy's "name" can
+        # include a nickname appended (e.g. "Manda Decker MandaJean"), which splits badly.
+        buyer_first = cust.get("first_name") or ""
+        buyer_last = cust.get("last_name") or ""
+        if buyer_first or buyer_last:
+            update["billing_first_name"] = buyer_first
+            update["billing_last_name"] = buyer_last or None
+        elif cust.get("name"):
+            bparts = str(cust["name"]).strip().split(" ", 1)
+            update["billing_first_name"] = bparts[0]
+            update["billing_last_name"] = bparts[1] if len(bparts) > 1 else None
+        if update and (update.get("ship_first_name") != d.get("ship_first_name")
+                       or update.get("ship_last_name") != d.get("ship_last_name")):
+            counts["refreshed"] = counts.get("refreshed", 0) + 1
+            if not dry_run:
+                db.table("decisions").update(update).eq("id", d["id"]).execute()
+                logger.info("[CJ RECONCILE] refreshed ship_to for decision=%s -> %s %s",
+                            d["id"], update.get("ship_first_name"), update.get("ship_last_name"))
+        else:
+            counts["unchanged"] = counts.get("unchanged", 0) + 1
+    return counts
+
+
+async def _cj_reconcile_customer_statuses(db, client, dry_run: bool = False) -> dict:
+    """Job 2: refresh subscription_status for all active/cancelled-prepaid Cratejoy customers."""
+    headers = _cj_basic_headers()
+    counts: dict = {}
+    customers = (
+        db.table("customers").select("id, email, cratejoy_customer_id, subscription_status")
+        .in_("platform", ["cratejoy", "both"])
+        .in_("subscription_status", ["active", "cancelled-prepaid"])
+        .not_.is_("cratejoy_customer_id", "null")
+        .execute().data or []
+    )
+    for cust in customers:
+        cj_id = cust["cratejoy_customer_id"]
+        try:
+            r = await client.get(f"https://api.cratejoy.com/v1/subscriptions/?customer.id={cj_id}&limit=5", headers=headers)
+        except Exception as e:
+            logger.error("[CJ RECONCILE] subscription fetch failed customer=%s: %s", cust["id"], e)
+            counts["error"] = counts.get("error", 0) + 1
+            continue
+        if r.status_code != 200:
+            counts["skip_http_error"] = counts.get("skip_http_error", 0) + 1
+            continue
+        subs = r.json().get("results", [])
+        if not subs:
+            continue
+        sub = subs[0]  # most recent
+        cj_status = (sub.get("status") or "").lower()
+
+        if cj_status == "active":
+            new_status = "active"
+        elif cj_status in ("cancelled", "expired"):
+            # Ground truth: does this customer have any real unshipped FUTURE box?
+            # (Not the num_cycles/end_date heuristic — verified live that it mislabels
+            # a customer whose whole renewal term was cancelled/refunded after the fact.)
+            try:
+                sr = await client.get(f"https://api.cratejoy.com/v1/shipments/?customer_id={cj_id}&limit=20", headers=headers)
+                ships = sr.json().get("results", []) if sr.status_code == 200 else []
+            except Exception as e:
+                logger.warning("[CJ RECONCILE] shipment lookup failed for customer=%s: %s", cust["id"], e)
+                ships = []
+            has_future_unshipped = any(
+                (s.get("status") or "").lower() == "unshipped"
+                and (_cj_shipment_ship_date(s) or date.min) >= date.today()
+                for s in ships
+            )
+            new_status = "cancelled-prepaid" if has_future_unshipped else "cancelled-expired"
+        else:
+            continue  # suspended/past_due/etc. — leave as-is, not in scope of this reconciliation
+
+        if new_status != cust["subscription_status"]:
+            counts[f"changed_to_{new_status}"] = counts.get(f"changed_to_{new_status}", 0) + 1
+            if not dry_run:
+                db.table("customers").update({"subscription_status": new_status}).eq("id", cust["id"]).execute()
+                logger.info("[CJ RECONCILE] customer=%s (%s) status %s -> %s",
+                            cust["id"], cust.get("email"), cust["subscription_status"], new_status)
+                await log_activity("customer", f"Subscription status synced for {cust.get('email')}",
+                                    f"{cust['subscription_status']} -> {new_status}", "success")
+        else:
+            counts["unchanged"] = counts.get("unchanged", 0) + 1
+    return counts
+
+
+async def cratejoy_daily_reconcile(db, dry_run: bool = False) -> dict:
+    """Entry point — runs both reconciliation jobs. Never raises; callers get counts."""
+    if not CRATEJOY_CLIENT_ID or not CRATEJOY_CLIENT_SECRET:
+        logger.info("[CJ RECONCILE] Cratejoy creds not set — skipping")
+        return {"skipped": "no_creds"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        decisions_result = await _cj_reconcile_pending_decisions(db, client, dry_run)
+        customers_result = await _cj_reconcile_customer_statuses(db, client, dry_run)
+    logger.info("[CJ RECONCILE] %s — decisions=%s customers=%s",
+                "DRY RUN" if dry_run else "done", decisions_result, customers_result)
+    return {"dry_run": dry_run, "decisions": decisions_result, "customers": customers_result}
+
+
 # ─── Monthly curation report scheduler ───
 # Runs on the 1st of each month at ~6 AM UTC. Uses a lightweight background thread.
 _scheduler_started = False
@@ -795,6 +965,7 @@ def _monthly_report_scheduler():
     last_cj_daily_day = None  # Cratejoy daily sync guard (replaces the retired monthly sweep)
     last_inventory_day = None  # Phase 3 — daily VeraCore inventory sync guard
     last_shipment_poll_day = None  # Phase 3 — daily VeraCore shipment poll guard
+    last_cj_reconcile_day = None  # Threads 7+10 — daily Cratejoy cancellation/ship-to reconciliation guard
     while True:
         try:
             now = datetime.utcnow()
@@ -852,6 +1023,26 @@ def _monthly_report_scheduler():
                 else:
                     logger.info("[SCHEDULER] CJ daily sync for %s already claimed by another worker, skipping", current_day_key)
                 last_cj_daily_day = current_day_key
+
+            # Cratejoy daily reconciliation (Threads 7+10) — runs after the sync above (same
+            # iteration, sync already completed synchronously by this point) so it sees that
+            # day's freshly-created decisions too. Rejects decisions whose Cratejoy shipment got
+            # cancelled, refreshes ship_to/ordered_by, and syncs customer subscription_status.
+            # Once/day after 7 AM UTC — matches the CJ daily sync's own guard exactly; no minute
+            # offset needed (or safe) since the hourly loop's `now` is captured once per
+            # iteration and doesn't reliably cross a specific minute boundary.
+            if now.hour >= 7 and last_cj_reconcile_day != current_day_key:
+                if _schedule_lock(f"cj_reconcile_{current_day_key}"):
+                    logger.info("[SCHEDULER] Cratejoy daily reconciliation triggered for %s", current_day_key)
+                    try:
+                        db = get_supabase()
+                        reconcile_result = asyncio.run(cratejoy_daily_reconcile(db))
+                        logger.info("[SCHEDULER] Cratejoy daily reconciliation complete: %s", reconcile_result)
+                    except Exception as e:
+                        logger.error("[SCHEDULER] Cratejoy daily reconciliation failed: %s", e, exc_info=True)
+                else:
+                    logger.info("[SCHEDULER] CJ reconciliation for %s already claimed by another worker, skipping", current_day_key)
+                last_cj_reconcile_day = current_day_key
 
             # Phase 3 — Daily VeraCore inventory sync at ~04:00 UTC (≈11 PM ET).
             # Skipped entirely when VeraCore is not configured.
@@ -1904,6 +2095,113 @@ async def shopify_order_webhook(request: Request):
 
 
 # ═══════════════════════════════════════════════════════════
+# SHOPIFY CUSTOMER WEBHOOK ENDPOINT (address sync — no order required)
+# ═══════════════════════════════════════════════════════════
+# Thread 3 fix: orders/create only refreshes the customer's address when a NEW order
+# fires. A mid-cycle address edit in Shopify had no path into the engine until the
+# next renewal. This subscribes to customers/update and syncs address fields only —
+# never quiz data (due_date/size/gender) or subscription_status.
+
+@app.post("/webhooks/shopify/customers/update")
+async def shopify_customer_webhook(request: Request):
+    """
+    Receives Shopify customers/update webhook. Address-only sync — does not touch
+    quiz data, platform, or subscription_status. No-op if the customer isn't already
+    in the engine (never creates ghost customers from a bare address edit).
+    """
+    start_time = time.time()
+    body = await request.body()
+    logger.info(f"[SHOPIFY CUSTOMER WEBHOOK] Received webhook, body size: {len(body)} bytes")
+
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+    if hmac_header and not verify_shopify_hmac(body, hmac_header):
+        logger.error("[SHOPIFY CUSTOMER WEBHOOK] HMAC verification FAILED — rejecting")
+        await log_activity("webhook", "Shopify customer webhook HMAC failed", "", "error")
+        return JSONResponse({"error": "HMAC verification failed"}, status_code=401)
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        logger.error(f"[SHOPIFY CUSTOMER WEBHOOK] JSON decode error: {e}")
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    event_id = request.headers.get("X-Shopify-Webhook-Id", "")
+    shopify_customer_id = str(payload.get("id", ""))
+    logger.info(f"[SHOPIFY CUSTOMER WEBHOOK] Event ID: {event_id}, Shopify Customer ID: {shopify_customer_id}")
+
+    db = get_supabase()
+
+    if event_id:
+        existing = db.table("webhook_logs").select("id").eq("source", "shopify").eq("event_id", event_id).execute()
+        if existing.data:
+            logger.info(f"[SHOPIFY CUSTOMER WEBHOOK] Duplicate event {event_id} — skipping")
+            return JSONResponse({"status": "duplicate"}, status_code=200)
+
+    webhook_log = db.table("webhook_logs").insert({
+        "source": "shopify",
+        "event_type": "customers/update",
+        "event_id": event_id or None,
+        "payload": payload,
+        "headers": {"X-Shopify-Webhook-Id": event_id},
+        "status": "received",
+    }).execute()
+    webhook_log_id = webhook_log.data[0]["id"] if webhook_log.data else None
+
+    try:
+        email = (payload.get("email") or "").strip().lower()
+        addr = payload.get("default_address") or {}
+
+        cust_row = None
+        if shopify_customer_id:
+            r = db.table("customers").select("id, email").eq("shopify_customer_id", shopify_customer_id).limit(1).execute()
+            cust_row = r.data[0] if r.data else None
+        if not cust_row and email:
+            r = db.table("customers").select("id, email").ilike("email", email).limit(1).execute()
+            cust_row = r.data[0] if r.data else None
+
+        if not cust_row:
+            logger.info(f"[SHOPIFY CUSTOMER WEBHOOK] No matching engine customer for shopify_id={shopify_customer_id} email={email} — skipping, no ghost customer created")
+        elif not addr:
+            logger.info(f"[SHOPIFY CUSTOMER WEBHOOK] Customer {cust_row['id']} has no default_address on this payload — nothing to sync")
+        else:
+            address_only = {
+                "address_line1": addr.get("address1") or None,
+                "city": addr.get("city") or None,
+                "province": addr.get("province") or None,
+                "zip": addr.get("zip") or None,
+                "country": addr.get("country_code") or "US",
+                "phone": addr.get("phone") or None,
+            }
+            db.table("customers").update(address_only).eq("id", cust_row["id"]).execute()
+            logger.info(f"[SHOPIFY CUSTOMER WEBHOOK] Synced address for customer {cust_row['id']} ({cust_row.get('email')}): {address_only}")
+            await log_activity(
+                "customer",
+                f"Address synced from Shopify for {cust_row.get('email')}",
+                f"{address_only['address_line1']}, {address_only['city']}, {address_only['province']} {address_only['zip']}",
+                "success",
+            )
+
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        if webhook_log_id:
+            db.table("webhook_logs").update({
+                "status": "processed",
+                "processing_time_ms": elapsed_ms,
+            }).eq("id", webhook_log_id).execute()
+        return JSONResponse({"status": "ok", "processing_time_ms": elapsed_ms})
+
+    except Exception as e:
+        logger.error(f"[SHOPIFY CUSTOMER WEBHOOK] Error processing customer update: {e}", exc_info=True)
+        if webhook_log_id:
+            db.table("webhook_logs").update({
+                "status": "failed",
+                "error_message": str(e),
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+            }).eq("id", webhook_log_id).execute()
+        await log_activity("webhook", f"Shopify customer webhook failed: {e}", "", "error")
+        return JSONResponse({"status": "ok"}, status_code=200)  # Always return 200 to Shopify
+
+
+# ═══════════════════════════════════════════════════════════
 # CRATEJOY WEBHOOK ENDPOINT
 # ═══════════════════════════════════════════════════════════
 
@@ -2538,6 +2836,15 @@ async def run_cratejoy_daily_sync(request: Request):
     dry = str(request.query_params.get("dry_run", "false")).lower() in ("1", "true", "yes")
     db = get_supabase()
     result = await _cratejoy_daily_sync(db, date.today(), dry_run=dry)
+    return JSONResponse({"dry_run": dry, "result": result})
+
+
+@app.post("/api/cratejoy/daily-reconcile")
+async def run_cratejoy_daily_reconcile(request: Request):
+    """Manually trigger the Cratejoy cancellation/ship-to reconciliation. ?dry_run=true previews without writing."""
+    dry = str(request.query_params.get("dry_run", "false")).lower() in ("1", "true", "yes")
+    db = get_supabase()
+    result = await cratejoy_daily_reconcile(db, dry_run=dry)
     return JSONResponse({"dry_run": dry, "result": result})
 
 
