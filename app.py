@@ -3982,7 +3982,11 @@ async def export_customer_pirateship(request: Request, customer_id: str):
         DEFAULT_HEIGHT_IN = 4
         for d in rows:
             c = d.get("customers") or {}
-            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+            # Prefer the decision's ship-to snapshot (gift recipient) over the account holder —
+            # same fix as Thread 2/10, applied here so the Pirate Ship label matches the packing slip.
+            ship_first = d.get("ship_first_name") or c.get("first_name") or ""
+            ship_last = d.get("ship_last_name") or c.get("last_name") or ""
+            name = f"{ship_first} {ship_last}".strip()
             country_iso = _norm_country(c.get("country") or "US")
             is_intl = country_iso != "US"
             if is_intl:
@@ -7818,7 +7822,9 @@ async def export_decisions_csv(request: Request):
         from veracore_client import normalize_country as _norm_country, build_customs as _build_customs
         for d in rows:
             c    = d.get("customers") or {}
-            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+            ship_first = d.get("ship_first_name") or c.get("first_name") or ""
+            ship_last  = d.get("ship_last_name")  or c.get("last_name")  or ""
+            name = f"{ship_first} {ship_last}".strip()
             country_iso = _norm_country(c.get("country") or "US")
             is_intl = country_iso != "US"
             if is_intl:
@@ -7904,7 +7910,9 @@ async def export_decisions_csv_selected(request: Request):
         DEFAULT_HEIGHT_IN = 4
         for d in rows:
             c = d.get("customers") or {}
-            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+            ship_first = d.get("ship_first_name") or c.get("first_name") or ""
+            ship_last = d.get("ship_last_name") or c.get("last_name") or ""
+            name = f"{ship_first} {ship_last}".strip()
             country_iso = _norm_country(c.get("country") or "US")
             is_intl = country_iso != "US"
             if is_intl:
@@ -7989,7 +7997,9 @@ async def export_decisions_veracore_csv(request: Request):
         for d in rows:
             c = d.get("customers") or {}
             k = d.get("kits") or {}
-            name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip() or c.get("email", "")
+            ship_first = d.get("ship_first_name") or c.get("first_name") or ""
+            ship_last = d.get("ship_last_name") or c.get("last_name") or ""
+            name = f"{ship_first} {ship_last}".strip() or c.get("email", "")
             country_iso = _norm_country(c.get("country") or "US")
             is_intl = country_iso != "US"
             offer_id = k.get("veracore_sku") or k.get("sku") or d.get("kit_sku", "")
@@ -8103,7 +8113,9 @@ async def export_decisions_sheet(request: Request, background_tasks: BackgroundT
                 sheet_rows = [header]
                 for d in rows_data:
                     c    = d.get("customers") or {}
-                    name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip()
+                    ship_first = d.get("ship_first_name") or c.get("first_name") or ""
+                    ship_last = d.get("ship_last_name") or c.get("last_name") or ""
+                    name = f"{ship_first} {ship_last}".strip()
                     sheet_rows.append([
                         name,
                         c.get("email", ""),
