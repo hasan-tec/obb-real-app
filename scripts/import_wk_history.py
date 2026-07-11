@@ -1125,6 +1125,11 @@ def main():
         action="store_true",
         help="Log every row (very detailed).",
     )
+    parser.add_argument(
+        "--file",
+        metavar="FILENAME",
+        help="Process only this CSV filename inside the Wk order history folder.",
+    )
     args = parser.parse_args()
 
     # Banner
@@ -1143,7 +1148,14 @@ def main():
         logger.error(f"SKU legend not found: {SKU_LEGEND}")
         sys.exit(1)
 
-    wk_csv_files = sorted(WK_DIR.glob("*.csv"))
+    if args.file:
+        target = WK_DIR / args.file
+        if not target.exists():
+            logger.error(f"[SETUP] --file not found: {target}")
+            sys.exit(1)
+        wk_csv_files = [target]
+    else:
+        wk_csv_files = sorted(WK_DIR.glob("*.csv"))
     if not wk_csv_files:
         logger.error(f"No CSV files found in: {WK_DIR}")
         sys.exit(1)

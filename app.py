@@ -4273,13 +4273,21 @@ async def kits_page(request: Request):
         msg = request.query_params.get("msg", "")
         msg_type = request.query_params.get("msg_type", "success")
 
-        # Get item counts per kit
+        # Get item counts per kit.
+        # Paginate: Supabase caps a single response at 1000 rows. With >1000 kit_items
+        # an unpaginated fetch silently under-counts and shows kits as "0 items" (display bug).
         kit_item_counts = {}
         if kits_data.data:
-            all_kit_items = db.table("kit_items").select("kit_id").execute()
-            for ki in (all_kit_items.data or []):
-                kid = ki["kit_id"]
-                kit_item_counts[kid] = kit_item_counts.get(kid, 0) + 1
+            offset = 0
+            while True:
+                batch = db.table("kit_items").select("kit_id").range(offset, offset + 999).execute().data or []
+                for ki in batch:
+                    kid = ki["kit_id"]
+                    kit_item_counts[kid] = kit_item_counts.get(kid, 0) + 1
+                if len(batch) < 1000:
+                    break
+                offset += 1000
+            logger.info("[KITS PAGE] Counted kit_items across %d kits (paginated fetch)", len(kit_item_counts))
 
         # Parse sort params for kits (Python sort — all kits fit in memory)
         kits_sort     = request.query_params.get("sort", "age_rank")

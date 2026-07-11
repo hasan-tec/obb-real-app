@@ -245,11 +245,17 @@ def parse_due_date(raw: Optional[str]) -> Optional[str]:
 
 def parse_kit_sku(raw: str) -> str:
     """
-    Strip the ' Kits' / ' Kit' suffix from a kit header value.
-      'OBB-CK-41 Kits'  -> 'OBB-CK-41'
-      'OBB-BW-21 Kit'   -> 'OBB-BW-21'
+    Normalize kit header value to a DB-compatible SKU.
+      Old format: 'OBB-CK-41 Kits'  -> 'OBB-CK-41'   (stripped; canonical_sku resolves to 'OBB-CK-41 KITS')
+      New format: 'CM41'             -> 'OBB-CM-41 KITS'  (full canonical form, used when kit not yet in DB)
     """
-    sku = re.sub(r"\s+Kits?$", "", raw.strip(), flags=re.IGNORECASE)
+    s = raw.strip()
+    # New compact format introduced May 2026: 'CM41', 'CN21', etc.
+    m = re.match(r'^([A-Z]{2})(\d{2})$', s)
+    if m:
+        return f"OBB-{m.group(1)}-{m.group(2)} KITS"
+    # Old format: strip trailing ' Kits' / ' Kit'
+    sku = re.sub(r"\s+Kits?$", "", s, flags=re.IGNORECASE)
     return sku.strip()
 
 
@@ -276,8 +282,9 @@ def extract_trimester_from_sku(kit_sku: str) -> Optional[int]:
 
 def is_kit_header(row: list) -> bool:
     """
-    Kit header: col A ends with 'Kits' or 'Kit', col B (order#) empty,
-    col C (email) empty.
+    Kit header: col B (order#) and col C (email) both empty, and col A is either:
+      - Old format: ends with 'Kits' or 'Kit'  (e.g. 'OBB-CK-41 Kits')
+      - New format: exactly two uppercase letters + two digits (e.g. 'CM41', 'CN21')
     """
     while len(row) < 3:
         row.append("")
@@ -286,7 +293,9 @@ def is_kit_header(row: list) -> bool:
     col_c = row[2].strip()
     if not col_a or col_b or col_c:
         return False
-    return bool(re.search(r"\bKits?\b", col_a, re.IGNORECASE))
+    if re.search(r"\bKits?\b", col_a, re.IGNORECASE):
+        return True
+    return bool(re.match(r'^[A-Z]{2}\d{2}$', col_a))
 
 
 def is_customer_row(row: list) -> bool:
