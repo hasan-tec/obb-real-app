@@ -2201,6 +2201,151 @@ async def shopify_customer_webhook(request: Request):
         return JSONResponse({"status": "ok"}, status_code=200)  # Always return 200 to Shopify
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SHOPIFY ORDERS/UPDATED — re-sync engine-relevant data when staff edit an
+# EXISTING order (e.g. adding a due date the customer supplied late, correcting
+# size/gender). Fills the gap where a post-order quiz edit never reached the
+# engine (orders/create only fires once; customers/update is address-only).
+#
+# Safety rules:
+#   - ADDITIVE only: a field is updated ONLY when the edited order actually
+#     carries a value for it, so an unrelated update (fulfillment, tags, payment)
+#     never blanks engine data, and an in-engine manual correction is never
+#     clobbered by an empty/missing order attribute.
+#   - Never creates a customer (no ghosts) and never creates a decision.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/webhooks/shopify/orders/updated")
+async def shopify_order_updated_webhook(request: Request):
+    """Receives Shopify orders/updated. Re-syncs due_date/trimester/size/gender
+    (and address) onto an existing customer — present-fields-only, no decisions."""
+    start_time = time.time()
+    body = await request.body()
+    logger.info(f"[SHOPIFY ORDER UPDATED] Received webhook, body size: {len(body)} bytes")
+
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+    if hmac_header and not verify_shopify_hmac(body, hmac_header):
+        logger.error("[SHOPIFY ORDER UPDATED] HMAC verification FAILED — rejecting")
+        await log_activity("webhook", "Shopify orders/updated HMAC failed", "", "error")
+        return JSONResponse({"error": "HMAC verification failed"}, status_code=401)
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        logger.error(f"[SHOPIFY ORDER UPDATED] JSON decode error: {e}")
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    event_id = request.headers.get("X-Shopify-Webhook-Id", "")
+    shopify_order_id = str(payload.get("id", ""))
+    logger.info(f"[SHOPIFY ORDER UPDATED] Event ID: {event_id}, Order ID: {shopify_order_id}")
+
+    db = get_supabase()
+
+    if event_id:
+        existing = db.table("webhook_logs").select("id").eq("source", "shopify").eq("event_id", event_id).execute()
+        if existing.data:
+            logger.info(f"[SHOPIFY ORDER UPDATED] Duplicate event {event_id} — skipping")
+            return JSONResponse({"status": "duplicate"}, status_code=200)
+
+    webhook_log = db.table("webhook_logs").insert({
+        "source": "shopify",
+        "event_type": "orders/updated",
+        "event_id": event_id or None,
+        "payload": payload,
+        "headers": {"X-Shopify-Webhook-Id": event_id},
+        "status": "received",
+    }).execute()
+    webhook_log_id = webhook_log.data[0]["id"] if webhook_log.data else None
+
+    try:
+        customer_data = payload.get("customer", {}) or {}
+        email = (customer_data.get("email") or payload.get("email") or "").strip().lower()
+        shopify_customer_id = str(customer_data.get("id", "") or "")
+
+        # Find EXISTING customer only — an order edit must never create a ghost.
+        cust_row = None
+        if shopify_customer_id:
+            r = db.table("customers").select("*").eq("shopify_customer_id", shopify_customer_id).limit(1).execute()
+            cust_row = r.data[0] if r.data else None
+        if not cust_row and email:
+            r = db.table("customers").select("*").ilike("email", email).limit(1).execute()
+            cust_row = r.data[0] if r.data else None
+
+        if not cust_row:
+            logger.info(f"[SHOPIFY ORDER UPDATED] No matching engine customer for shopify_id={shopify_customer_id} email={email} — skipping (no ghost)")
+            if webhook_log_id:
+                db.table("webhook_logs").update({"status": "processed", "processing_time_ms": int((time.time() - start_time) * 1000)}).eq("id", webhook_log_id).execute()
+            return JSONResponse({"status": "ok", "reason": "customer not in engine"})
+
+        cust_id = cust_row["id"]
+        line_items = payload.get("line_items", []) or []
+        note_attributes = payload.get("note_attributes", []) or []
+        quiz = extract_quiz_data(note_attributes, line_items)
+
+        # Does the order actually carry a second-parent answer this time? (wants_daddy
+        # defaults False in the parser, so only sync it when the attr is truly present.)
+        def _daddy_present() -> bool:
+            for a in note_attributes:
+                n = str(a.get("name") or "").lower()
+                if ("second_parent" in n or "daddy" in n) and str(a.get("value") or "").strip():
+                    return True
+            for it in line_items:
+                for p in (it.get("properties") or []):
+                    n = (p.get("name") or "").lower()
+                    if ("second_parent" in n or "daddy" in n) and (p.get("value") or "").strip():
+                        return True
+            return False
+
+        update: dict = {}
+        changes: list = []
+
+        due_date = parse_due_date(quiz.get("due_date_str"))
+        if due_date:
+            iso = due_date.isoformat()
+            if iso != (cust_row.get("due_date") or ""):
+                update["due_date"] = iso
+                update["trimester"] = calculate_trimester(due_date, date.today())
+                changes.append(f"due_date→{iso} (T{update['trimester']})")
+        if quiz.get("clothing_size") and quiz["clothing_size"] != cust_row.get("clothing_size"):
+            update["clothing_size"] = quiz["clothing_size"]
+            changes.append(f"size→{quiz['clothing_size']}")
+        if quiz.get("baby_gender") and quiz["baby_gender"] != cust_row.get("baby_gender"):
+            update["baby_gender"] = quiz["baby_gender"]
+            changes.append(f"gender→{quiz['baby_gender']}")
+        if _daddy_present() and bool(quiz.get("wants_daddy")) != bool(cust_row.get("wants_daddy_item")):
+            update["wants_daddy_item"] = bool(quiz["wants_daddy"])
+            changes.append(f"wants_daddy→{update['wants_daddy_item']}")
+
+        # Shipping-address refresh (recipient address for gift orders) — present-only.
+        shipping = payload.get("shipping_address") or {}
+        for src, col in (("address1", "address_line1"), ("city", "city"),
+                         ("province", "province"), ("zip", "zip")):
+            val = (shipping.get(src) or "").strip()
+            if val and val != (cust_row.get(col) or ""):
+                update[col] = val
+                changes.append(f"{col}→{val}")
+
+        if update:
+            db.table("customers").update(update).eq("id", cust_id).execute()
+            logger.info("[SHOPIFY ORDER UPDATED] Synced %s for %s (order=%s): %s",
+                        list(update.keys()), cust_row.get("email"), shopify_order_id, "; ".join(changes))
+            await log_activity("customer", f"Order edit synced for {cust_row.get('email')}",
+                               "; ".join(changes), "success")
+        else:
+            logger.info("[SHOPIFY ORDER UPDATED] No engine-relevant changes for %s (order=%s)",
+                        cust_row.get("email"), shopify_order_id)
+
+        if webhook_log_id:
+            db.table("webhook_logs").update({"status": "processed", "processing_time_ms": int((time.time() - start_time) * 1000)}).eq("id", webhook_log_id).execute()
+        return JSONResponse({"status": "ok", "changes": changes})
+
+    except Exception as e:
+        logger.error(f"[SHOPIFY ORDER UPDATED] Error: {e}", exc_info=True)
+        if webhook_log_id:
+            db.table("webhook_logs").update({"status": "failed", "error_message": str(e), "processing_time_ms": int((time.time() - start_time) * 1000)}).eq("id", webhook_log_id).execute()
+        return JSONResponse({"status": "ok"}, status_code=200)  # Always return 200 to Shopify
+
+
 # ═══════════════════════════════════════════════════════════
 # CRATEJOY WEBHOOK ENDPOINT
 # ═══════════════════════════════════════════════════════════
@@ -6535,6 +6680,16 @@ def submit_to_veracore(decision_id: str, batch_ref: Optional[str] = None,
         return {"status": "failed", "order_id": None, "error": err}
 
 
+def _post_action_redirect(request: Request, fallback: str = "/decisions") -> str:
+    """After a single-decision action (approve/ship/reject), return to the customer
+    detail page it was triggered from — the ✓/📦/✗ buttons on that page — instead of
+    always bouncing to the decisions list. Falls back to the list for actions started
+    on the Decisions page or when Referer is missing/stripped."""
+    ref = request.headers.get("referer", "") or ""
+    m = re.search(r"/customers/[0-9a-fA-F-]{36}", ref)
+    return m.group(0) if m else fallback
+
+
 @app.post("/decisions/{decision_id}/approve")
 async def approve_decision(request: Request, decision_id: str, background_tasks: BackgroundTasks):
     """
@@ -6554,7 +6709,7 @@ async def approve_decision(request: Request, decision_id: str, background_tasks:
         current_status = d.get("status")
         if current_status != "pending":
             logger.warning(f"[APPROVE] Decision {decision_id} is '{current_status}', not 'pending' — skipping")
-            return RedirectResponse("/decisions", status_code=303)
+            return RedirectResponse(_post_action_redirect(request), status_code=303)
 
         # Update decision status
         db.table("decisions").update({"status": "approved"}).eq("id", decision_id).execute()
@@ -6642,7 +6797,7 @@ async def approve_decision(request: Request, decision_id: str, background_tasks:
     except Exception as e:
         logger.error(f"[APPROVE] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to approve decision: {e}", "", "error")
-    return RedirectResponse("/decisions", status_code=303)
+    return RedirectResponse(_post_action_redirect(request), status_code=303)
 
 
 @app.post("/decisions/{decision_id}/reject")
@@ -6657,7 +6812,7 @@ async def reject_decision(request: Request, decision_id: str):
         d = decision.data
         if d.get("status") != "pending":
             logger.warning(f"[REJECT] Decision {decision_id} is '{d.get('status')}', not 'pending'")
-            return RedirectResponse("/decisions", status_code=303)
+            return RedirectResponse(_post_action_redirect(request), status_code=303)
 
         db.table("decisions").update({"status": "rejected"}).eq("id", decision_id).execute()
         cust_email = d.get("customers", {}).get("email", decision_id[:8]) if d.get("customers") else decision_id[:8]
@@ -6672,7 +6827,7 @@ async def reject_decision(request: Request, decision_id: str):
         )
     except Exception as e:
         logger.error(f"[REJECT] Error: {e}", exc_info=True)
-    return RedirectResponse("/decisions", status_code=303)
+    return RedirectResponse(_post_action_redirect(request), status_code=303)
 
 
 @app.post("/decisions/{decision_id}/veracore-retry")
@@ -6939,7 +7094,7 @@ async def ship_decision(request: Request, decision_id: str):
         d = decision.data
         if d.get("status") not in ("approved", "pending"):
             logger.warning(f"[SHIP] Decision {decision_id} is '{d.get('status')}', cannot ship")
-            return RedirectResponse("/decisions", status_code=303)
+            return RedirectResponse(_post_action_redirect(request), status_code=303)
 
         # If shipping from pending, also decrement stock
         if d.get("status") == "pending" and d.get("kit_id"):
@@ -7003,7 +7158,7 @@ async def ship_decision(request: Request, decision_id: str):
     except Exception as e:
         logger.error(f"[SHIP] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to ship decision: {e}", "", "error")
-    return RedirectResponse("/decisions", status_code=303)
+    return RedirectResponse(_post_action_redirect(request), status_code=303)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -7055,14 +7210,25 @@ async def recurate_customer(request: Request, customer_id: str, background_tasks
         # Save new decision
         trimester = cust.data.get("trimester")
 
-        # Find old decision's order_id so we can update its sheet row
+        # Carry order context forward from the customer's original decision so a
+        # re-curated decision keeps its gift ship-to / billing snapshot and order link.
+        # Prefer the most recent decision that actually carries an order_id (the ingested
+        # Shopify/Cratejoy order); fall back to the most recent decision overall.
+        prior_ctx: dict = {}
         old_order_id = ""
         try:
-            old_decisions = db.table("decisions").select("order_id").eq("customer_id", customer_id).eq("status", "rejected").order("created_at", desc=True).limit(1).execute()
-            if old_decisions.data:
-                old_order_id = old_decisions.data[0].get("order_id") or ""
-        except Exception:
-            pass
+            prior_rows = (db.table("decisions")
+                          .select("order_id, platform, ship_first_name, ship_last_name, "
+                                  "billing_first_name, billing_last_name, billing_address1, "
+                                  "billing_city, billing_state, billing_zip, billing_country, created_at")
+                          .eq("customer_id", customer_id).order("created_at", desc=True).execute().data or [])
+            prior_ctx = next((r for r in prior_rows if r.get("order_id")), (prior_rows[0] if prior_rows else {}))
+            old_order_id = prior_ctx.get("order_id") or ""
+            logger.info("[RECURATE] Prior context — order_id=%s ship_to=%s %s platform=%s",
+                        old_order_id or "(none)", prior_ctx.get("ship_first_name"),
+                        prior_ctx.get("ship_last_name"), prior_ctx.get("platform"))
+        except Exception as ctx_err:
+            logger.warning("[RECURATE] Could not load prior decision context: %s", ctx_err)
 
         # Update old decision's sheet row to show "re-curated"
         if email:
@@ -7080,10 +7246,25 @@ async def recurate_customer(request: Request, customer_id: str, background_tasks
             "decision_type": kit_decision["decision_type"],
             "reason": f"[Re-curated] {kit_decision['reason']}",
             "status": "pending",
-            "order_id": None,
-            "platform": None,
+            "order_id": prior_ctx.get("order_id"),
+            "platform": prior_ctx.get("platform"),
             "trimester": trimester,
             "ship_date": date.today().isoformat(),
+            # Freeze order_type now — before any shipment for this cycle exists — so a
+            # first-box re-curate stays 'new' instead of the NULL→has-shipment fallback
+            # flipping it to 'renewal'. Genuine renewals still compute 'renewal'.
+            "order_type": _compute_order_type(db, customer_id),
+            # Preserve gift recipient (ship-to) + purchaser (billing) snapshot so the
+            # VeraCore label ships to the recipient, not the account holder.
+            "ship_first_name": prior_ctx.get("ship_first_name"),
+            "ship_last_name": prior_ctx.get("ship_last_name"),
+            "billing_first_name": prior_ctx.get("billing_first_name"),
+            "billing_last_name": prior_ctx.get("billing_last_name"),
+            "billing_address1": prior_ctx.get("billing_address1"),
+            "billing_city": prior_ctx.get("billing_city"),
+            "billing_state": prior_ctx.get("billing_state"),
+            "billing_zip": prior_ctx.get("billing_zip"),
+            "billing_country": prior_ctx.get("billing_country"),
         }
         db.table("decisions").insert(decision_record).execute()
         logger.info(f"[RECURATE] Decision inserted for {email} ({kit_decision['decision_type']})")
