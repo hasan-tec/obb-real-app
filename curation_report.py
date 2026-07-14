@@ -32,18 +32,11 @@ RISK_MEDIUM_THRESHOLD = 25.0      # >= 25% blocked = MEDIUM risk
 # ─── Trimester Calculation (same as Phase 1) ───
 
 def calc_trimester(due_date: date, ship_date: date) -> int:
-    """Calculate trimester from due date and ship date. Same formula as Phase 1."""
-    t4_cutoff = ship_date + timedelta(days=19)
-    t3_cutoff = t4_cutoff + timedelta(weeks=13)
-    t2_cutoff = t3_cutoff + timedelta(weeks=14)
-    if due_date <= t4_cutoff:
-        return 4
-    elif due_date <= t3_cutoff:
-        return 3
-    elif due_date <= t2_cutoff:
-        return 2
-    else:
-        return 1
+    """Trimester from due/ship date. Delegates to the single source of truth in app.py
+    so the formula can never drift between the engine and the monthly report.
+    Lazy import avoids a circular import at module load (app imports this module)."""
+    from app import calculate_trimester
+    return calculate_trimester(due_date, ship_date)
 
 
 # ─── Lookback Window Calculation ───

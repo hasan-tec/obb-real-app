@@ -958,6 +958,37 @@ def _schedule_lock(key: str) -> bool:
     except FileExistsError:
         return False
 
+
+def _refresh_customer_trimesters(db, today: date) -> dict:
+    """Recompute customers.trimester from due_date for active-ish customers so the stored
+    value (used by the customers list + filters + engine fallback) doesn't drift as due
+    dates near. The customer detail page already self-heals on view; this keeps the whole
+    table correct without needing a visit. due_date is the source of truth."""
+    statuses = ["active", "cancelled-prepaid", "paused"]
+    scanned = updated = 0
+    offset = 0
+    while True:
+        batch = (db.table("customers")
+                 .select("id, due_date, trimester")
+                 .in_("subscription_status", statuses)
+                 .not_.is_("due_date", "null")
+                 .range(offset, offset + 999).execute().data or [])
+        for c in batch:
+            scanned += 1
+            try:
+                live = calculate_trimester(date.fromisoformat(str(c["due_date"])[:10]), today)
+            except Exception:
+                continue
+            if c.get("trimester") != live:
+                db.table("customers").update({"trimester": live}).eq("id", c["id"]).execute()
+                updated += 1
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    logger.info("[TRIMESTER REFRESH] scanned=%d updated=%d (today=%s)", scanned, updated, today)
+    return {"scanned": scanned, "updated": updated}
+
+
 def _monthly_report_scheduler():
     """Background thread that checks once per hour if it's the 1st and triggers the report."""
     import time as _time
@@ -966,6 +997,7 @@ def _monthly_report_scheduler():
     last_inventory_day = None  # Phase 3 — daily VeraCore inventory sync guard
     last_shipment_poll_day = None  # Phase 3 — daily VeraCore shipment poll guard
     last_cj_reconcile_day = None  # Threads 7+10 — daily Cratejoy cancellation/ship-to reconciliation guard
+    last_trimester_refresh_day = None  # Thread 18 — daily customers.trimester refresh guard
     while True:
         try:
             now = datetime.utcnow()
@@ -1043,6 +1075,22 @@ def _monthly_report_scheduler():
                 else:
                     logger.info("[SCHEDULER] CJ reconciliation for %s already claimed by another worker, skipping", current_day_key)
                 last_cj_reconcile_day = current_day_key
+
+            # Daily trimester refresh (Thread 18) — recompute customers.trimester from
+            # due_date so the stored value / customers-list filter don't drift as due
+            # dates near. Once/day after 6 AM UTC.
+            if now.hour >= 6 and last_trimester_refresh_day != current_day_key:
+                if _schedule_lock(f"tri_refresh_{current_day_key}"):
+                    logger.info("[SCHEDULER] Daily trimester refresh triggered for %s", current_day_key)
+                    try:
+                        db = get_supabase()
+                        tri_result = _refresh_customer_trimesters(db, now.date())
+                        logger.info("[SCHEDULER] Trimester refresh complete: %s", tri_result)
+                    except Exception as e:
+                        logger.error("[SCHEDULER] Trimester refresh failed: %s", e, exc_info=True)
+                else:
+                    logger.info("[SCHEDULER] Trimester refresh for %s already claimed by another worker, skipping", current_day_key)
+                last_trimester_refresh_day = current_day_key
 
             # Phase 3 — Daily VeraCore inventory sync at ~04:00 UTC (≈11 PM ET).
             # Skipped entirely when VeraCore is not configured.
@@ -4272,12 +4320,10 @@ async def decisions_page(request: Request):
 
         # Build Supabase query with server-side filters — helper to rebuild for pagination
         def _build_q():
-            qo = db.table("decisions").select("*, customers(email, first_name, last_name, address_line1, city, province, zip)")
-            if f_trimester:
-                try:
-                    qo = qo.eq("trimester", int(f_trimester))
-                except ValueError:
-                    pass
+            # trimester is filtered in Python on the customer's LIVE trimester (below),
+            # NOT here — decision.trimester is a frozen snapshot that drifts as the due
+            # date nears (Thread 18). due_date is joined so we can recompute it live.
+            qo = db.table("decisions").select("*, customers(email, first_name, last_name, due_date, trimester, address_line1, city, province, zip)")
             if f_status:
                 qo = qo.eq("status", f_status)
             if f_type:
@@ -4334,6 +4380,27 @@ async def decisions_page(request: Request):
                 or q in (d.get("kit_sku") or "").lower()
             ]
             logger.info(f"[DECISIONS PAGE] Text search '{q}' → {len(all_decisions)} decisions")
+
+        # ─── Live trimester (Thread 18) ──────────────────────────────────────────
+        # decision.trimester is frozen at creation and drifts as the due date nears, so
+        # the Decisions page disagreed with the customer's true (advanced) trimester.
+        # Recompute each row from the customer's due_date (same formula the customer
+        # page uses) and use it for BOTH the badge and the trimester filter.
+        _tri_today = date.today()
+        for d in all_decisions:
+            c = d.get("customers") or {}
+            dd = c.get("due_date")
+            live = d.get("trimester")
+            if dd:
+                try:
+                    live = calculate_trimester(date.fromisoformat(str(dd)[:10]), _tri_today)
+                except Exception:
+                    pass
+            d["_live_trimester"] = live
+            d["trimester"] = live  # show the live value in the badge/column
+        if f_trimester:
+            all_decisions = [d for d in all_decisions if str(d.get("_live_trimester")) == f_trimester]
+            logger.info("[DECISIONS PAGE] live-trimester filter T%s → %d decisions", f_trimester, len(all_decisions))
 
         # Tag each decision with _order_type — use stored column; shipment scan only for legacy NULLs
         if all_decisions:
@@ -7301,6 +7368,89 @@ async def recurate_customer(request: Request, customer_id: str, background_tasks
         except Exception as log_err:
             logger.error(f"[RECURATE] log_activity also failed: {log_err}")
     return RedirectResponse(f"/customers/{customer_id}", status_code=303)
+
+
+@app.api_route("/admin/recurate-stale", methods=["GET", "POST"])
+async def recurate_stale_decisions(request: Request):
+    """Re-curate PENDING decisions whose stored trimester no longer matches the customer's
+    LIVE trimester (Thread 18). Re-runs the engine and replaces the stale kit + trimester
+    IN PLACE (status stays pending; approved/shipped decisions are NEVER touched).
+
+    Query params:
+      dry_run = true (default) | false   — preview vs apply
+      month   = YYYY-MM (optional)        — limit to decisions created in that month (e.g. 2026-07)
+
+    Safe by default: dry_run returns exactly what WOULD change and writes nothing.
+    """
+    dry_run = request.query_params.get("dry_run", "true").strip().lower() != "false"
+    f_month = request.query_params.get("month", "").strip()
+    db = get_supabase()
+    today = date.today()
+
+    # All PENDING decisions + the customer's due_date, paginated past the 1000-row cap.
+    pend, offset = [], 0
+    while True:
+        batch = (db.table("decisions")
+                 .select("id, customer_id, trimester, kit_sku, created_at, customers(email, due_date)")
+                 .eq("status", "pending")
+                 .range(offset, offset + 999).execute().data or [])
+        pend.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+
+    targets = []
+    for d in pend:
+        c = d.get("customers") or {}
+        dd = c.get("due_date")
+        if not dd:
+            continue
+        if f_month and not str(d.get("created_at") or "").startswith(f_month):
+            continue
+        try:
+            live = calculate_trimester(date.fromisoformat(str(dd)[:10]), today)
+        except Exception:
+            continue
+        if d.get("trimester") == live:
+            continue  # already correct — skip
+        targets.append((d, c, live))
+
+    logger.info("[RECURATE-STALE] dry_run=%s month=%s pending=%d stale_targets=%d",
+                dry_run, f_month or "all", len(pend), len(targets))
+
+    rows, applied, skipped = [], 0, 0
+    for d, c, live in targets:
+        new = await assign_kit(d["customer_id"], today)
+        row = {
+            "email": c.get("email"),
+            "old_trimester": d.get("trimester"), "new_trimester": live,
+            "old_kit": d.get("kit_sku"), "new_kit": new.get("kit_sku"),
+            "new_decision_type": new["decision_type"],
+        }
+        if not dry_run and new["decision_type"] == "auto" and new.get("kit_id"):
+            db.table("decisions").update({
+                "kit_id": new.get("kit_id"),
+                "kit_sku": new.get("kit_sku"),
+                "trimester": live,
+                "decision_type": new["decision_type"],
+                "reason": f"[Re-curated: trimester {d.get('trimester')}→{live}] {new['reason']}",
+            }).eq("id", d["id"]).execute()
+            applied += 1
+            row["action"] = "updated"
+        else:
+            skipped += 1
+            row["action"] = "preview" if dry_run else f"skipped ({new['decision_type']})"
+        rows.append(row)
+
+    if not dry_run:
+        await log_activity("decision", f"Re-curated stale pending decisions (month={f_month or 'all'})",
+                           f"applied={applied}, skipped={skipped}, targets={len(targets)}", "success")
+
+    return JSONResponse({
+        "dry_run": dry_run, "month": f_month or "all",
+        "pending_scanned": len(pend), "stale_targets": len(targets),
+        "applied": applied, "skipped": skipped, "rows": rows[:300],
+    })
 
 
 # ═══════════════════════════════════════════════════════════
