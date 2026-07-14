@@ -7274,8 +7274,18 @@ async def recurate_customer(request: Request, customer_id: str, background_tasks
                 status_code=303,
             )
 
-        # Save new decision
+        # Save new decision.
+        # Use the LIVE trimester (recomputed from due_date today) so the decision's
+        # trimester matches the kit assign_kit just picked. The stored customers.trimester
+        # can be stale, which is what left re-curated decisions labelled with a trimester
+        # that disagreed with their kit (Thread 18 / Category B).
+        due_raw = cust.data.get("due_date")
         trimester = cust.data.get("trimester")
+        if due_raw:
+            try:
+                trimester = calculate_trimester(date.fromisoformat(str(due_raw)[:10]), date.today())
+            except Exception:
+                pass
 
         # Carry order context forward from the customer's original decision so a
         # re-curated decision keeps its gift ship-to / billing snapshot and order link.
