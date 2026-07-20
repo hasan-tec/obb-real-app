@@ -665,6 +665,10 @@ async def process_cratejoy_box(db, client, shipment: dict, today: date, dry_run:
 
     cust_id = cust_row["id"]
 
+    # Thread 17: a paused/on-hold customer never gets a new decision queued.
+    if cust_row.get("subscription_status") == "paused":
+        return "skip_paused"
+
     # Backlog customer without real kit history → never auto-decide yet
     if cust_row.get("history_pending"):
         return "skip_history_pending"
@@ -940,6 +944,145 @@ async def cratejoy_daily_reconcile(db, dry_run: bool = False) -> dict:
     return {"dry_run": dry_run, "decisions": decisions_result, "customers": customers_result}
 
 
+# ═══════════════════════════════════════════════════════════
+# SHOPIFY DAILY HOLD RECONCILIATION  (Thread 17 — SHOPIFY_ONHOLD_PLAN.md)
+# ═══════════════════════════════════════════════════════════
+# Set-based, unlike the Cratejoy reconcile above: there are 1,000+ open Shopify
+# decisions but typically only a handful of ON_HOLD orders, so we pull the small
+# on-hold set ONCE (one search query) and intersect it against open decisions,
+# instead of polling Shopify once per open decision.
+_SHOPIFY_OPEN_FO_STATES = {"OPEN", "IN_PROGRESS", "SCHEDULED"}
+
+
+async def shopify_daily_reconcile(db, dry_run: bool = False) -> dict:
+    """
+    PAUSE pass  — a pending decision whose Shopify order is ON_HOLD gets rejected
+      with a "[Shopify hold]" reason marker (so RESUME can tell an auto-pause from a
+      staff-set pause), and the customer is set subscription_status='paused'. An
+      *approved* decision for an on-hold order is never silently rejected (it may
+      already be pushed to VeraCore) — it's flagged via log_activity for manual
+      follow-up instead, but the customer is still paused so nothing new gets queued.
+    RESUME pass — a customer paused via a "[Shopify hold]" decision whose order is no
+      longer on hold AND has an open fulfillment order again gets un-paused and
+      re-curated. Staff-set pauses (no marker decision) are never touched.
+    Never raises; callers get counts. No-op when outbound Shopify creds are missing.
+    """
+    if not shopify_fulfillment_enabled():
+        logger.info("[SHOPIFY RECONCILE] Shopify outbound creds not set — skipping")
+        return {"skipped": "no_creds"}
+
+    from shopify_client import ShopifyError
+    sc = get_shopify_client()
+
+    try:
+        held = sc.get_on_hold_order_ids()
+    except ShopifyError as e:
+        logger.error("[SHOPIFY RECONCILE] failed to fetch on-hold order ids: %s", e)
+        return {"error": str(e)}
+
+    counts: dict = {"held_orders": len(held)}
+
+    # ─── PAUSE pass ───
+    open_decisions: list[dict] = []
+    offset = 0
+    while True:
+        batch = (db.table("decisions")
+                 .select("id, customer_id, status, order_id, kit_sku")
+                 .eq("platform", "shopify").in_("status", ["pending", "approved"])
+                 .not_.is_("order_id", "null")
+                 .range(offset, offset + 999).execute().data or [])
+        open_decisions.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    counts["scanned"] = len(open_decisions)
+
+    paused_customer_ids: set[str] = set()
+    for d in open_decisions:
+        if d["order_id"] not in held:
+            continue
+        if d["status"] == "pending":
+            counts["paused"] = counts.get("paused", 0) + 1
+            logger.info("[SHOPIFY RECONCILE] %s decision=%s order=%s customer=%s — order on hold in Shopify",
+                        "WOULD pause" if dry_run else "pausing", d["id"], d["order_id"], d["customer_id"])
+            if not dry_run:
+                db.table("decisions").update({
+                    "status": "rejected",
+                    "reason": "[Shopify hold] order on hold in Shopify — auto-paused by daily reconcile",
+                }).eq("id", d["id"]).execute()
+            paused_customer_ids.add(d["customer_id"])
+        elif d["status"] == "approved":
+            counts["approved_flagged"] = counts.get("approved_flagged", 0) + 1
+            logger.warning("[SHOPIFY RECONCILE] APPROVED decision=%s order=%s customer=%s is for an "
+                           "ON_HOLD Shopify order — not auto-rejecting (may already be at VeraCore); "
+                           "flagging for manual review", d["id"], d["order_id"], d["customer_id"])
+            if not dry_run:
+                await log_activity(
+                    "decision",
+                    f"Approved decision {d['id'][:8]} is for an ON_HOLD Shopify order — check manually",
+                    f"order={d['order_id']}, kit={d.get('kit_sku') or '—'}", "warning",
+                )
+            paused_customer_ids.add(d["customer_id"])
+
+    for cust_id in paused_customer_ids:
+        cust = db.table("customers").select("subscription_status, email").eq("id", cust_id).single().execute()
+        if not cust.data or cust.data.get("subscription_status") == "paused":
+            continue
+        logger.info("[SHOPIFY RECONCILE] %s customer=%s (%s) -> paused",
+                    "WOULD set" if dry_run else "setting", cust_id, cust.data.get("email"))
+        if not dry_run:
+            db.table("customers").update({"subscription_status": "paused"}).eq("id", cust_id).execute()
+            await log_activity("customer", f"Paused {cust.data.get('email')} — Shopify order on hold", "", "info")
+
+    # ─── RESUME pass ───
+    paused_customers = (
+        db.table("customers").select("id, email")
+        .eq("subscription_status", "paused")
+        .in_("platform", ["shopify", "both"])
+        .execute().data or []
+    )
+    for cust in paused_customers:
+        marker = (
+            db.table("decisions").select("id, order_id")
+            .eq("customer_id", cust["id"]).eq("status", "rejected")
+            .ilike("reason", "[Shopify hold]%")
+            .not_.is_("order_id", "null")
+            .order("created_at", desc=True).limit(1).execute().data
+        )
+        if not marker:
+            continue  # staff-set pause (no auto-pause marker) — never auto-resume
+        order_id = marker[0]["order_id"]
+        if order_id in held:
+            continue  # still on hold
+
+        try:
+            statuses = sc.get_fulfillment_order_statuses(order_id)
+        except ShopifyError as e:
+            logger.warning("[SHOPIFY RECONCILE] resume check failed customer=%s order=%s: %s",
+                           cust["id"], order_id, e)
+            continue
+        if not any(s in _SHOPIFY_OPEN_FO_STATES for s in statuses):
+            logger.info("[SHOPIFY RECONCILE] customer=%s order=%s hold released but no open fulfillment "
+                       "order (statuses=%s) — nothing to resume", cust["id"], order_id, statuses)
+            continue
+
+        counts["resumed"] = counts.get("resumed", 0) + 1
+        logger.info("[SHOPIFY RECONCILE] %s customer=%s (%s) — order=%s hold released",
+                   "WOULD resume" if dry_run else "resuming", cust["id"], cust.get("email"), order_id)
+        if dry_run:
+            continue
+        db.table("customers").update({"subscription_status": "active"}).eq("id", cust["id"]).execute()
+        bg = BackgroundTasks()
+        recurate_result = await _recurate_customer_core(db, cust["id"], bg, reason_prefix="Resumed", allow_paused=True)
+        await bg()
+        logger.info("[SHOPIFY RECONCILE] resumed customer=%s — recurate status=%s",
+                   cust["id"], recurate_result["status"])
+        await log_activity("customer", f"Resumed {cust.get('email')} — Shopify hold released", "", "success")
+
+    logger.info("[SHOPIFY RECONCILE] %s — %s", "DRY RUN" if dry_run else "done", counts)
+    return {"dry_run": dry_run, **counts}
+
+
 # ─── Monthly curation report scheduler ───
 # Runs on the 1st of each month at ~6 AM UTC. Uses a lightweight background thread.
 _scheduler_started = False
@@ -998,6 +1141,7 @@ def _monthly_report_scheduler():
     last_shipment_poll_day = None  # Phase 3 — daily VeraCore shipment poll guard
     last_cj_reconcile_day = None  # Threads 7+10 — daily Cratejoy cancellation/ship-to reconciliation guard
     last_trimester_refresh_day = None  # Thread 18 — daily customers.trimester refresh guard
+    last_shopify_reconcile_day = None  # Thread 17 — daily Shopify on-hold reconciliation guard
     while True:
         try:
             now = datetime.utcnow()
@@ -1075,6 +1219,22 @@ def _monthly_report_scheduler():
                 else:
                     logger.info("[SCHEDULER] CJ reconciliation for %s already claimed by another worker, skipping", current_day_key)
                 last_cj_reconcile_day = current_day_key
+
+            # Shopify daily on-hold reconciliation (Thread 17) — pauses decisions/customers
+            # whose Shopify order is ON_HOLD, resumes ones whose hold was released. No-op
+            # when Shopify outbound creds aren't configured. Once/day after 7 AM UTC.
+            if now.hour >= 7 and last_shopify_reconcile_day != current_day_key:
+                if _schedule_lock(f"shopify_reconcile_{current_day_key}"):
+                    logger.info("[SCHEDULER] Shopify daily hold reconciliation triggered for %s", current_day_key)
+                    try:
+                        db = get_supabase()
+                        shopify_reconcile_result = asyncio.run(shopify_daily_reconcile(db))
+                        logger.info("[SCHEDULER] Shopify hold reconciliation complete: %s", shopify_reconcile_result)
+                    except Exception as e:
+                        logger.error("[SCHEDULER] Shopify hold reconciliation failed: %s", e, exc_info=True)
+                else:
+                    logger.info("[SCHEDULER] Shopify hold reconciliation for %s already claimed by another worker, skipping", current_day_key)
+                last_shopify_reconcile_day = current_day_key
 
             # Daily trimester refresh (Thread 18) — recompute customers.trimester from
             # due_date so the stored value / customers-list filter don't drift as due
@@ -2066,7 +2226,15 @@ async def shopify_order_webhook(request: Request):
                 logger.info(f"[SHOPIFY WEBHOOK] Created new customer: {cust_id}")
 
             # ─── Run Decision Engine (subscription orders only) ───
-            if cust_id and is_subscription_order:
+            # Thread 17: a paused/on-hold customer never gets a new decision queued —
+            # customer data above is still upserted (address/quiz stay current), just no
+            # curation while paused.
+            existing_sub_status = existing_customer.data[0].get("subscription_status") if existing_customer.data else None
+            if cust_id and is_subscription_order and existing_sub_status == "paused":
+                logger.info(f"[SHOPIFY WEBHOOK] Customer {cust_id} ({email}) is paused — skipping decision engine")
+                await log_activity("webhook", f"Skipped curation for {email} — customer is paused/on hold",
+                                   f"order={shopify_order_id}", "info")
+            elif cust_id and is_subscription_order:
                 kit_decision = await assign_kit(cust_id, date.today())
                 logger.info(f"[SHOPIFY WEBHOOK] Decision engine result: {kit_decision['decision_type']} — {kit_decision.get('kit_sku', 'none')}")
 
@@ -3038,6 +3206,15 @@ async def run_cratejoy_daily_reconcile(request: Request):
     dry = str(request.query_params.get("dry_run", "false")).lower() in ("1", "true", "yes")
     db = get_supabase()
     result = await cratejoy_daily_reconcile(db, dry_run=dry)
+    return JSONResponse({"dry_run": dry, "result": result})
+
+
+@app.post("/api/shopify/hold-reconcile")
+async def run_shopify_hold_reconcile(request: Request):
+    """Manually trigger the Shopify on-hold reconciliation (Thread 17). ?dry_run=true previews without writing."""
+    dry = str(request.query_params.get("dry_run", "false")).lower() in ("1", "true", "yes")
+    db = get_supabase()
+    result = await shopify_daily_reconcile(db, dry_run=dry)
     return JSONResponse({"dry_run": dry, "result": result})
 
 
@@ -6767,7 +6944,7 @@ async def approve_decision(request: Request, decision_id: str, background_tasks:
     """
     try:
         db = get_supabase()
-        decision = db.table("decisions").select("*, customers(email, first_name, last_name)").eq("id", decision_id).single().execute()
+        decision = db.table("decisions").select("*, customers(email, first_name, last_name, subscription_status)").eq("id", decision_id).single().execute()
         if not decision.data:
             logger.error(f"[APPROVE] Decision {decision_id} not found")
             return JSONResponse({"error": "Decision not found"}, status_code=404)
@@ -6777,6 +6954,15 @@ async def approve_decision(request: Request, decision_id: str, background_tasks:
         if current_status != "pending":
             logger.warning(f"[APPROVE] Decision {decision_id} is '{current_status}', not 'pending' — skipping")
             return RedirectResponse(_post_action_redirect(request), status_code=303)
+
+        # Thread 17: block approving a decision for a paused/on-hold customer.
+        if (d.get("customers") or {}).get("subscription_status") == "paused":
+            logger.warning(f"[APPROVE] Decision {decision_id} blocked — customer is paused/on hold")
+            sep = "&" if "?" in _post_action_redirect(request) else "?"
+            return RedirectResponse(
+                f"{_post_action_redirect(request)}{sep}msg={quote('Customer is paused/on hold — cannot approve.')}&msg_type=error",
+                status_code=303,
+            )
 
         # Update decision status
         db.table("decisions").update({"status": "approved"}).eq("id", decision_id).execute()
@@ -7154,7 +7340,7 @@ async def ship_decision(request: Request, decision_id: str):
     """
     try:
         db = get_supabase()
-        decision = db.table("decisions").select("*, customers(email, first_name, last_name)").eq("id", decision_id).single().execute()
+        decision = db.table("decisions").select("*, customers(email, first_name, last_name, subscription_status)").eq("id", decision_id).single().execute()
         if not decision.data:
             return JSONResponse({"error": "Decision not found"}, status_code=404)
 
@@ -7162,6 +7348,15 @@ async def ship_decision(request: Request, decision_id: str):
         if d.get("status") not in ("approved", "pending"):
             logger.warning(f"[SHIP] Decision {decision_id} is '{d.get('status')}', cannot ship")
             return RedirectResponse(_post_action_redirect(request), status_code=303)
+
+        # Thread 17: block shipping a decision for a paused/on-hold customer.
+        if (d.get("customers") or {}).get("subscription_status") == "paused":
+            logger.warning(f"[SHIP] Decision {decision_id} blocked — customer is paused/on hold")
+            sep = "&" if "?" in _post_action_redirect(request) else "?"
+            return RedirectResponse(
+                f"{_post_action_redirect(request)}{sep}msg={quote('Customer is paused/on hold — cannot ship.')}&msg_type=error",
+                status_code=303,
+            )
 
         # If shipping from pending, also decrement stock
         if d.get("status") == "pending" and d.get("kit_id"):
@@ -7232,6 +7427,166 @@ async def ship_decision(request: Request, decision_id: str):
 # RE-CURATE (Re-run decision engine for a customer)
 # ═══════════════════════════════════════════════════════════
 
+async def _recurate_customer_core(
+    db, customer_id: str, background_tasks: BackgroundTasks,
+    reason_prefix: str = "Re-curated", allow_paused: bool = False,
+) -> dict:
+    """
+    Shared core for re-running the decision engine for a customer. Used by both the
+    POST /customers/{id}/recurate route and the Shopify hold-reconcile resume pass
+    (which calls this after flipping the customer back to active — allow_paused=True
+    lets it through in the same call in case of a race).
+
+    Returns {"status": ..., "message": ..., "kit_decision": dict|None}. Never catches
+    unexpected exceptions itself — callers keep their own try/except around the call,
+    matching the original route's error handling.
+
+    status values: not_found | blocked_paused | blocked_pending | incomplete_data | ok
+    """
+    cust = db.table("customers").select(
+        "email, first_name, last_name, due_date, clothing_size, trimester, subscription_status"
+    ).eq("id", customer_id).single().execute()
+    if not cust.data:
+        logger.error(f"[RECURATE] Customer {customer_id} not found")
+        return {"status": "not_found", "message": "Customer not found", "kit_decision": None}
+
+    email = cust.data["email"]
+    logger.info(f"[RECURATE] Re-running decision engine for {email} (customer_id={customer_id})")
+
+    # Guard: a paused/on-hold customer never gets curated (Shopify on-hold gating).
+    if not allow_paused and cust.data.get("subscription_status") == "paused":
+        logger.warning(f"[RECURATE] Customer {customer_id} ({email}) is paused — blocked")
+        return {
+            "status": "blocked_paused",
+            "message": "Customer subscription is paused/on hold. Resume it first, then re-curate.",
+            "kit_decision": None,
+        }
+
+    # Guard: reject if there are already pending decisions to avoid stacking
+    existing_pending = db.table("decisions").select("id").eq("customer_id", customer_id).eq("status", "pending").execute()
+    if existing_pending.data:
+        pending_count = len(existing_pending.data)
+        logger.warning(f"[RECURATE] {pending_count} pending decision(s) already exist for {email} — blocked stacking")
+        return {
+            "status": "blocked_pending",
+            "message": f"{pending_count} pending decision(s) already exist. Reject or approve them first, then re-curate.",
+            "kit_decision": None,
+        }
+
+    # Run the decision engine
+    kit_decision = await assign_kit(customer_id, date.today())
+    logger.info(f"[RECURATE] Result: {kit_decision['decision_type']} — Kit: {kit_decision.get('kit_sku', 'none')}")
+
+    # Early return for incomplete-data — do NOT insert a dangling pending decision
+    if kit_decision["decision_type"] == "incomplete-data":
+        reason = kit_decision.get("reason", "Missing customer data")
+        logger.warning(f"[RECURATE] Skipping insert — incomplete-data for {email}: {reason}")
+        return {
+            "status": "incomplete_data",
+            "message": f"Cannot curate: {reason}. Edit the customer to add missing data first.",
+            "kit_decision": kit_decision,
+        }
+
+    # Save new decision.
+    # Use the LIVE trimester (recomputed from due_date today) so the decision's
+    # trimester matches the kit assign_kit just picked. The stored customers.trimester
+    # can be stale, which is what left re-curated decisions labelled with a trimester
+    # that disagreed with their kit (Thread 18 / Category B).
+    due_raw = cust.data.get("due_date")
+    trimester = cust.data.get("trimester")
+    if due_raw:
+        try:
+            trimester = calculate_trimester(date.fromisoformat(str(due_raw)[:10]), date.today())
+        except Exception:
+            pass
+
+    # Carry order context forward from the customer's original decision so a
+    # re-curated decision keeps its gift ship-to / billing snapshot and order link.
+    # Prefer the most recent decision that actually carries an order_id (the ingested
+    # Shopify/Cratejoy order); fall back to the most recent decision overall.
+    prior_ctx: dict = {}
+    old_order_id = ""
+    try:
+        prior_rows = (db.table("decisions")
+                      .select("order_id, platform, ship_first_name, ship_last_name, "
+                              "billing_first_name, billing_last_name, billing_address1, "
+                              "billing_city, billing_state, billing_zip, billing_country, created_at")
+                      .eq("customer_id", customer_id).order("created_at", desc=True).execute().data or [])
+        prior_ctx = next((r for r in prior_rows if r.get("order_id")), (prior_rows[0] if prior_rows else {}))
+        old_order_id = prior_ctx.get("order_id") or ""
+        logger.info("[RECURATE] Prior context — order_id=%s ship_to=%s %s platform=%s",
+                    old_order_id or "(none)", prior_ctx.get("ship_first_name"),
+                    prior_ctx.get("ship_last_name"), prior_ctx.get("platform"))
+    except Exception as ctx_err:
+        logger.warning("[RECURATE] Could not load prior decision context: %s", ctx_err)
+
+    # Update old decision's sheet row to show "re-curated"
+    if email:
+        update_decision_status_in_sheet(
+            email=email,
+            order_id=old_order_id,
+            new_status="re-curated",
+            reason_prefix=reason_prefix,
+        )
+
+    decision_record = {
+        "customer_id": customer_id,
+        "kit_id": kit_decision.get("kit_id"),
+        "kit_sku": kit_decision.get("kit_sku"),
+        "decision_type": kit_decision["decision_type"],
+        "reason": f"[{reason_prefix}] {kit_decision['reason']}",
+        "status": "pending",
+        "order_id": prior_ctx.get("order_id"),
+        "platform": prior_ctx.get("platform"),
+        "trimester": trimester,
+        "ship_date": date.today().isoformat(),
+        # Freeze order_type now — before any shipment for this cycle exists — so a
+        # first-box re-curate stays 'new' instead of the NULL→has-shipment fallback
+        # flipping it to 'renewal'. Genuine renewals still compute 'renewal'.
+        "order_type": _compute_order_type(db, customer_id),
+        # Preserve gift recipient (ship-to) + purchaser (billing) snapshot so the
+        # VeraCore label ships to the recipient, not the account holder.
+        "ship_first_name": prior_ctx.get("ship_first_name"),
+        "ship_last_name": prior_ctx.get("ship_last_name"),
+        "billing_first_name": prior_ctx.get("billing_first_name"),
+        "billing_last_name": prior_ctx.get("billing_last_name"),
+        "billing_address1": prior_ctx.get("billing_address1"),
+        "billing_city": prior_ctx.get("billing_city"),
+        "billing_state": prior_ctx.get("billing_state"),
+        "billing_zip": prior_ctx.get("billing_zip"),
+        "billing_country": prior_ctx.get("billing_country"),
+    }
+    db.table("decisions").insert(decision_record).execute()
+    logger.info(f"[RECURATE] Decision inserted for {email} ({kit_decision['decision_type']})")
+
+    # Write to Google Sheets in background — non-blocking so Heroku H12 never fires
+    sheet_payload = {
+        "date": date.today().isoformat(),
+        "customer_name": f"{cust.data.get('first_name', '')} {cust.data.get('last_name', '')}".strip(),
+        "email": email,
+        "platform": "re-curate",
+        "trimester": trimester,
+        "order_type": "re-curate",
+        "kit_sku": kit_decision.get("kit_sku", "—"),
+        "decision_type": kit_decision["decision_type"],
+        "reason": f"[{reason_prefix}] {kit_decision['reason']}",
+        "order_id": old_order_id or "",
+        "due_date": cust.data.get("due_date", "") or "",
+        "clothing_size": cust.data.get("clothing_size", "") or "",
+    }
+    def _write_sheet_safe(payload: dict):
+        try:
+            write_decision_to_sheet(payload)
+            logger.info(f"[RECURATE] Google Sheets write succeeded for {email}")
+        except Exception as sheet_err:
+            logger.error(f"[RECURATE] Google Sheets write failed (non-fatal, decision already saved): {sheet_err}")
+    background_tasks.add_task(_write_sheet_safe, sheet_payload)
+
+    await log_activity("decision", f"{reason_prefix} {email}: {kit_decision['decision_type']}",
+                      f"Kit: {kit_decision.get('kit_sku', '—')}, T{trimester}", "success")
+    return {"status": "ok", "message": "Re-curated", "kit_decision": kit_decision}
+
+
 @app.post("/customers/{customer_id}/recurate")
 async def recurate_customer(request: Request, customer_id: str, background_tasks: BackgroundTasks):
     """
@@ -7243,134 +7598,19 @@ async def recurate_customer(request: Request, customer_id: str, background_tasks
     """
     try:
         db = get_supabase()
-        cust = db.table("customers").select("email, first_name, last_name, due_date, clothing_size, trimester").eq("id", customer_id).single().execute()
-        if not cust.data:
-            logger.error(f"[RECURATE] Customer {customer_id} not found")
+        result = await _recurate_customer_core(db, customer_id, background_tasks)
+        if result["status"] == "not_found":
             return RedirectResponse(f"/customers/{customer_id}", status_code=303)
-
-        email = cust.data["email"]
-        logger.info(f"[RECURATE] Re-running decision engine for {email} (customer_id={customer_id})")
-
-        # Guard: reject if there are already pending decisions to avoid stacking
-        existing_pending = db.table("decisions").select("id").eq("customer_id", customer_id).eq("status", "pending").execute()
-        if existing_pending.data:
-            pending_count = len(existing_pending.data)
-            logger.warning(f"[RECURATE] {pending_count} pending decision(s) already exist for {email} — blocked stacking")
+        if result["status"] in ("blocked_paused", "blocked_pending"):
             return RedirectResponse(
-                f"/customers/{customer_id}?msg={quote(f'{pending_count} pending decision(s) already exist. Reject or approve them first, then re-curate.')}&msg_type=error",
+                f"/customers/{customer_id}?msg={quote(result['message'])}&msg_type=error",
                 status_code=303,
             )
-
-        # Run the decision engine
-        kit_decision = await assign_kit(customer_id, date.today())
-        logger.info(f"[RECURATE] Result: {kit_decision['decision_type']} — Kit: {kit_decision.get('kit_sku', 'none')}")
-
-        # Early return for incomplete-data — do NOT insert a dangling pending decision
-        if kit_decision["decision_type"] == "incomplete-data":
-            reason = kit_decision.get("reason", "Missing customer data")
-            logger.warning(f"[RECURATE] Skipping insert — incomplete-data for {email}: {reason}")
+        if result["status"] == "incomplete_data":
             return RedirectResponse(
-                f"/customers/{customer_id}?msg={quote(f'Cannot curate: {reason}. Edit the customer to add missing data first.')}&msg_type=warning",
+                f"/customers/{customer_id}?msg={quote(result['message'])}&msg_type=warning",
                 status_code=303,
             )
-
-        # Save new decision.
-        # Use the LIVE trimester (recomputed from due_date today) so the decision's
-        # trimester matches the kit assign_kit just picked. The stored customers.trimester
-        # can be stale, which is what left re-curated decisions labelled with a trimester
-        # that disagreed with their kit (Thread 18 / Category B).
-        due_raw = cust.data.get("due_date")
-        trimester = cust.data.get("trimester")
-        if due_raw:
-            try:
-                trimester = calculate_trimester(date.fromisoformat(str(due_raw)[:10]), date.today())
-            except Exception:
-                pass
-
-        # Carry order context forward from the customer's original decision so a
-        # re-curated decision keeps its gift ship-to / billing snapshot and order link.
-        # Prefer the most recent decision that actually carries an order_id (the ingested
-        # Shopify/Cratejoy order); fall back to the most recent decision overall.
-        prior_ctx: dict = {}
-        old_order_id = ""
-        try:
-            prior_rows = (db.table("decisions")
-                          .select("order_id, platform, ship_first_name, ship_last_name, "
-                                  "billing_first_name, billing_last_name, billing_address1, "
-                                  "billing_city, billing_state, billing_zip, billing_country, created_at")
-                          .eq("customer_id", customer_id).order("created_at", desc=True).execute().data or [])
-            prior_ctx = next((r for r in prior_rows if r.get("order_id")), (prior_rows[0] if prior_rows else {}))
-            old_order_id = prior_ctx.get("order_id") or ""
-            logger.info("[RECURATE] Prior context — order_id=%s ship_to=%s %s platform=%s",
-                        old_order_id or "(none)", prior_ctx.get("ship_first_name"),
-                        prior_ctx.get("ship_last_name"), prior_ctx.get("platform"))
-        except Exception as ctx_err:
-            logger.warning("[RECURATE] Could not load prior decision context: %s", ctx_err)
-
-        # Update old decision's sheet row to show "re-curated"
-        if email:
-            update_decision_status_in_sheet(
-                email=email,
-                order_id=old_order_id,
-                new_status="re-curated",
-                reason_prefix="Re-curated",
-            )
-
-        decision_record = {
-            "customer_id": customer_id,
-            "kit_id": kit_decision.get("kit_id"),
-            "kit_sku": kit_decision.get("kit_sku"),
-            "decision_type": kit_decision["decision_type"],
-            "reason": f"[Re-curated] {kit_decision['reason']}",
-            "status": "pending",
-            "order_id": prior_ctx.get("order_id"),
-            "platform": prior_ctx.get("platform"),
-            "trimester": trimester,
-            "ship_date": date.today().isoformat(),
-            # Freeze order_type now — before any shipment for this cycle exists — so a
-            # first-box re-curate stays 'new' instead of the NULL→has-shipment fallback
-            # flipping it to 'renewal'. Genuine renewals still compute 'renewal'.
-            "order_type": _compute_order_type(db, customer_id),
-            # Preserve gift recipient (ship-to) + purchaser (billing) snapshot so the
-            # VeraCore label ships to the recipient, not the account holder.
-            "ship_first_name": prior_ctx.get("ship_first_name"),
-            "ship_last_name": prior_ctx.get("ship_last_name"),
-            "billing_first_name": prior_ctx.get("billing_first_name"),
-            "billing_last_name": prior_ctx.get("billing_last_name"),
-            "billing_address1": prior_ctx.get("billing_address1"),
-            "billing_city": prior_ctx.get("billing_city"),
-            "billing_state": prior_ctx.get("billing_state"),
-            "billing_zip": prior_ctx.get("billing_zip"),
-            "billing_country": prior_ctx.get("billing_country"),
-        }
-        db.table("decisions").insert(decision_record).execute()
-        logger.info(f"[RECURATE] Decision inserted for {email} ({kit_decision['decision_type']})")
-
-        # Write to Google Sheets in background — non-blocking so Heroku H12 never fires
-        sheet_payload = {
-            "date": date.today().isoformat(),
-            "customer_name": f"{cust.data.get('first_name', '')} {cust.data.get('last_name', '')}".strip(),
-            "email": email,
-            "platform": "re-curate",
-            "trimester": trimester,
-            "order_type": "re-curate",
-            "kit_sku": kit_decision.get("kit_sku", "—"),
-            "decision_type": kit_decision["decision_type"],
-            "reason": f"[Re-curated] {kit_decision['reason']}",
-            "order_id": old_order_id or "",
-            "due_date": cust.data.get("due_date", "") or "",
-            "clothing_size": cust.data.get("clothing_size", "") or "",
-        }
-        def _write_sheet_safe(payload: dict):
-            try:
-                write_decision_to_sheet(payload)
-                logger.info(f"[RECURATE] Google Sheets write succeeded for {email}")
-            except Exception as sheet_err:
-                logger.error(f"[RECURATE] Google Sheets write failed (non-fatal, decision already saved): {sheet_err}")
-        background_tasks.add_task(_write_sheet_safe, sheet_payload)
-
-        await log_activity("decision", f"Re-curated {email}: {kit_decision['decision_type']}",
-                          f"Kit: {kit_decision.get('kit_sku', '—')}, T{trimester}", "success")
     except Exception as e:
         logger.error(f"[RECURATE] Error: {e}", exc_info=True)
         try:
@@ -7604,7 +7844,7 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
         # Issue 10 — bulk-fetch all decisions in ONE query instead of one per id
         all_decisions_result = (
             db.table("decisions")
-            .select("*, customers(email, first_name, last_name)")
+            .select("*, customers(email, first_name, last_name, subscription_status)")
             .in_("id", decision_ids)
             .execute()
         )
@@ -7636,10 +7876,15 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                     continue
 
                 current_status = d.get("status")
+                cust_paused = (d.get("customers") or {}).get("subscription_status") == "paused"
 
                 if action == "approve":
                     if current_status != "pending":
                         logger.debug(f"[BULK ACTION] Skip approve on {did[:8]} — status={current_status}")
+                        skipped += 1
+                        continue
+                    if cust_paused:
+                        logger.debug(f"[BULK ACTION] Skip approve on {did[:8]} — customer is paused/on hold")
                         skipped += 1
                         continue
                     db.table("decisions").update({"status": "approved"}).eq("id", did).execute()
@@ -7685,6 +7930,10 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                 elif action == "ship":
                     if current_status not in ("pending", "approved"):
                         logger.debug(f"[BULK ACTION] Skip ship on {did[:8]} — status={current_status}")
+                        skipped += 1
+                        continue
+                    if cust_paused:
+                        logger.debug(f"[BULK ACTION] Skip ship on {did[:8]} — customer is paused/on hold")
                         skipped += 1
                         continue
                     # Decrement stock if still pending

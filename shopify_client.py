@@ -184,6 +184,44 @@ class ShopifyClient:
         fos = (order.get("fulfillmentOrders") or {}).get("nodes") or []
         return [fo for fo in fos if (fo.get("status") or "").upper() in _OPEN_FO_STATES]
 
+    def get_fulfillment_order_statuses(self, order_numeric_id: str) -> list[str]:
+        """
+        Return the raw FO status list for an order, e.g. ["ON_HOLD"], ["OPEN"], ["CLOSED"].
+        Unlike get_open_fulfillment_orders, this can distinguish "on hold" from
+        "already fulfilled/cancelled" — both of those return [] from the open-only query.
+        Used by the Shopify hold-reconcile job's resume check.
+        """
+        q = ("query($id:ID!){order(id:$id){id name "
+             "fulfillmentOrders(first:20){nodes{status}}}}")
+        order = self._graphql(q, {"id": self._to_order_gid(order_numeric_id)}).get("order")
+        if not order:
+            raise ShopifyError(f"order {order_numeric_id} not found")
+        fos = (order.get("fulfillmentOrders") or {}).get("nodes") or []
+        return [(fo.get("status") or "").upper() for fo in fos]
+
+    def get_on_hold_order_ids(self) -> set[str]:
+        """
+        Return the numeric order ids of every order currently ON_HOLD, store-wide.
+        One search query (paginated) instead of polling every open decision individually —
+        the hold-reconcile job intersects this small set against open Shopify decisions.
+        """
+        ids: set[str] = set()
+        cursor: Optional[str] = None
+        pages = 0
+        while True:
+            q = ("query($c:String){orders(first:50,after:$c,query:\"fulfillment_status:on_hold\")"
+                 "{pageInfo{hasNextPage endCursor}nodes{id}}}")
+            data = self._graphql(q, {"c": cursor}).get("orders") or {}
+            nodes = data.get("nodes") or []
+            ids.update(n["id"].rsplit("/", 1)[-1] for n in nodes)
+            pages += 1
+            page_info = data.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+        logger.info("[SHOPIFY] on-hold order sweep — pages=%d found=%d", pages, len(ids))
+        return ids
+
     def fulfill_order(
         self,
         order_numeric_id: str,
