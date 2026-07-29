@@ -603,4 +603,6 @@ if __name__ == "__main__":
         help="Preview what would be seeded without touching the DB.",
     )
     args = parser.parse_args()
+    from _legacy_seed_guard import assert_allowed   # quarantined: see hazard H2
+    assert_allowed("seed_old_kits.py")
     run(dry_run=args.dry_run)

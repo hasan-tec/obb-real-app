@@ -416,6 +416,8 @@ def main(live: bool = False):
 
 
 if __name__ == "__main__":
+    from _legacy_seed_guard import assert_allowed   # quarantined: see hazard H2
+    assert_allowed("seed_cm_cn_kits.py")
     parser = argparse.ArgumentParser(description="Seed CM/CN kits, items, and links")
     parser.add_argument("--live", action="store_true", help="Execute creates (default is dry-run)")
     args = parser.parse_args()

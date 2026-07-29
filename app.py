@@ -9166,7 +9166,14 @@ async def clear_committed_items(
 
 
 # ─── Start the monthly scheduler ───
-_start_scheduler()
+# Guard: a maintenance script or test can `import app` to reuse assign_kit /
+# resolve_history_item_ids WITHOUT kicking off the background scheduler thread —
+# which would otherwise fire the daily Cratejoy sync, trimester refresh, etc. and
+# race with whatever the script is doing. Set OBB_DISABLE_SCHEDULER=1 before importing.
+if os.getenv("OBB_DISABLE_SCHEDULER") != "1":
+    _start_scheduler()
+else:
+    logger.info("[SCHEDULER] Disabled via OBB_DISABLE_SCHEDULER=1 (imported by a script/test)")
 
 
 if __name__ == "__main__":

@@ -384,4 +384,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from _legacy_seed_guard import assert_allowed   # quarantined: see hazard H2
+    assert_allowed("fix_orr_items.py")
     main()
