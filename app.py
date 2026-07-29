@@ -1641,7 +1641,9 @@ def resolve_history_item_ids(raw_value: str) -> tuple[list[str], list[str]]:
 
     for ref in refs:
         item_row = None
-        sku_match = db.table("items").select("id, name, sku").eq("sku", ref.upper()).execute()
+        # Case-INSENSITIVE: item SKUs now preserve VeraCore's mixed case, so an exact
+        # .eq() on ref.upper() would no longer match (e.g. 'OBB-Aminnah+MacaronSugarScrub8z').
+        sku_match = db.table("items").select("id, name, sku").ilike("sku", ref).execute()
         if sku_match.data:
             item_row = sku_match.data[0]
         else:
@@ -4868,7 +4870,11 @@ async def add_item(
         db = get_supabase()
         therabox = is_therabox.lower() in ("true", "on", "1", "yes") if is_therabox else False
         name_clean = name.strip()
-        sku_clean = sku.strip().upper() or None
+        # Preserve SKU case exactly as entered. VeraCore Product IDs are mixed-case
+        # (e.g. 'OBB-Aminnah+MacaronSugarScrub8z') and force-uppercasing silently
+        # corrupts the identifier we match on. All SKU comparisons upper-case both
+        # sides at compare time, so storing the true case is safe.
+        sku_clean = sku.strip() or None
         logger.info(f"[ITEMS] Adding item: name='{name_clean}', sku={sku_clean}, category={category}, therabox={therabox}")
         item_data = {
             "name": name_clean,
@@ -6498,7 +6504,7 @@ async def quick_add_item_to_kit(
         db = get_supabase()
         therabox = is_therabox.lower() in ("true", "on", "1", "yes") if is_therabox else False
         name_clean = name.strip()
-        sku_clean = sku.strip().upper() or None
+        sku_clean = sku.strip() or None   # preserve VeraCore's mixed case (see add_item)
         if not name_clean:
             return RedirectResponse(f"/kits/{kit_id}?msg={quote('Item name is required')}&msg_type=error", status_code=303)
 
@@ -7721,7 +7727,7 @@ async def edit_item(
         db = get_supabase()
         therabox = is_therabox.lower() in ("true", "on", "1", "yes") if is_therabox else False
         name_clean = name.strip()
-        sku_clean = sku.strip().upper() or None
+        sku_clean = sku.strip() or None   # preserve VeraCore's mixed case (see add_item)
         if not name_clean:
             return RedirectResponse(f"/items?msg=Name+is+required&msg_type=error", status_code=303)
         record = {
