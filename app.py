@@ -1639,17 +1639,24 @@ def resolve_history_item_ids(raw_value: str) -> tuple[list[str], list[str]]:
     unresolved_refs: list[str] = []
     seen_item_ids: set[str] = set()
 
+    # Match case-insensitively in Python, NOT via SQL ilike.
+    # ilike treats '%' and '_' as wildcards, and 3 item SKUs / 2 names legitimately
+    # contain '_' (e.g. 'OBB-VOESH+VEGANBODYCREME_GREENTEA'), so an ilike pattern would
+    # silently match the wrong row. Item SKUs also now preserve VeraCore's mixed case,
+    # so a case-sensitive .eq() would miss. Loading items once is O(1) per ref and exact.
+    all_items, _off = [], 0
+    while True:
+        _b = db.table("items").select("id, name, sku").range(_off, _off + 999).execute().data or []
+        all_items.extend(_b)
+        if len(_b) < 1000:
+            break
+        _off += 1000
+    by_sku_ci = {(i["sku"] or "").strip().upper(): i for i in all_items if i.get("sku")}
+    by_name_ci = {(i["name"] or "").strip().upper(): i for i in all_items if i.get("name")}
+
     for ref in refs:
-        item_row = None
-        # Case-INSENSITIVE: item SKUs now preserve VeraCore's mixed case, so an exact
-        # .eq() on ref.upper() would no longer match (e.g. 'OBB-Aminnah+MacaronSugarScrub8z').
-        sku_match = db.table("items").select("id, name, sku").ilike("sku", ref).execute()
-        if sku_match.data:
-            item_row = sku_match.data[0]
-        else:
-            name_match = db.table("items").select("id, name, sku").ilike("name", ref).execute()
-            if name_match.data:
-                item_row = name_match.data[0]
+        key = ref.strip().upper()
+        item_row = by_sku_ci.get(key) or by_name_ci.get(key)
 
         if item_row:
             item_id = item_row["id"]
