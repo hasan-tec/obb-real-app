@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 apply_veracore_skus.py — align items.sku / items.veracore_sku with VeraCore.
-NO DELETES. Duplicates are merged by repointing links; the retired row is kept
-but made inert (0 links) and marked in `notes`.
+Duplicates are MERGED: links are repointed to the survivor, then the retired row is
+DELETED so the items table stays clean (--keep-merged keeps it as an inert tombstone).
 
 RULES (from Sheena, 2026-07-30)
   * VeraCore **Product ID** is the ONLY source of truth. Never the Description.
@@ -108,8 +108,11 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--dry-run", action="store_true")
     g.add_argument("--live", action="store_true")
+    ap.add_argument("--keep-merged", action="store_true",
+                    help="Keep retired rows as inert tombstones instead of deleting them.")
     args = ap.parse_args()
     DRY = args.dry_run
+    KEEP_MERGED = args.keep_merged
 
     url = os.getenv("SUPABASE_URL"); key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
     if not url or not key:
@@ -117,7 +120,7 @@ def main():
     db: Client = create_client(url, key)
 
     log.info("=" * 78)
-    log.info("  APPLY VERACORE SKUS  —  %s  (NO DELETES)", "DRY RUN" if DRY else "LIVE")
+    log.info("  APPLY VERACORE SKUS  —  %s  (mode: %s)", "DRY RUN" if DRY else "LIVE", "KEEP tombstones" if KEEP_MERGED else "DELETE merged rows")
     log.info("=" * 78)
 
     products = load_products()
@@ -180,6 +183,7 @@ def main():
 
     plan_updates = []
     plan_link_moves = []
+    plan_deletes = []
 
     for t_upper, members in sorted(merges.items()):
         real = products[t_upper]
@@ -202,13 +206,14 @@ def main():
             for a in alts:
                 plan_link_moves.append(("item_alternatives", "pair",
                                         (a["item_id"], a["alternative_item_id"]), r, survivor))
-            patch = {"notes": f"[MERGED -> {real}] " + (S(by_id[r].get("notes")) or "")}
-            if S(by_id[r]["sku"]).upper() == t_upper and r != survivor:
-                dup_n += 1
-                patch["sku"] = f"{real}-DUP{dup_n}"
-                log.info("          ^ holds the target sku; renaming to %s so the survivor can take it",
-                         patch["sku"])
-            plan_updates.append((r, patch, f"retire {S(by_id[r]['sku'])}"))
+            if KEEP_MERGED:
+                patch = {"notes": f"[MERGED -> {real}] " + (S(by_id[r].get("notes")) or "")}
+                if S(by_id[r]["sku"]).upper() == t_upper and r != survivor:
+                    dup_n += 1
+                    patch["sku"] = f"{real}-DUP{dup_n}"
+                plan_updates.append((r, patch, f"retire {S(by_id[r]['sku'])}"))
+            else:
+                plan_deletes.append(r)      # deleted AFTER its links are repointed
         plan_updates.append((survivor, {"sku": real, "veracore_sku": real}, f"survivor -> {real}"))
 
     n_ren = 0
@@ -226,11 +231,14 @@ def main():
     log.info("  PLAN")
     log.info("=" * 78)
     log.info("  merge groups              : %d", len(merges))
-    log.info("  items merged (kept, inert): %d", sum(len(m) - 1 for m in merges.values()))
+    log.info("  items merged into a survivor : %d", sum(len(m) - 1 for m in merges.values()))
     log.info("  single renames            : %d", n_ren)
     log.info("  item update statements    : %d", len(plan_updates))
     log.info("  link rows to repoint      : %d", len(plan_link_moves))
-    log.info("  ITEMS DELETED             : 0  (by design)")
+    if KEEP_MERGED:
+        log.info("  ITEMS DELETED             : 0  (--keep-merged)")
+    else:
+        log.info("  ITEMS DELETED after merge : %d  (links repointed first)", len(plan_deletes))
     if skipped:
         log.info("")
         log.info("  SKIPPED — answer is not a Product ID in the current export (%d):", len(skipped))
@@ -270,6 +278,24 @@ def main():
         except Exception as e:
             log.error("link move failed %s %s: %s", tbl, keyval, e)
 
+    # DELETE retirees only AFTER their links are repointed. FK is ON DELETE CASCADE,
+    # so deleting first would destroy the very links we just moved. Verified in sandbox.
+    deleted = blocked = 0
+    for r in plan_deletes:
+        try:
+            k = db.table("kit_items").select("kit_id", count="exact").eq("item_id", r).execute().count or 0
+            sp = db.table("shipment_items").select("shipment_id", count="exact").eq("item_id", r).execute().count or 0
+            cc = db.table("curation_committed_items").select("item_id", count="exact").eq("item_id", r).execute().count or 0
+            if k or sp or cc:
+                blocked += 1
+                log.warning("NOT deleting %s — still linked (kit_items=%d shipment_items=%d committed=%d)",
+                            S(by_id[r]["sku"]), k, sp, cc)
+                continue
+            db.table("items").delete().eq("id", r).execute()
+            deleted += 1
+        except Exception as e:
+            log.error("delete failed for %s: %s", S(by_id[r]["sku"]), e)
+
     applied = 0
     for iid, patch, why in plan_updates:
         try:
@@ -279,8 +305,8 @@ def main():
             log.error("update failed for %s (%s): %s", iid, why, e)
 
     log.info("")
-    log.info("LIVE DONE — links moved=%d deduped=%d | item updates=%d | deletes=0",
-             moved, deduped, applied)
+    log.info("LIVE DONE — links moved=%d deduped=%d | item updates=%d | deleted=%d | blocked=%d",
+             moved, deduped, applied, deleted, blocked)
 
 
 if __name__ == "__main__":
