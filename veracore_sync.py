@@ -73,7 +73,8 @@ def run_inventory_sync(db, vc_client) -> dict:
 
     Returns: {synced: int, items_synced: int, skipped: int, alerts_raised: int, error: str|None}
     """
-    result = {"synced": 0, "items_synced": 0, "skipped": 0, "alerts_raised": 0, "error": None}
+    result = {"synced": 0, "items_synced": 0, "skipped": 0, "alerts_raised": 0,
+              "unseen_items": 0, "unseen_kits": 0, "error": None}
     started_at = datetime.utcnow()
     logger.info("[VERACORE SYNC] ═══ Inventory sync started at %s UTC ═══", started_at.isoformat())
 
@@ -90,15 +91,33 @@ def run_inventory_sync(db, vc_client) -> dict:
         return result
 
     # Build O(1) lookup dicts keyed by upper-cased SKU.
-    kits_by_vc_sku   = {k["veracore_sku"].upper(): k for k in all_kits if k.get("veracore_sku")}
-    kits_by_sku      = {k["sku"].upper(): k for k in all_kits if k.get("sku")}
-    items_by_vc_sku  = {it["veracore_sku"].upper(): it for it in all_items if it.get("veracore_sku")}
-    items_by_sku     = {it["sku"].upper(): it for it in all_items if it.get("sku")}
+    # legacy .sku fallback is only used for rows with NO veracore_sku set —
+    # once veracore_sku is set it is the sole source of truth for that row.
+    # Without this restriction, a row whose legacy .sku happens to
+    # case-insensitively match a DIFFERENT real VeraCore product than its
+    # veracore_sku (e.g. two similarly-named real products) gets written
+    # twice in the same run, and whichever match is processed last wins —
+    # a silent, order-dependent correctness bug. Confirmed live 2026-07-30:
+    # 'Toe Talk - Mantra Grip Socks (Mixed Designs)' has legacy sku
+    # 'OBB-TOETALK+MANTRAGRIPSOCKS(MIXEDDESIGNS)' which matches a REAL SOAP
+    # product with 120 in stock, while its (incorrectly assigned)
+    # veracore_sku 'OBB-ToeTalk+MantraGripSocks' matches a DIFFERENT real
+    # product with 0 in stock — see VERACORE_SOAP_INVENTORY_PLAN.md.
+    kits_by_vc_sku   = {k["veracore_sku"].strip().upper(): k for k in all_kits if k.get("veracore_sku")}
+    kits_by_sku      = {k["sku"].strip().upper(): k for k in all_kits
+                         if k.get("sku") and not k.get("veracore_sku")}
+    items_by_vc_sku  = {it["veracore_sku"].strip().upper(): it for it in all_items if it.get("veracore_sku")}
+    items_by_sku     = {it["sku"].strip().upper(): it for it in all_items
+                         if it.get("sku") and not it.get("veracore_sku")}
     alerted_kit_ids  = {r["kit_id"] for r in alerts_data}
 
     logger.info("[VERACORE SYNC] Loaded %d kits, %d items from DB", len(all_kits), len(all_items))
 
-    # 2. Pull VeraCore inventory (1 API call).
+    # 2. Pull inventory from BOTH sources — they cover different things.
+    #    Kits are offer-only constructs, so they come from REST /api/GetInventory.
+    #    Items are products; REST hides any product whose offer is inactive or
+    #    absent, so they come from SOAP GetProductAvailabilities instead.
+    #    See VERACORE_SOAP_INVENTORY_PLAN.md for the evidence.
     try:
         rows = vc_client.get_inventory()
     except Exception as e:
@@ -107,6 +126,24 @@ def run_inventory_sync(db, vc_client) -> dict:
         log_sync(db, "inventory", None, None, None, "fail", err)
         result["error"] = err
         return result
+
+    try:
+        product_rows = vc_client.get_product_availabilities()
+        logger.info("[VERACORE SYNC] Product source: SOAP (%d products)", len(product_rows))
+    except Exception as e:
+        # Degrade to REST rather than failing the whole sync — kits still update,
+        # and items keep their last known values instead of being zeroed.
+        logger.error("[VERACORE SYNC] get_product_availabilities failed, falling back to REST "
+                     "for items (inactive/offer-less products will stay stale) — error=%s",
+                     e, exc_info=True)
+        product_rows = []
+
+    # SOAP is a superset for products, but keep any REST-only SKU as a fallback
+    # so switching sources can never reduce coverage.
+    soap_skus = {r["sku"].strip().upper() for r in product_rows if r.get("sku")}
+    item_rows = product_rows + [
+        r for r in rows if r.get("sku") and r["sku"].strip().upper() not in soap_skus
+    ]
 
     synced_at_iso = datetime.utcnow().isoformat()
 
@@ -117,7 +154,7 @@ def run_inventory_sync(db, vc_client) -> dict:
             result["skipped"] += 1
             continue
 
-        sku_upper = sku.upper()
+        sku_upper = sku.strip().upper()
         new_qty = max(0, int(row.get("available_balance", 0) or 0))
 
         # ── Kit match ──
@@ -152,32 +189,72 @@ def run_inventory_sync(db, vc_client) -> dict:
                     logger.warning("[VERACORE SYNC] Failed to raise stock alert for %s: %s", kit["sku"], e)
             continue
 
-        # ── Item match (item-level VC SKUs contain '+') ──
-        item = items_by_vc_sku.get(sku_upper) or items_by_sku.get(sku_upper)
-        if item:
-            old_qty = int(item.get("quantity_available", 0) or 0)
-            patch = {"inventory_synced_at": synced_at_iso}
-            if old_qty != new_qty:
-                patch["quantity_available"] = new_qty
-            try:
-                db.table("items").update(patch).eq("id", item["id"]).execute()
-                if old_qty != new_qty:
-                    logger.info("[VERACORE SYNC] Item %s qty: %d → %d", item["sku"], old_qty, new_qty)
-                    item["quantity_available"] = new_qty
-            except Exception as e:
-                logger.warning("[VERACORE SYNC] Item update failed for %s: %s", item["sku"], e)
-                result["skipped"] += 1
-                continue
-            result["items_synced"] += 1
+        # Not a kit — if it's a tracked item, the item loop below (item_rows,
+        # sourced from SOAP) handles it, so don't double-count it as skipped.
+        if sku_upper in items_by_vc_sku or sku_upper in items_by_sku:
             continue
 
-        logger.debug("[VERACORE SYNC] No matching kit or item for VeraCore SKU '%s' — skipping", sku)
+        logger.debug("[VERACORE SYNC] No matching kit or item for VeraCore offer '%s' — skipping", sku)
         result["skipped"] += 1
+
+    # 3b. Items — sourced from SOAP product availabilities (falls back to any
+    # REST-only rows merged into item_rows in step 2 above).
+    for row in item_rows:
+        sku = row.get("sku")
+        if not sku:
+            result["skipped"] += 1
+            continue
+        sku_upper = sku.strip().upper()
+
+        item = items_by_vc_sku.get(sku_upper) or items_by_sku.get(sku_upper)
+        if not item:
+            continue  # product we don't track — normal, not an error
+
+        new_qty = max(0, int(row.get("available_balance", 0) or 0))
+        old_qty = int(item.get("quantity_available", 0) or 0)
+        patch = {"inventory_synced_at": synced_at_iso}
+        if old_qty != new_qty:
+            patch["quantity_available"] = new_qty
+        try:
+            db.table("items").update(patch).eq("id", item["id"]).execute()
+            if old_qty != new_qty:
+                logger.info("[VERACORE SYNC] Item %s qty: %d → %d", item["sku"], old_qty, new_qty)
+                item["quantity_available"] = new_qty
+        except Exception as e:
+            logger.warning("[VERACORE SYNC] Item update failed for %s: %s", item["sku"], e)
+            result["skipped"] += 1
+            continue
+        result["items_synced"] += 1
+
+    # 4. Reverse reconciliation — find OUR rows that neither source returned.
+    #    The loops above iterate VeraCore's rows, so a DB row VeraCore never
+    #    mentions is never visited and its stock silently freezes forever.
+    #    This is exactly how the inactive-offer bug went unnoticed for months.
+    seen = {r["sku"].strip().upper() for r in rows if r.get("sku")}
+    seen |= {r["sku"].strip().upper() for r in item_rows if r.get("sku")}
+
+    def _key(r):
+        return ((r.get("veracore_sku") or "").strip() or (r.get("sku") or "").strip()).upper()
+
+    unseen_items = [i for i in all_items if _key(i) and _key(i) not in seen]
+    unseen_kits  = [k for k in all_kits  if _key(k) and _key(k) not in seen]
+    result["unseen_items"] = len(unseen_items)
+    result["unseen_kits"]  = len(unseen_kits)
+
+    if unseen_items or unseen_kits:
+        logger.warning(
+            "[VERACORE SYNC] STALE STOCK: %d item(s) and %d kit(s) were not returned by "
+            "VeraCore — their quantities are frozen. items=%s kits=%s",
+            len(unseen_items), len(unseen_kits),
+            [i.get("sku") for i in unseen_items][:10],
+            [k.get("sku") for k in unseen_kits][:10],
+        )
 
     log_sync(db, "inventory", None,
              {"pulled_rows": len(rows)},
              {"synced": result["synced"], "items_synced": result["items_synced"],
-              "skipped": result["skipped"], "alerts_raised": result["alerts_raised"]},
+              "skipped": result["skipped"], "alerts_raised": result["alerts_raised"],
+              "unseen_items": result["unseen_items"], "unseen_kits": result["unseen_kits"]},
              "ok")
     logger.info(
         "[VERACORE SYNC] ═══ Inventory sync done: kits=%d items=%d skipped=%d alerts=%d ═══",
@@ -289,8 +366,8 @@ def run_expiry_sync(db, vc_client) -> dict:
         result["error"] = err
         return result
 
-    items_by_vc_sku = {it["veracore_sku"].upper(): it for it in all_items if it.get("veracore_sku")}
-    items_by_sku    = {it["sku"].upper(): it for it in all_items if it.get("sku")}
+    items_by_vc_sku = {it["veracore_sku"].strip().upper(): it for it in all_items if it.get("veracore_sku")}
+    items_by_sku    = {it["sku"].strip().upper(): it for it in all_items if it.get("sku")}
 
     # 2. Pull VeraCore inventory (1 API call).
     try:

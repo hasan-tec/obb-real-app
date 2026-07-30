@@ -66,6 +66,12 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 # VeraCore SOAP AddOrder constants.
 _SOAP_NS = "http://sma-promail/"
 _SOAP_ACTION_ADD_ORDER = "http://sma-promail/AddOrder"
+_SOAP_ACTION_GET_PRODUCT_AVAIL = "http://sma-promail/GetProductAvailabilities"
+
+# XML namespaces used when parsing SOAP responses.
+_NS_PM = "{http://sma-promail/}"
+_NS_ENV = "{http://schemas.xmlsoap.org/soap/envelope/}"
+
 ORDER_ID_MAX_LEN = 20  # VeraCore hard limit
 
 # Carrier/service pairs as configured in VeraCore.
@@ -396,6 +402,108 @@ class VeraCoreClient:
                 "committed":         int(row.get("Committed") or row.get("committed") or 0),
             })
         logger.info("[VERACORE] GetInventory pulled %d SKUs", len(normalized))
+        return normalized
+
+    def get_product_availabilities(self) -> list[dict]:
+        """
+        SOAP GetProductAvailabilities — read PRODUCT-level warehouse balances.
+
+        Why this exists alongside get_inventory():
+          REST /api/GetInventory returns only ACTIVE OFFERS.  Products whose
+          offer is inactive (Status.Inactive.Indicator == 1) or that have no
+          offer record at all are silently absent from it.  Verified live
+          2026-07-30: REST returned 992 rows, this returns 1,326.
+          Full write-up in VERACORE_SOAP_INVENTORY_PLAN.md.
+
+        `partNumber` is a SQL LIKE pattern; '%' matches every product.
+        Sending it empty or as '*' raises a VeraCore "Invalid Search
+        Criteria" fault, so it is hardcoded.
+
+        Returns the same shape as get_inventory() plus 'on_order':
+          [{sku, title, available_balance, on_hand, committed, on_order}, ...]
+
+        Raises VeraCoreError on a SOAP fault, unparseable XML, or an empty
+        catalog.  It must NEVER return [] — callers zero out stock from it.
+        """
+        xml_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <AuthenticationHeader xmlns="http://sma-promail/">
+      <Username>{_xml_escape(self.user_id)}</Username>
+      <Password>{_xml_escape(self.password)}</Password>
+    </AuthenticationHeader>
+  </soap:Header>
+  <soap:Body>
+    <GetProductAvailabilities xmlns="http://sma-promail/">
+      <partNumber>%</partNumber>
+      <owner>{_xml_escape(self.system_id)}</owner>
+    </GetProductAvailabilities>
+  </soap:Body>
+</soap:Envelope>"""
+
+        logger.info("[VERACORE-SOAP] GetProductAvailabilities starting — owner=%s url=%s",
+                    self.system_id or "(none)", self.soap_url)
+        response_text = self._soap_request(xml_body, _SOAP_ACTION_GET_PRODUCT_AVAIL)
+
+        try:
+            root = ET.fromstring(response_text)
+        except ET.ParseError as e:
+            logger.error("[VERACORE-SOAP] GetProductAvailabilities unparseable XML — error=%s body=%s",
+                         e, response_text[:300], exc_info=True)
+            raise VeraCoreError(f"GetProductAvailabilities: unparseable XML: {e}") from e
+
+        # SOAP faults arrive as HTTP 500 with an XML body; _soap_request returns it.
+        fault = root.find(f".//{_NS_ENV}Fault")
+        if fault is not None:
+            msg = (fault.findtext("faultstring") or "unknown SOAP fault").strip()
+            logger.error("[VERACORE-SOAP] GetProductAvailabilities fault — msg=%s", msg)
+            raise VeraCoreError(f"GetProductAvailabilities SOAP fault: {msg}")
+
+        def _int(el, tag: str) -> int:
+            try:
+                return int(el.findtext(f"{_NS_PM}{tag}"))
+            except (TypeError, ValueError):
+                return 0
+
+        # One <WarehouseLevels> per product per warehouse. Today only PFCHIC
+        # is configured, but the schema allows several — so aggregate by SKU
+        # rather than assuming a single row per product.
+        agg: dict[str, dict] = {}
+        warehouses: set[str] = set()
+        for lvl in root.iter(f"{_NS_PM}WarehouseLevels"):
+            sku = (lvl.findtext(f"{_NS_PM}PartNumber") or "").strip()
+            if not sku:
+                continue
+            wh = lvl.find(f"{_NS_PM}Warehouse")
+            if wh is not None:
+                warehouses.add((wh.findtext(f"{_NS_PM}ID") or "").strip())
+            rec = agg.get(sku.upper())
+            if rec is None:
+                rec = agg[sku.upper()] = {
+                    "sku":               sku,
+                    "title":             (lvl.findtext(f"{_NS_PM}PartDescription") or "").strip(),
+                    "available_balance": 0,
+                    "on_hand":           0,
+                    "committed":         0,
+                    "on_order":          0,
+                }
+            rec["available_balance"] += _int(lvl, "Available")
+            rec["on_hand"]           += _int(lvl, "OnHand")
+            rec["committed"]         += _int(lvl, "Reserved")
+            rec["on_order"]          += _int(lvl, "OnOrder")
+
+        normalized = list(agg.values())
+        if not normalized:
+            logger.error("[VERACORE-SOAP] GetProductAvailabilities parsed 0 products — body=%s",
+                         response_text[:300])
+            raise VeraCoreError(
+                "GetProductAvailabilities returned 0 products — refusing to report an empty catalog"
+            )
+
+        logger.info("[VERACORE-SOAP] GetProductAvailabilities pulled %d products across %d warehouse(s): %s",
+                    len(normalized), len(warehouses), sorted(warehouses))
         return normalized
 
     # ─────────────────────────────────────────────────────────
