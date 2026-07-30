@@ -246,6 +246,112 @@ def main():
             log.info("     %-52s -> %s", S(s)[:52], a)
 
     if DRY:
+        # BEFORE/AFTER impact report, computed from the SAME plan --live executes,
+        # so the report can never drift from what actually happens.
+        rp = SCRIPT_DIR / "apply_veracore_skus_REPORT.md"
+        del_set = set(plan_deletes)
+        TABLES = ("items", "kit_items", "shipment_items", "item_alternatives",
+                  "curation_run_items", "curation_committed_items",
+                  "kits", "shipments", "decisions")
+        before = {}
+        for t in TABLES:
+            try:
+                before[t] = db.table(t).select("*", count="exact").limit(1).execute().count or 0
+            except Exception:
+                before[t] = -1
+
+        # A link move is a DEDUPE (net -1 row) when the survivor is already on that
+        # kit/shipment; otherwise it is a pure move (net 0).
+        cur_pairs = {
+            "kit_items": {(r["kit_id"], r["item_id"])
+                          for r in fetch_all(db, "kit_items", "kit_id,item_id")},
+            "shipment_items": {(r["shipment_id"], r["item_id"])
+                               for r in fetch_all(db, "shipment_items", "shipment_id,item_id")},
+        }
+        seen, dedup = set(), Counter()
+        for tbl, keycol, keyval, old, new_id in plan_link_moves:
+            if tbl == "item_alternatives":
+                continue
+            if (keyval, new_id) in cur_pairs[tbl] or (tbl, keyval, new_id) in seen:
+                dedup[tbl] += 1
+            seen.add((tbl, keyval, new_id))
+
+        cri_lost = 0
+        if del_set:
+            cri_lost = sum(1 for r in fetch_all(db, "curation_run_items", "item_id")
+                           if r["item_id"] in del_set)
+
+        after = dict(before)
+        after["items"] = before["items"] - len(del_set)
+        after["kit_items"] = before["kit_items"] - dedup["kit_items"]
+        after["shipment_items"] = before["shipment_items"] - dedup["shipment_items"]
+        after["curation_run_items"] = before["curation_run_items"] - cri_lost
+
+        why = {
+            "items": f"{len(del_set)} duplicate rows merged into a survivor, then deleted",
+            "kit_items": "drops ONLY where a kit already held BOTH twins (deduped)",
+            "shipment_items": "drops ONLY where a shipment already held BOTH twins (deduped)",
+            "item_alternatives": "pairs repointed; self-referencing pairs dropped",
+            "curation_run_items": "CASCADE from deleted items - accepted (H3), Ting regenerates",
+            "curation_committed_items": "MUST stay 0 - non-zero would BLOCK deletes",
+            "kits": "untouched", "shipments": "untouched", "decisions": "untouched",
+        }
+        L = []
+        add = L.append
+        add("# Apply VeraCore SKUs - BEFORE / AFTER (dry run)")
+        add("")
+        add("Generated from the same plan `--live` executes. **Nothing has been written.**")
+        add("")
+        add("## Row counts per table")
+        add("")
+        add("| Table | Before | After | Change | Why |")
+        add("|---|---:|---:|---:|---|")
+        for t in TABLES:
+            add(f"| `{t}` | {before[t]:,} | {after[t]:,} | {after[t]-before[t]:+,} | {why.get(t,'')} |")
+        add("")
+        add("## What changes inside `items`")
+        add("")
+        add(f"- **{len(merges)}** merge groups -> **{len(del_set)}** rows deleted after their links move")
+        add(f"- **{n_ren}** single renames (`sku` -> exact VeraCore Product ID)")
+        add(f"- **{len(plan_updates)}** rows get `veracore_sku` set (currently 0 of {before['items']} have one)")
+        add(f"- **{len(skipped)}** skipped, needs a human")
+        add("")
+        add("## Every merge group")
+        add("")
+        add("| Target Product ID | KEEP (survivor) | kits | ships | MERGED IN (deleted) |")
+        add("|---|---|---:|---:|---|")
+        for t_upper, members in sorted(merges.items()):
+            realp = products[t_upper]
+            surv = max(members, key=lambda i: (ship_links.get(i, 0), kit_links.get(i, 0)))
+            gone = " · ".join(S(by_id[i]["sku"]) for i in members if i != surv)
+            add(f"| `{realp}` | `{S(by_id[surv]['sku'])}` | {kit_links.get(surv,0)} | "
+                f"{ship_links.get(surv,0)} | {gone} |")
+        if snapped:
+            add("")
+            add("## Snapped to nearest Product ID (please eyeball)")
+            add("")
+            add("| Ratio | Our item | Sheena wrote | Snapped to |")
+            add("|---:|---|---|---|")
+            for sk, a, realp, r in snapped:
+                add(f"| {r:.2f} | `{S(sk)}` | `{a}` | `{realp}` |")
+        if skipped:
+            add("")
+            add("## Skipped - needs a human")
+            add("")
+            for sk, a in skipped:
+                add(f"- `{S(sk)}` -> `{a}`")
+        add("")
+        add("## Safety")
+        add("")
+        add("- Links are repointed **before** any delete (FK is `ON DELETE CASCADE`).")
+        add("- A retiree still holding any link is **skipped, not force-deleted**.")
+        add(f"- `curation_committed_items` = {before['curation_committed_items']} "
+            "(must be 0, or deletes are blocked).")
+        add("- Reversible from a `scripts/backup_obb_tables.py` snapshot.")
+        rp.write_text("\n".join(L), encoding="utf-8")
+
+        log.info("")
+        log.info("BEFORE/AFTER report written: %s", rp)
         log.info("")
         log.info("DRY RUN — nothing written. Re-run with --live to apply.")
         return
