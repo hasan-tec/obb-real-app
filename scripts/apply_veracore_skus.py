@@ -127,11 +127,16 @@ def main():
     answers = load_answers()
     items = fetch_all(db, "items", "id,name,sku,veracore_sku,notes")
     by_id = {i["id"]: i for i in items}
-    holder = {}
+    # sku UNIQUE is CASE-SENSITIVE in Postgres, so 'OBB-Foo' and 'OBB-FOO' can BOTH
+    # exist. Key by upper() but keep EVERY match, otherwise a case-twin stays invisible
+    # to the grouping, survives, and collides on the final rename (real bug, caught in
+    # pre-flight: OBB-TOTESPREGGO-TOTE vs OBB-TotesPreggo-Tote).
+    holder_all = defaultdict(list)
     for i in items:
         s = S(i.get("sku")).upper()
         if s:
-            holder[s] = i["id"]
+            holder_all[s].append(i["id"])
+    holder = {k: v[0] for k, v in holder_all.items()}
     kit_links = Counter(k["item_id"] for k in fetch_all(db, "kit_items", "item_id"))
     ship_links = Counter(s["item_id"] for s in fetch_all(db, "shipment_items", "item_id"))
     log.info("DB: %d items | export: %d products", len(items), len(products))
@@ -146,9 +151,10 @@ def main():
 
     target, skipped, snapped = {}, [], []
     for cur_sku, ans in answers.items():
-        iid = holder.get(cur_sku)
-        if not iid:
+        iids = holder_all.get(cur_sku) or []
+        if not iids:
             continue
+        iid = iids[0]
         real = products.get(ans.upper())
         if not real:
             m = difflib.get_close_matches(ans, product_names, n=1, cutoff=NEAR_CUTOFF)
@@ -159,7 +165,8 @@ def main():
             else:
                 skipped.append((by_id[iid]["sku"], ans))
                 continue
-        target[iid] = real
+        for _i in iids:
+            target[_i] = real
 
     if snapped:
         log.info("")
@@ -174,8 +181,7 @@ def main():
     for iid, t in target.items():
         groups[t.upper()].add(iid)
     for t in list(groups):
-        h = holder.get(t)
-        if h:
+        for h in holder_all.get(t, []):
             groups[t].add(h)
 
     merges = {t: m for t, m in groups.items() if len(m) > 1}
