@@ -1509,6 +1509,67 @@ def _compute_order_type(db, customer_id: Optional[str]) -> str:
         return "new"
 
 
+def _prior_order_context(db, customer_id: Optional[str]) -> dict:
+    """
+    Recover the order context (order link, gift ship-to, purchaser billing,
+    frozen order_type) from a customer's earlier decisions.
+
+    Used by BOTH replacement-decision paths — manual kit override and re-curate.
+    They must share this: the override path originally carried none of it, which
+    shipped gift boxes addressed to the purchaser instead of the recipient and
+    flipped New → Renewal in the UI. Keeping one helper stops the two paths
+    drifting apart again.
+
+    Coalesces field-by-field (most recent non-NULL wins) rather than trusting a
+    single "best" prior row, because a customer can accumulate later decisions
+    that themselves carry NULLs and would otherwise shadow the good snapshot.
+
+    Name and address groups are taken ATOMICALLY from one decision each, so we
+    never splice a first name from one order onto an address from another.
+
+    Never raises — returns {} on any error.
+    """
+    if not customer_id:
+        return {}
+    try:
+        rows = (db.table("decisions")
+                .select("order_id, platform, order_type, ship_first_name, ship_last_name, "
+                        "billing_first_name, billing_last_name, billing_address1, "
+                        "billing_city, billing_state, billing_zip, billing_country, created_at")
+                .eq("customer_id", customer_id)
+                .order("created_at", desc=True)
+                .execute().data or [])
+    except Exception as e:
+        logger.warning("[ORDER CTX] Could not load prior decisions for customer=%s: %s",
+                       customer_id, e, exc_info=True)
+        return {}
+
+    ctx: dict = {}
+    for field in ("order_id", "platform", "order_type"):
+        ctx[field] = next((r[field] for r in rows if r.get(field)), None)
+
+    # Gift recipient name — atomic pair from the newest decision that has one.
+    ship_row = next((r for r in rows if r.get("ship_first_name")), None)
+    if ship_row:
+        ctx["ship_first_name"] = ship_row.get("ship_first_name")
+        ctx["ship_last_name"] = ship_row.get("ship_last_name")
+
+    # Purchaser billing snapshot — atomic block from the newest decision with an address.
+    bill_row = next((r for r in rows if r.get("billing_address1") or r.get("billing_first_name")), None)
+    if bill_row:
+        for field in ("billing_first_name", "billing_last_name", "billing_address1",
+                      "billing_city", "billing_state", "billing_zip", "billing_country"):
+            ctx[field] = bill_row.get(field)
+
+    logger.info(
+        "[ORDER CTX] customer=%s scanned=%d → order_id=%s order_type=%s ship_to=%s %s billing=%s",
+        customer_id, len(rows), ctx.get("order_id") or "(none)", ctx.get("order_type") or "(none)",
+        ctx.get("ship_first_name"), ctx.get("ship_last_name"),
+        ctx.get("billing_address1") or "(none)",
+    )
+    return ctx
+
+
 def parse_due_date(due_date_str: str) -> Optional[date]:
     """Parse due date from various formats."""
     if not due_date_str:
@@ -7517,21 +7578,8 @@ async def _recurate_customer_core(
     # re-curated decision keeps its gift ship-to / billing snapshot and order link.
     # Prefer the most recent decision that actually carries an order_id (the ingested
     # Shopify/Cratejoy order); fall back to the most recent decision overall.
-    prior_ctx: dict = {}
-    old_order_id = ""
-    try:
-        prior_rows = (db.table("decisions")
-                      .select("order_id, platform, ship_first_name, ship_last_name, "
-                              "billing_first_name, billing_last_name, billing_address1, "
-                              "billing_city, billing_state, billing_zip, billing_country, created_at")
-                      .eq("customer_id", customer_id).order("created_at", desc=True).execute().data or [])
-        prior_ctx = next((r for r in prior_rows if r.get("order_id")), (prior_rows[0] if prior_rows else {}))
-        old_order_id = prior_ctx.get("order_id") or ""
-        logger.info("[RECURATE] Prior context — order_id=%s ship_to=%s %s platform=%s",
-                    old_order_id or "(none)", prior_ctx.get("ship_first_name"),
-                    prior_ctx.get("ship_last_name"), prior_ctx.get("platform"))
-    except Exception as ctx_err:
-        logger.warning("[RECURATE] Could not load prior decision context: %s", ctx_err)
+    prior_ctx = _prior_order_context(db, customer_id)
+    old_order_id = prior_ctx.get("order_id") or ""
 
     # Update old decision's sheet row to show "re-curated"
     if email:
@@ -7789,6 +7837,19 @@ async def manual_override_kit(
         kit_sku = kit.data["sku"]
         override_reason = reason.strip() or f"Manual override — staff selected {kit_sku}"
 
+        # Carry order context forward from the decision this override replaces.
+        # An override re-decides the SAME order, so it must inherit the gift
+        # ship-to snapshot, the billing (purchaser) snapshot, the order link and
+        # the frozen order_type — exactly like _recurate_customer_core does.
+        #
+        # Without this the override wrote NULLs, which caused two live failures:
+        #   1. submit_to_veracore falls back to the account holder's name
+        #      (app.py ~6815), so gift boxes shipped addressed to the purchaser
+        #      instead of the recipient — packages were returned to sender.
+        #   2. The decisions page falls back to "customer has any shipment?"
+        #      when order_type is NULL (app.py ~4605), flipping New → Renewal.
+        prior_ctx = _prior_order_context(db, customer_id)
+
         decision_record = {
             "customer_id": customer_id,
             "kit_id": kit_id,
@@ -7796,10 +7857,26 @@ async def manual_override_kit(
             "decision_type": "manual-override",
             "reason": override_reason,
             "status": "pending",
-            "order_id": None,
-            "platform": cust.data.get("platform"),
+            "order_id": prior_ctx.get("order_id"),
+            "platform": prior_ctx.get("platform") or cust.data.get("platform"),
             "trimester": cust.data.get("trimester"),
             "ship_date": date.today().isoformat(),
+            # Inherit the original order's type. Do NOT recompute here: by override
+            # time the first box may already have shipped, which would wrongly flip
+            # a genuine 'new' order to 'renewal'. Only compute when there is no
+            # prior decision to inherit from.
+            "order_type": prior_ctx.get("order_type") or _compute_order_type(db, customer_id),
+            # Preserve gift recipient (ship-to) + purchaser (billing) snapshot so the
+            # VeraCore label ships to the recipient, not the account holder.
+            "ship_first_name": prior_ctx.get("ship_first_name"),
+            "ship_last_name": prior_ctx.get("ship_last_name"),
+            "billing_first_name": prior_ctx.get("billing_first_name"),
+            "billing_last_name": prior_ctx.get("billing_last_name"),
+            "billing_address1": prior_ctx.get("billing_address1"),
+            "billing_city": prior_ctx.get("billing_city"),
+            "billing_state": prior_ctx.get("billing_state"),
+            "billing_zip": prior_ctx.get("billing_zip"),
+            "billing_country": prior_ctx.get("billing_country"),
         }
         db.table("decisions").insert(decision_record).execute()
         logger.info(f"[OVERRIDE] Manual override for customer {customer_id}: kit={kit_sku}, reason='{override_reason}'")
@@ -8926,10 +9003,31 @@ async def generate_forward_projection(
 
 
 def _run_forward_planner_job(job_id: str, params: dict):
-    """Background worker: runs the full forward projection and stores result in job registry and DB."""
+    """Background worker: runs the full forward projection and stores result in job registry and DB.
+
+    Writes a 'running' placeholder row to projection_runs up front (same pattern as
+    _run_curation_report_job) so /forward-planner/job/{id}/status can fall back to the DB
+    when this job's in-memory _jobs entry isn't visible to the worker process handling the
+    poll request — e.g. multiple dynos/workers, or a dyno restart mid-run."""
+    base_month = params["base_month"]
     try:
         db = get_supabase()
-        base_month = params["base_month"]
+    except Exception as e:
+        logger.error(f"[PLANNER JOB] {job_id} — Could not get DB client: {e}", exc_info=True)
+        _fail_job(job_id, str(e)[:500])
+        return
+
+    try:
+        db.table("projection_runs").upsert({
+            "id": job_id,
+            "base_month": base_month,
+            "params": params,
+            "status": "running",
+        }).execute()
+    except Exception as db_err:
+        logger.warning(f"[PLANNER JOB] {job_id} — Could not write running placeholder (table may not exist yet): {db_err}")
+
+    try:
         logger.info(
             f"[PLANNER JOB] {job_id} — Generating projection: base={base_month}, "
             f"horizon={params['horizon_months']}, wh_min={params['warehouse_min']}, "
@@ -8953,7 +9051,7 @@ def _run_forward_planner_job(job_id: str, params: dict):
 
         # Persist to DB so history survives server restarts
         try:
-            db.table("projection_runs").insert({
+            db.table("projection_runs").upsert({
                 "id": job_id,
                 "base_month": base_month,
                 "params": params,
@@ -8967,6 +9065,15 @@ def _run_forward_planner_job(job_id: str, params: dict):
     except Exception as e:
         logger.error(f"[PLANNER JOB] {job_id} — Error: {e}", exc_info=True)
         _fail_job(job_id, str(e)[:500])
+        try:
+            db.table("projection_runs").upsert({
+                "id": job_id,
+                "base_month": base_month,
+                "params": params,
+                "status": "error",
+            }).execute()
+        except Exception:
+            pass
 
 
 @app.get("/forward-planner/job/{job_id}", response_class=HTMLResponse)
@@ -8974,30 +9081,45 @@ async def forward_planner_job_page(request: Request, job_id: str):
     """Loading/result page for a forward planner background job."""
     job = _get_job(job_id)
 
-    # If not in memory (server restarted), try loading from DB
+    # If not in memory (different worker / dyno restart), try loading from DB
     if not job:
         try:
             db = get_supabase()
-            run_res = db.table("projection_runs").select("*").eq("id", job_id).single().execute()
+            run_res = db.table("projection_runs").select("*").eq("id", job_id).limit(1).execute()
             if run_res.data:
-                run = run_res.data
-                projection = run["result"]["projection"]
-                base_month = run["result"]["base_month"]
-                try:
-                    all_items_res = db.table("items").select("id, name, sku, category").order("name").execute()
-                    all_items = all_items_res.data or []
-                except Exception:
-                    all_items = []
-                return templates.TemplateResponse("forward_planner.html", {
-                    "request": request,
-                    "page": "forward-planner",
-                    "msg": f"Projection for {base_month} (loaded from history)",
-                    "msg_type": "success",
-                    "projection": projection,
-                    "default_month": base_month,
-                    "all_items": all_items,
-                    "projection_runs": [],
-                })
+                run = run_res.data[0]
+                db_status = run.get("status", "")
+                result = run.get("result") or {}
+                if db_status == "done" and result.get("projection"):
+                    projection = result["projection"]
+                    base_month = result["base_month"]
+                    try:
+                        all_items_res = db.table("items").select("id, name, sku, category").order("name").execute()
+                        all_items = all_items_res.data or []
+                    except Exception:
+                        all_items = []
+                    return templates.TemplateResponse("forward_planner.html", {
+                        "request": request,
+                        "page": "forward-planner",
+                        "msg": f"Projection for {base_month} (loaded from history)",
+                        "msg_type": "success",
+                        "projection": projection,
+                        "default_month": base_month,
+                        "all_items": all_items,
+                        "projection_runs": [],
+                    })
+                elif db_status == "error":
+                    return templates.TemplateResponse("job_loading.html", {
+                        "request": request, "job_id": job_id, "job_type": "Forward Planner",
+                        "status": "error", "error": "Projection failed",
+                        "cancel_url": "/forward-planner", "page": "forward-planner",
+                    })
+                else:
+                    # Still running on another worker — show loading page
+                    return templates.TemplateResponse("job_loading.html", {
+                        "request": request, "job_id": job_id, "job_type": "Forward Planner",
+                        "status": "running", "cancel_url": "/forward-planner", "page": "forward-planner",
+                    })
         except Exception:
             pass
         return RedirectResponse("/forward-planner?msg=Job+not+found&msg_type=error", status_code=303)
@@ -9048,15 +9170,31 @@ async def forward_planner_job_page(request: Request, job_id: str):
 
 @app.get("/forward-planner/job/{job_id}/status")
 async def forward_planner_job_status(job_id: str):
-    """JSON status endpoint for polling. Used by the loading page."""
+    """JSON status endpoint for polling. Used by the loading page.
+    Falls back to DB if _jobs was wiped (dyno restart / redeploy) or this worker
+    process never saw the job (multiple dynos/workers) — same pattern as
+    curation_report_job_status."""
     job = _get_job(job_id)
-    if not job:
-        return JSONResponse({"status": "not_found"}, status_code=404)
-    return JSONResponse({
-        "status": job["status"],
-        "error": job["error"],
-        "redirect_url": f"/forward-planner/job/{job_id}" if job["status"] == "done" else None,
-    })
+    if job:
+        return JSONResponse({
+            "status": job["status"],
+            "error": job["error"],
+            "redirect_url": f"/forward-planner/job/{job_id}" if job["status"] == "done" else None,
+        })
+    try:
+        db = get_supabase()
+        run = db.table("projection_runs").select("id, status").eq("id", job_id).limit(1).execute()
+        if run.data:
+            db_status = run.data[0].get("status", "")
+            if db_status == "done":
+                return JSONResponse({"status": "done", "error": None, "redirect_url": f"/forward-planner/job/{job_id}"})
+            elif db_status == "error":
+                return JSONResponse({"status": "error", "error": "Projection failed", "redirect_url": None})
+            else:
+                return JSONResponse({"status": "running", "error": None, "redirect_url": None})
+    except Exception as e:
+        logger.warning(f"[PLANNER STATUS] DB fallback failed: {e}")
+    return JSONResponse({"status": "not_found"}, status_code=404)
 
 
 @app.post("/forward-planner/{run_id}/delete")
