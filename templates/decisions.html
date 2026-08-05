@@ -100,6 +100,18 @@
             </div>
             <div style="display:flex;flex-direction:column;gap:3px;">
                 <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Size</label>
+                <select name="size" class="form-control" style="height:32px;font-size:13px;min-width:100px;">
+                    <option value="">All sizes</option>
+                    <option value="S" {% if filters.size=='S' %}selected{% endif %}>Small (S)</option>
+                    <option value="M" {% if filters.size=='M' %}selected{% endif %}>Medium (M)</option>
+                    <option value="L" {% if filters.size=='L' %}selected{% endif %}>Large (L)</option>
+                    <option value="XL" {% if filters.size=='XL' %}selected{% endif %}>Extra Large (XL)</option>
+                    <option value="none" {% if filters.size=='none' %}selected{% endif %}>No size on record</option>
+                </select>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:3px;">
+                <label
                     style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Month</label>
                 <input type="month" name="month" value="{{ filters.month or '' }}" class="form-control"
                     style="height:32px;font-size:13px;min-width:130px;">
@@ -130,6 +142,7 @@
                 <input type="hidden" name="type" value="{{ filters.type or '' }}">
                 <input type="hidden" name="platform" value="{{ filters.platform or '' }}">
                 <input type="hidden" name="month" value="{{ filters.month or '' }}">
+                <input type="hidden" name="size" value="{{ filters.size or '' }}">
                 <input type="hidden" name="redirect_qs" value="{{ filter_qs or '' }}">
                 <button type="submit" class="btn btn-sm" style="background:var(--green);color:white;border:none;"
                     title="Push to Google Sheets">

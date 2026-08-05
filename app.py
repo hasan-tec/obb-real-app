@@ -2169,6 +2169,10 @@ async def shopify_order_webhook(request: Request):
         # dict.get(key, default) returns None, not the default value.
         shipping = payload.get("shipping_address") or {}
         address_line1 = shipping.get("address1", "")
+        # address2 holds apartment/suite/unit. Dropping it caused real "insufficient
+        # address" delivery failures (Thread 17): the Pirate Ship CSV exports an empty
+        # line 2 while the apartment number sits unused in the Shopify payload.
+        address_line2 = shipping.get("address2", "")
         city = shipping.get("city", "")
         province = shipping.get("province", "")
         zip_code = shipping.get("zip", "")
@@ -2258,6 +2262,7 @@ async def shopify_order_webhook(request: Request):
                 "shopify_customer_id": shopify_customer_id or None,
                 "phone": phone or None,
                 "address_line1": address_line1 or None,
+                "address_line2": address_line2 or None,
                 "city": city or None,
                 "province": province or None,
                 "zip": zip_code or None,
@@ -2282,7 +2287,7 @@ async def shopify_order_webhook(request: Request):
                     customer_record["platform"] = "shopify"
                 # Non-sub order for existing customer → update address fields only, don't overwrite quiz data
                 if not is_subscription_order:
-                    address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "city", "province", "zip", "country", "platform") if k in customer_record}
+                    address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country", "platform") if k in customer_record}
                     db.table("customers").update(address_only).eq("id", cust_id).execute()
                     logger.info(f"[SHOPIFY WEBHOOK] Non-sub order — updated address only for existing customer: {cust_id}")
                 else:
@@ -2452,6 +2457,7 @@ async def shopify_customer_webhook(request: Request):
         else:
             address_only = {
                 "address_line1": addr.get("address1") or None,
+                "address_line2": addr.get("address2") or None,
                 "city": addr.get("city") or None,
                 "province": addr.get("province") or None,
                 "zip": addr.get("zip") or None,
@@ -2604,7 +2610,8 @@ async def shopify_order_updated_webhook(request: Request):
 
         # Shipping-address refresh (recipient address for gift orders) — present-only.
         shipping = payload.get("shipping_address") or {}
-        for src, col in (("address1", "address_line1"), ("city", "city"),
+        for src, col in (("address1", "address_line1"), ("address2", "address_line2"),
+                         ("city", "city"),
                          ("province", "province"), ("zip", "zip")):
             val = (shipping.get(src) or "").strip()
             if val and val != (cust_row.get(col) or ""):
@@ -2808,12 +2815,14 @@ async def cratejoy_order_webhook(request: Request):
         address_data = customer_data.get("shipping_address", customer_data.get("address", {}))
         if isinstance(address_data, dict):
             address_line1 = address_data.get("street", address_data.get("address1", ""))
+            # apartment/suite/unit — see Thread 17 note on the Shopify path
+            address_line2 = address_data.get("street2", address_data.get("address2", "")) or ""
             city = address_data.get("city", "")
             province = address_data.get("state", address_data.get("province", ""))
             zip_code = address_data.get("zip_code", address_data.get("zip", ""))
             country = address_data.get("country", "US")
         else:
-            address_line1 = city = province = zip_code = ""
+            address_line1 = address_line2 = city = province = zip_code = ""
             country = "US"
 
         # Try to extract due date from Cratejoy subscription note or custom fields
@@ -2852,6 +2861,7 @@ async def cratejoy_order_webhook(request: Request):
                 "last_name": last_name or None,
                 "cratejoy_customer_id": cratejoy_customer_id or None,
                 "address_line1": address_line1 or None,
+                "address_line2": address_line2 or None,
                 "city": city or None,
                 "province": province or None,
                 "zip": zip_code or None,
@@ -3612,6 +3622,7 @@ async def replay_webhook(webhook_id: str):
             # Must use `or {}` — shipping_address can be explicitly null in Shopify JSON
             shipping = payload.get("shipping_address") or {}
             address_line1 = shipping.get("address1", "")
+            address_line2 = shipping.get("address2", "")  # apartment/suite — Thread 17
             city = shipping.get("city", "")
             province = shipping.get("province", "")
             zip_code = shipping.get("zip", "")
@@ -3680,6 +3691,7 @@ async def replay_webhook(webhook_id: str):
                     "shopify_customer_id": shopify_customer_id or None,
                     "phone": phone or None,
                     "address_line1": address_line1 or None,
+                    "address_line2": address_line2 or None,
                     "city": city or None,
                     "province": province or None,
                     "zip": zip_code or None,
@@ -3703,7 +3715,7 @@ async def replay_webhook(webhook_id: str):
                         customer_record["platform"] = "shopify"
                     # Non-sub order for existing customer → address only
                     if not is_subscription_order:
-                        address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "city", "province", "zip", "country", "platform") if k in customer_record}
+                        address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country", "platform") if k in customer_record}
                         db.table("customers").update(address_only).eq("id", cust_id).execute()
                         logger.info(f"[WEBHOOK REPLAY] Non-sub order — updated address only for existing customer: {cust_id}")
                     else:
@@ -3839,12 +3851,13 @@ async def replay_webhook(webhook_id: str):
             address_data = customer_data.get("shipping_address", customer_data.get("address", {}))
             if isinstance(address_data, dict):
                 address_line1 = address_data.get("street", address_data.get("address1", ""))
+                address_line2 = address_data.get("street2", address_data.get("address2", "")) or ""
                 city = address_data.get("city", "")
                 province = address_data.get("state", address_data.get("province", ""))
                 zip_code = address_data.get("zip_code", address_data.get("zip", ""))
                 country = address_data.get("country", "US")
             else:
-                address_line1 = city = province = zip_code = ""
+                address_line1 = address_line2 = city = province = zip_code = ""
                 country = "US"
 
             # Due date from note
@@ -3880,6 +3893,7 @@ async def replay_webhook(webhook_id: str):
                     "last_name": last_name or None,
                     "cratejoy_customer_id": cratejoy_customer_id or None,
                     "address_line1": address_line1 or None,
+                    "address_line2": address_line2 or None,
                     "city": city or None,
                     "province": province or None,
                     "zip": zip_code or None,
@@ -4550,6 +4564,10 @@ async def decisions_page(request: Request):
         f_platform    = request.query_params.get("platform", "").strip()
         f_month       = request.query_params.get("month", "").strip()
         f_order_type  = request.query_params.get("order_type", "").strip()
+        # Thread 16 — filter by the CUSTOMER's clothing size so sized kit variants
+        # (e.g. the July baby mama tank) can be grouped and processed together.
+        # Blank = no size filtering at all; "none" = customers with no size on record.
+        f_size        = request.query_params.get("size", "").strip()
         q             = request.query_params.get("q", "").strip().lower()
 
         # Parse sort (whitelist)
@@ -4570,7 +4588,7 @@ async def decisions_page(request: Request):
             # trimester is filtered in Python on the customer's LIVE trimester (below),
             # NOT here — decision.trimester is a frozen snapshot that drifts as the due
             # date nears (Thread 18). due_date is joined so we can recompute it live.
-            qo = db.table("decisions").select("*, customers(email, first_name, last_name, due_date, trimester, address_line1, city, province, zip)")
+            qo = db.table("decisions").select("*, customers(email, first_name, last_name, due_date, trimester, clothing_size, address_line1, address_line2, city, province, zip)")
             if f_status:
                 qo = qo.eq("status", f_status)
             if f_type:
@@ -4649,6 +4667,18 @@ async def decisions_page(request: Request):
             all_decisions = [d for d in all_decisions if str(d.get("_live_trimester")) == f_trimester]
             logger.info("[DECISIONS PAGE] live-trimester filter T%s → %d decisions", f_trimester, len(all_decisions))
 
+        # ─── Sizing filter (Thread 16) ───────────────────────────────────────────
+        # Filters on the customer's clothing size, since sized kit variants are chosen
+        # from it. Blank leaves the filter off entirely (Sheena's "no sizing" case).
+        if f_size:
+            if f_size == "none":
+                all_decisions = [d for d in all_decisions
+                                 if not ((d.get("customers") or {}).get("clothing_size"))]
+            else:
+                all_decisions = [d for d in all_decisions
+                                 if ((d.get("customers") or {}).get("clothing_size") or "") == f_size]
+            logger.info("[DECISIONS PAGE] size filter '%s' → %d decisions", f_size, len(all_decisions))
+
         # Tag each decision with _order_type — use stored column; shipment scan only for legacy NULLs
         if all_decisions:
             legacy_cids = list({d["customer_id"] for d in all_decisions if d.get("customer_id") and not d.get("order_type")})
@@ -4679,10 +4709,11 @@ async def decisions_page(request: Request):
         if f_platform:   filter_qs_parts.append(f"platform={f_platform}")
         if f_order_type: filter_qs_parts.append(f"order_type={f_order_type}")
         if f_month:      filter_qs_parts.append(f"month={f_month}")
+        if f_size:       filter_qs_parts.append(f"size={f_size}")
         if q:            filter_qs_parts.append(f"q={q}")
         filter_qs = "&".join(filter_qs_parts)
 
-        any_filter_active = bool(f_trimester or f_status or f_type or f_platform or f_order_type or f_month or q)
+        any_filter_active = bool(f_trimester or f_status or f_type or f_platform or f_order_type or f_month or f_size or q)
 
         return templates.TemplateResponse("decisions.html", {
             "request":          request,
@@ -4698,6 +4729,7 @@ async def decisions_page(request: Request):
                 "platform":   f_platform,
                 "order_type": f_order_type,
                 "month":      f_month,
+                "size":       f_size,
                 "q":          q,
             },
             "sort":             sort,
@@ -5618,6 +5650,7 @@ async def add_customer(
     wants_daddy_item: str = Form(""),
     phone: str = Form(""),
     address_line1: str = Form(""),
+    address_line2: str = Form(""),
     city: str = Form(""),
     province: str = Form(""),
     zip_code: str = Form(""),
@@ -5655,6 +5688,7 @@ async def add_customer(
             "wants_daddy_item": daddy,
             "phone": phone.strip() or None,
             "address_line1": address_line1.strip() or None,
+            "address_line2": address_line2.strip() or None,
             "city": city.strip() or None,
             "province": province.strip() or None,
             "zip": zip_code.strip() or None,
@@ -5741,6 +5775,7 @@ async def edit_customer(
     subscription_status: str = Form("active"),
     wants_daddy_item: str = Form(""),
     address_line1: str = Form(""),
+    address_line2: str = Form(""),
     city: str = Form(""),
     province: str = Form(""),
     zip: str = Form(""),
@@ -5765,6 +5800,7 @@ async def edit_customer(
             "subscription_status": subscription_status,
             "wants_daddy_item": daddy,
             "address_line1": address_line1.strip() or None,
+            "address_line2": address_line2.strip() or None,
             "city": city.strip() or None,
             "province": province.strip() or None,
             "zip": zip.strip() or None,
@@ -8659,6 +8695,7 @@ async def export_decisions_sheet(request: Request, background_tasks: BackgroundT
         f_type      = form.get("type", "")
         f_platform  = form.get("platform", "")
         f_month     = form.get("month", "")
+        f_size      = form.get("size", "")  # Thread 16 — keep export in step with the page filter
         redirect_qs = form.get("redirect_qs", "")
 
         def _build_sheet_q():
@@ -8698,6 +8735,17 @@ async def export_decisions_sheet(request: Request, background_tasks: BackgroundT
             if len(batch_data) < PAGE_SIZE:
                 break
             offset += PAGE_SIZE
+
+        # clothing_size lives on the joined customers row, so it can't be filtered in the
+        # Supabase query — apply it here so the export matches what the page showed.
+        if f_size:
+            before = len(rows)
+            if f_size == "none":
+                rows = [r for r in rows if not ((r.get("customers") or {}).get("clothing_size"))]
+            else:
+                rows = [r for r in rows if ((r.get("customers") or {}).get("clothing_size") or "") == f_size]
+            logger.info("[EXPORT SHEET] size filter '%s' → %d of %d rows", f_size, len(rows), before)
+
         logger.info(f"[EXPORT SHEET] Queued {len(rows)} rows for Google Sheet push")
 
         def _push_to_sheet(rows_data: list):
