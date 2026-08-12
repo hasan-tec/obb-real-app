@@ -1237,6 +1237,16 @@ def _monthly_report_scheduler():
                             include_paused=False,
                             lookback_months=4,
                             recency_months=3,
+                            # Pinned to the OLD pool explicitly (2026-08-13, audit finding C1).
+                            # This fires on day 1 at the first hourly tick >=6am UTC — measured
+                            # live: 0-2 decisions exist for the new month by then (most land
+                            # 07:00-18:00 UTC same day or later), so the decisions-pool default
+                            # would silently auto-generate a near-empty report every month. The
+                            # interactive form (curation_report_page) already defaults to the
+                            # current month and correctly gets the new pool; only this unattended
+                            # 6am path needs to wait for a real decision on retiming before it
+                            # switches over — see CURATION_REBUILD_PLAN.md 9.9/9.11.
+                            pool_source="shipments",
                         )
                         # Save to DB
                         run_insert = db.table("curation_runs").insert({
@@ -5259,13 +5269,15 @@ async def curation_report_page(request: Request, msg: str = "", msg_type: str = 
                 except Exception:
                     run["summary_json"] = None
 
-        # Default month = next month
-        from datetime import date, timedelta
+        # Default month = CURRENT month, not next. The decisions-based pool (curation_report.py
+        # load_renewal_pool_from_decisions) only contains customers whose renewal has actually
+        # landed within report_month — for a future month that's structurally empty/near-empty
+        # until the month starts. Current month has real decisions accumulating all along
+        # (confirmed 2026-08-13, Hasan). Forward Planner's own default stays "next month" —
+        # that's a different feature whose whole purpose is projecting ahead.
+        from datetime import date
         today = date.today()
-        if today.month == 12:
-            default_month = f"{today.year + 1}-01"
-        else:
-            default_month = f"{today.year}-{today.month + 1:02d}"
+        default_month = f"{today.year}-{today.month:02d}"
 
         return templates.TemplateResponse("curation_report.html", {
             "request": request,
@@ -8052,13 +8064,23 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
             if decisions_map.get(did, {}).get("status") == "pending"
             and decisions_map.get(did, {}).get("kit_id")
         })
+        kit_items_by_kit: dict[str, list[str]] = {}
         if pending_kit_ids:
-            kit_items_bulk = db.table("kit_items").select("kit_id, item_id").in_("kit_id", pending_kit_ids).execute()
-            kit_items_by_kit: dict[str, list[str]] = {}
-            for ki in (kit_items_bulk.data or []):
-                kit_items_by_kit.setdefault(ki["kit_id"], []).append(ki["item_id"])
-        else:
-            kit_items_by_kit = {}
+            # MUST paginate — a bare .execute() caps at 1000 rows. A large bulk-approve batch can
+            # span >125 distinct kits (each ~8 items), silently truncating this and dropping
+            # shipment_items for the kits past the cutoff. Same bug class already fixed at :4839.
+            offset = 0
+            while True:
+                batch = (
+                    db.table("kit_items").select("kit_id, item_id")
+                    .in_("kit_id", pending_kit_ids)
+                    .range(offset, offset + 999).execute().data or []
+                )
+                for ki in batch:
+                    kit_items_by_kit.setdefault(ki["kit_id"], []).append(ki["item_id"])
+                if len(batch) < 1000:
+                    break
+                offset += 1000
         pending_shipment_items: list[dict] = []  # collected across all decisions, bulk-inserted after loop
 
         for did in decision_ids:

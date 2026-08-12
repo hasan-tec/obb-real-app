@@ -158,13 +158,16 @@ def load_renewal_pool_from_decisions(db, ship_date: date, report_month: str) -> 
     Rule (deliberately minimal — see CURATION_REBUILD_PLAN.md 3.1):
       - decision created within the report month
       - status NOT IN (rejected, shipped)
+      - customer subscription_status IN (active, cancelled-prepaid) — same filter
+        load_renewal_pool() already applies by default, and the direct equivalent of
+        Sheena deleting a cancellation from her sheet: cancelled-expired is precisely
+        that state. Fixed 2026-08-13 (plan audit finding F2) — measured 5 cancelled-expired
+        customers were reaching the pool before this filter existed.
       - customer has a due_date
       - de-duplicated by customer_id
 
-    No subscription_status condition: Sheena deletes cancellations outright rather than
-    filtering by status, so adding one has no basis in her process. Trimester is always
-    recomputed live from due_date vs ship_date by project_trimesters() — never the frozen
-    decisions.trimester snapshot, which drifts as the ship date moves.
+    Trimester is always recomputed live from due_date vs ship_date by project_trimesters()
+    — never the frozen decisions.trimester snapshot, which drifts as the ship date moves.
 
     Returns (renewal_pool, new_customers) to match load_renewal_pool()'s contract.
     """
@@ -195,6 +198,7 @@ def load_renewal_pool_from_decisions(db, ship_date: date, report_month: str) -> 
         db.table("customers")
         .select("id, email, first_name, last_name, due_date, clothing_size, subscription_status, platform")
         .not_.is_("due_date", "null")
+        .in_("subscription_status", ["active", "cancelled-prepaid"])
     )
     customers_by_id = {c["id"]: c for c in customers}
 
@@ -616,7 +620,7 @@ def run_monthly_report(
     include_paused: bool = False,
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
     recency_months: Optional[int] = DEFAULT_RECENCY_MONTHS,
-    pool_source: str = "shipments",
+    pool_source: str = "decisions",
 ) -> dict:
     """
     Run the full monthly curation report.
