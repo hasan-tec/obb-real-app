@@ -485,7 +485,7 @@ No migration, no schema change, no data backfill. The only DB writes are `items.
 - [x] `STALE STOCK` warning appears with 1 item + 118 kits, and is visible in logs — **exact match, both live runs**
 - [x] `pytest tests/` no worse than baseline — **6 passed, 0 failed** (3 suites requiring a live local server on :8000 excluded — pre-existing, unrelated to this change)
 - [ ] Sheena asked about the missing `CE`→`CO` kit offers — not yet sent
-- [ ] Commit the changes (currently uncommitted working-tree edits to `veracore_client.py` + `veracore_sync.py`)
+- [x] Commit the changes — `cd61c53`, pushed to `origin/main` 2026-07-30
 
 ---
 

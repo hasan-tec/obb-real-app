@@ -12,7 +12,7 @@ Generates the monthly curation report answering Ting's 7 key questions:
 
 import logging
 from datetime import date, timedelta
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Optional
 import httpx
 
@@ -142,6 +142,105 @@ def load_renewal_pool(db, ship_date: date, include_paused: bool = False, recency
         )
 
     logger.info(f"[CURATION] Final renewal pool: {len(renewal_pool)} customers")
+
+    return renewal_pool, new_customers
+
+
+def load_renewal_pool_from_decisions(db, ship_date: date, report_month: str) -> tuple[list[dict], list[dict]]:
+    """
+    Build the monthly pool from the `decisions` table instead of shipment recency.
+
+    WHY: the recency filter answers "who received a shipment in the last N months" —
+    historical data. Curation needs "who requires a shipment this cycle". A decision row
+    is created the moment a Shopify order or Cratejoy renewal lands, so `decisions` is the
+    engine's native equivalent of Sheena's manual order sheet.
+
+    Rule (deliberately minimal — see CURATION_REBUILD_PLAN.md 3.1):
+      - decision created within the report month
+      - status NOT IN (rejected, shipped)
+      - customer has a due_date
+      - de-duplicated by customer_id
+
+    No subscription_status condition: Sheena deletes cancellations outright rather than
+    filtering by status, so adding one has no basis in her process. Trimester is always
+    recomputed live from due_date vs ship_date by project_trimesters() — never the frozen
+    decisions.trimester snapshot, which drifts as the ship date moves.
+
+    Returns (renewal_pool, new_customers) to match load_renewal_pool()'s contract.
+    """
+    month_start = f"{report_month}-01"
+    year, month = int(report_month.split("-")[0]), int(report_month.split("-")[1])
+    month_end_excl = f"{year + 1}-01-01" if month == 12 else f"{year}-{month + 1:02d}-01"
+
+    logger.info(
+        "[CURATION] Loading pool from decisions — month=%s window=[%s, %s) ship_date=%s",
+        report_month, month_start, month_end_excl, ship_date,
+    )
+
+    decisions = _paginate_all(
+        db.table("decisions")
+        .select("customer_id, status, created_at, platform")
+        .gte("created_at", month_start)
+        .lt("created_at", month_end_excl)
+    )
+    logger.info("[CURATION] Decisions created in %s: %d", report_month, len(decisions))
+
+    actionable = [d for d in decisions if d.get("status") not in ("rejected", "shipped")]
+    logger.info(
+        "[CURATION] After status filter (excl rejected/shipped): %d kept, %d dropped",
+        len(actionable), len(decisions) - len(actionable),
+    )
+
+    customers = _paginate_all(
+        db.table("customers")
+        .select("id, email, first_name, last_name, due_date, clothing_size, subscription_status, platform")
+        .not_.is_("due_date", "null")
+    )
+    customers_by_id = {c["id"]: c for c in customers}
+
+    # Dedupe keeps the first decision seen per customer. Order is whatever Postgres
+    # returns (no ORDER BY), so if one customer had two decisions on different platforms
+    # the retained decision_platform would be arbitrary. Measured 2026-08-12: 5 customers
+    # have >1 actionable decision this month and 0 of them differ on platform, so this is
+    # currently harmless — revisit if that stops being true.
+    pool, seen = [], set()
+    dropped_unresolved = 0
+    for d in actionable:
+        cid = d["customer_id"]
+        if cid in seen:
+            continue
+        cust = customers_by_id.get(cid)
+        if not cust:
+            # Either the customer has a NULL due_date or the row is missing entirely.
+            # Don't assert which — the query above cannot distinguish them.
+            dropped_unresolved += 1
+            continue
+        seen.add(cid)
+        # Decision platform is the order's platform — what Sheena reconciles against,
+        # since she processes Shopify and Cratejoy as separate lists.
+        pool.append({**cust, "decision_platform": d.get("platform")})
+
+    logger.info(
+        "[CURATION] Pool after dedupe: %d customers (%d decisions dropped — no customer row with a due_date)",
+        len(pool), dropped_unresolved,
+    )
+
+    # Split renewal vs new on the same rule the shipment-based pool uses: a customer with
+    # at least one shipment is a renewal, everyone else belongs on the welcome-kit track.
+    shipments = _paginate_all(db.table("shipments").select("customer_id"))
+    has_shipment = {s["customer_id"] for s in shipments}
+
+    renewal_pool = [c for c in pool if c["id"] in has_shipment]
+    new_customers = [c for c in pool if c["id"] not in has_shipment]
+
+    platform_counts = defaultdict(int)
+    for c in renewal_pool:
+        platform_counts[c.get("decision_platform") or "unknown"] += 1
+
+    logger.info(
+        "[CURATION] Decisions pool: %d renewal, %d new — renewal by platform: %s",
+        len(renewal_pool), len(new_customers), dict(platform_counts),
+    )
 
     return renewal_pool, new_customers
 
@@ -517,6 +616,7 @@ def run_monthly_report(
     include_paused: bool = False,
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
     recency_months: Optional[int] = DEFAULT_RECENCY_MONTHS,
+    pool_source: str = "shipments",
 ) -> dict:
     """
     Run the full monthly curation report.
@@ -539,12 +639,16 @@ def run_monthly_report(
     logger.info(f"[CURATION] Warehouse minimum: {warehouse_minimum}")
     logger.info(f"[CURATION] Lookback: {lookback_months} months, Include paused: {include_paused}")
     logger.info(f"[CURATION] Recency filter: {recency_months} months (None = all history)")
+    logger.info(f"[CURATION] Pool source: {pool_source}")
 
     lookback_start, lookback_end = calc_lookback_window(ship_date, lookback_months)
     logger.info(f"[CURATION] Lookback window: {lookback_start} to {lookback_end}")
 
     # ── Step 1: Load renewal pool ──
-    renewal_pool, new_customers = load_renewal_pool(db, ship_date, include_paused, recency_months)
+    if pool_source == "decisions":
+        renewal_pool, new_customers = load_renewal_pool_from_decisions(db, ship_date, report_month)
+    else:
+        renewal_pool, new_customers = load_renewal_pool(db, ship_date, include_paused, recency_months)
 
     # ── Step 2: Project trimesters ──
     trimester_groups = project_trimesters(renewal_pool, ship_date)
@@ -686,6 +790,13 @@ def run_monthly_report(
         "total_renewal_customers": len(renewal_pool),
         "total_new_customers": len(new_customers),
         "recency_months": recency_months,
+        "pool_source": pool_source,
+        # Sheena curates Shopify and Cratejoy as separate lists, so a combined total
+        # cannot be compared against her manual counts. Break it down per platform.
+        "renewal_by_platform": dict(sorted(
+            Counter(c.get("decision_platform") or c.get("platform") or "unknown"
+                    for c in renewal_pool).items()
+        )),
         "trimesters": {},
     }
 

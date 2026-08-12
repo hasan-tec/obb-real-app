@@ -611,6 +611,72 @@ async def _cj_enrich_new_customer(client, sub_id: str, ship_address: dict) -> di
     return fields
 
 
+def _log_platform_change(email: str, old: Optional[str], new: str, source: str) -> None:
+    """Platform flips are rare (measured: 2 of 2,487 customers) — make every one visible."""
+    if old != new:
+        logger.warning("[PLATFORM] %s: %s -> %s (source=%s)", email, old or "none", new, source)
+
+
+async def _cj_refresh_existing_customer(
+    db, client, cust_row: dict, cj_customer: dict, sub_id: str, ship_addr: dict,
+    cj_cust_id: str, dry_run: bool,
+) -> None:
+    """
+    Keep an EXISTING Cratejoy customer's platform + survey data current on every sync.
+    Present-only merge — never blanks a good field with an empty/ambiguous API value.
+    See DYNAMIC_CUSTOMER_SYNC_PLAN.md section 2.2 for why each field is included/excluded.
+    """
+    raw = await _cj_enrich_new_customer(client, sub_id, ship_addr)
+    update: dict = {}
+
+    for field in ("address_line1", "city", "province", "zip", "due_date", "clothing_size"):
+        val = raw.get(field)
+        if val and val != cust_row.get(field):
+            update[field] = val
+
+    # "unknown" is a real survey answer, not "no answer" — only a real boy/girl is worth writing.
+    gender = raw.get("baby_gender")
+    if gender in ("boy", "girl") and gender != cust_row.get("baby_gender"):
+        update["baby_gender"] = gender
+
+    # Presence in `raw` means the survey question was actually answered — _cj_enrich_new_customer
+    # skips blank answers before this key would ever be set — so this is a true presence probe,
+    # not a truthy check. That matters because "no" (False) must still be writable.
+    if "wants_daddy_item" in raw:
+        daddy = bool(raw["wants_daddy_item"])
+        if daddy != bool(cust_row.get("wants_daddy_item")):
+            update["wants_daddy_item"] = daddy
+
+    # country / trimester / email / first_name / last_name deliberately excluded — see plan 2.2.
+
+    if cust_row.get("platform") != "cratejoy":
+        _log_platform_change(cust_row.get("email"), cust_row.get("platform"), "cratejoy", "cj_daily_sync")
+        update["platform"] = "cratejoy"
+
+    if cj_cust_id and not cust_row.get("cratejoy_customer_id"):
+        stored_name = f"{(cust_row.get('first_name') or '').strip()} {(cust_row.get('last_name') or '').strip()}".strip().lower()
+        cj_name = f"{(cj_customer.get('first_name') or '').strip()} {(cj_customer.get('last_name') or '').strip()}".strip().lower()
+        if stored_name and cj_name and stored_name != cj_name:
+            logger.warning(
+                "[CJ IDENTITY] %s row name %r disagrees with Cratejoy customer name %r — "
+                "NOT backfilling cratejoy_customer_id=%s (possible shared-email gift subscription; verify manually)",
+                cust_row.get("email"), stored_name, cj_name, cj_cust_id,
+            )
+        else:
+            update["cratejoy_customer_id"] = cj_cust_id
+
+    if not update:
+        return
+
+    if dry_run:
+        logger.info("[CJ DAILY] WOULD refresh existing customer %s: %s", cust_row.get("email"), list(update.keys()))
+        return
+
+    db.table("customers").update(update).eq("id", cust_row["id"]).execute()
+    logger.info("[CJ DAILY] refreshed existing customer %s: %s", cust_row.get("email"), list(update.keys()))
+    cust_row.update(update)
+
+
 async def process_cratejoy_box(db, client, shipment: dict, today: date, dry_run: bool = False) -> str:
     """
     Onboard/locate the customer for one unshipped Cratejoy box and create exactly one
@@ -665,13 +731,20 @@ async def process_cratejoy_box(db, client, shipment: dict, today: date, dry_run:
 
     cust_id = cust_row["id"]
 
-    # Thread 17: a paused/on-hold customer never gets a new decision queued.
-    if cust_row.get("subscription_status") == "paused":
-        return "skip_paused"
-
-    # Backlog customer without real kit history → never auto-decide yet
+    # Backlog customer without real kit history → never auto-decide, never auto-refresh either
+    # (quarantined by design until real history is imported).
     if cust_row.get("history_pending"):
         return "skip_history_pending"
+
+    # Keep platform + survey data current every sync — see DYNAMIC_CUSTOMER_SYNC_PLAN.md 2.2.
+    # Runs even for paused customers: platform/survey are facts about the customer, independent
+    # of whether she's currently being decisioned, and a paused customer with a stale platform
+    # is exactly the case invisible to the reconcile jobs.
+    await _cj_refresh_existing_customer(db, client, cust_row, cust, sub_id, ship_addr, cj_cust_id, dry_run)
+
+    # Thread 17: a paused/on-hold customer never gets a new decision queued (refresh above still ran).
+    if cust_row.get("subscription_status") == "paused":
+        return "skip_paused"
 
     # Idempotency #2 — one decision per customer per box-month (covers the sweep transition)
     month_start = date(ship_date.year, ship_date.month, 1)
@@ -2281,16 +2354,16 @@ async def shopify_order_webhook(request: Request):
 
             if existing_customer.data:
                 cust_id = existing_customer.data[0]["id"]
-                if existing_customer.data[0].get("cratejoy_customer_id"):
-                    customer_record["platform"] = "both"
-                else:
-                    customer_record["platform"] = "shopify"
-                # Non-sub order for existing customer → update address fields only, don't overwrite quiz data
+                customer_record["platform"] = "shopify"
+                # Non-sub order for existing customer → address fields only, don't overwrite quiz
+                # data OR platform — a one-off retail item shouldn't override a subscriber's real
+                # platform (see DYNAMIC_CUSTOMER_SYNC_PLAN.md 2.1).
                 if not is_subscription_order:
-                    address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country", "platform") if k in customer_record}
+                    address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country") if k in customer_record}
                     db.table("customers").update(address_only).eq("id", cust_id).execute()
                     logger.info(f"[SHOPIFY WEBHOOK] Non-sub order — updated address only for existing customer: {cust_id}")
                 else:
+                    _log_platform_change(email, existing_customer.data[0].get("platform"), "shopify", "shopify_order_webhook")
                     db.table("customers").update(customer_record).eq("id", cust_id).execute()
                     logger.info(f"[SHOPIFY WEBHOOK] Updated existing customer: {cust_id}")
             else:
@@ -2887,10 +2960,8 @@ async def cratejoy_order_webhook(request: Request):
             if existing_customer.data:
                 cust_id = existing_customer.data[0]["id"]
                 existing_cust = existing_customer.data[0]
-                if existing_cust.get("shopify_customer_id"):
-                    customer_record["platform"] = "both"
-                else:
-                    customer_record["platform"] = "cratejoy"
+                _log_platform_change(email, existing_cust.get("platform"), "cratejoy", "cratejoy_order_webhook")
+                customer_record["platform"] = "cratejoy"
 
                 # IMPORTANT: Don't overwrite existing data with empty values from Cratejoy
                 # If existing customer already has due_date/trimester/clothing_size from Shopify, preserve it
@@ -3709,16 +3780,14 @@ async def replay_webhook(webhook_id: str):
 
                 if existing_customer.data:
                     cust_id = existing_customer.data[0]["id"]
-                    if existing_customer.data[0].get("cratejoy_customer_id"):
-                        customer_record["platform"] = "both"
-                    else:
-                        customer_record["platform"] = "shopify"
-                    # Non-sub order for existing customer → address only
+                    customer_record["platform"] = "shopify"
+                    # Non-sub order for existing customer → address only, never platform (2.1)
                     if not is_subscription_order:
-                        address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country", "platform") if k in customer_record}
+                        address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country") if k in customer_record}
                         db.table("customers").update(address_only).eq("id", cust_id).execute()
                         logger.info(f"[WEBHOOK REPLAY] Non-sub order — updated address only for existing customer: {cust_id}")
                     else:
+                        _log_platform_change(email, existing_customer.data[0].get("platform"), "shopify", "replay_webhook")
                         db.table("customers").update(customer_record).eq("id", cust_id).execute()
                         logger.info(f"[WEBHOOK REPLAY] Updated existing customer: {cust_id}")
                 else:
@@ -3912,7 +3981,8 @@ async def replay_webhook(webhook_id: str):
                 if existing_customer.data:
                     cust_id = existing_customer.data[0]["id"]
                     existing_cust = existing_customer.data[0]
-                    customer_record["platform"] = "both" if existing_cust.get("shopify_customer_id") else "cratejoy"
+                    _log_platform_change(existing_cust.get("email"), existing_cust.get("platform"), "cratejoy", "replay_webhook_cj")
+                    customer_record["platform"] = "cratejoy"
                     # Preserve existing data
                     if not due_date and existing_cust.get("due_date"):
                         logger.info(f"[WEBHOOK REPLAY] Preserving existing due_date: {existing_cust['due_date']}")
@@ -6705,8 +6775,6 @@ async def test_webhook_cratejoy(request: Request):
 
         if existing.data:
             cust_id = existing.data[0]["id"]
-            if existing.data[0].get("shopify_customer_id"):
-                customer_record["platform"] = "both"
             db.table("customers").update(customer_record).eq("id", cust_id).execute()
             logger.info(f"[CJ TEST] Updated customer: {cust_id}")
         else:

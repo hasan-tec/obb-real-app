@@ -236,9 +236,18 @@ def parse_due_date(raw: Optional[str]) -> Optional[str]:
         return None
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%SZ"):
         try:
-            return datetime.strptime(raw.strip(), fmt).date().isoformat()
+            parsed = datetime.strptime(raw.strip(), fmt).date()
         except ValueError:
             continue
+        # A typo'd year still parses cleanly ('10/6/0226' -> year 226), so bound it.
+        # Without this the bad value reaches customers.due_date and skews the trimester.
+        if not (2000 <= parsed.year <= 2100):
+            logger.warning(
+                f"[DATE] due_date '{raw}' parsed to year {parsed.year} (outside 2000-2100)"
+                f" -- rejecting, leaving due_date empty"
+            )
+            return None
+        return parsed.isoformat()
     logger.warning(f"[DATE] Could not parse due_date '{raw}' -- skipping due_date")
     return None
 
@@ -411,9 +420,24 @@ def load_kit_cache(db: Client) -> KitCache:
     """Load all kits + kit_items from Supabase into a KitCache."""
     logger.info("[SETUP] Loading kit cache from Supabase...")
     try:
-        kits = db.table("kits").select("id, sku, trimester").execute()
-        kit_items = db.table("kit_items").select("kit_id, item_id").execute()
-        cache = KitCache(kits.data or [], kit_items.data or [])
+        # MUST paginate. Supabase caps a bare .execute() at 1000 rows; kit_items is
+        # larger than that, so an unpaginated read silently returns a PARTIAL cache and
+        # every kit beyond the cap links ZERO items onto its shipments.
+        def _page(table: str, cols: str) -> list:
+            rows, offset = [], 0
+            while True:
+                batch = db.table(table).select(cols).range(offset, offset + 999).execute()
+                rows.extend(batch.data or [])
+                if len(batch.data or []) < 1000:
+                    return rows
+                offset += 1000
+
+        kits_rows = _page("kits", "id, sku, trimester")
+        kit_items_rows = _page("kit_items", "kit_id, item_id")
+        logger.info(
+            f"[SETUP] Paginated read: {len(kits_rows)} kits, {len(kit_items_rows)} kit_items rows"
+        )
+        cache = KitCache(kits_rows, kit_items_rows)
         logger.info(
             f"[SETUP] Kit cache: {len(cache)} kits, "
             f"{len(cache.items_by_kit)} kits have item mappings"
@@ -676,6 +700,18 @@ def collect_from_csv(
             "due_date": due_date_str,
         }
         existing_cust = customers_by_email.get(email_raw, {})
+        # One email can only be one customer row (unique index on lower(email)), so when the
+        # same email appears twice with DIFFERENT personal data -- two subscriptions on one
+        # account -- the later row silently wins. Surface it rather than hiding it; a wrong
+        # due_date puts the customer in the wrong trimester.
+        for field in ("due_date", "clothing_size"):
+            old_val = existing_cust.get(field)
+            new_val = new_cust.get(field)
+            if old_val and new_val and old_val != new_val:
+                stats.add_warning(
+                    f"{email_raw}: conflicting {field} across rows in '{label}' "
+                    f"({old_val!r} -> {new_val!r}); later row wins -- confirm which is correct"
+                )
         for field, val in new_cust.items():
             if val is not None:
                 existing_cust[field] = val
@@ -1139,6 +1175,25 @@ def main():
             "Review summary above, then run without --dry-run to import."
         )
         return
+
+    # -- HARD GATE: never write shipments we cannot resolve to a real kit ------
+    # Rule: imports may only READ kits/items. An unresolved SKU must halt and be
+    # reported to a human -- never auto-created, and never silently written as a
+    # text-only shipment with no kit_id and no items.
+    unresolved = {s["kit_sku"] for s in shipments_collected if not kit_cache.get_kit(s["kit_sku"])}
+    if unresolved:
+        logger.error(
+            "ABORTING -- %d kit SKU(s) in the CSV do not exist in the kits table: %s",
+            len(unresolved), sorted(unresolved),
+        )
+        logger.error("Ask Sheena to create these kits in the app, then re-run. Nothing was written.")
+        sys.exit(1)
+    if len(kit_cache) == 0:
+        logger.error(
+            "ABORTING -- kit cache is EMPTY. Phase 0 could not load the kits table, so every "
+            "shipment would be written without kit_id and without items. Nothing was written."
+        )
+        sys.exit(1)
 
     # -- Confirm live import ---------------------------------------------------
     logger.info("")
