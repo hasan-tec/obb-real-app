@@ -176,6 +176,32 @@
         </div>
     </div>
 
+    <!-- Override kit modal — lazy-loads eligible kits per customer on open -->
+    <div id="overrideModal"
+        style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;">
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;max-width:480px;width:90%;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <strong style="font-size:15px;">Override Kit</strong>
+                <button onclick="document.getElementById('overrideModal').style.display='none'"
+                    style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--text-dim);">✕</button>
+            </div>
+            <form method="POST" id="overrideForm">
+                <div class="form-group">
+                    <label>Kit *</label>
+                    <select name="kit_id" id="overrideKitSelect" class="form-control" required>
+                        <option value="">Loading…</option>
+                    </select>
+                </div>
+                <div class="form-group" style="margin-top:10px;">
+                    <label>Reason</label>
+                    <input type="text" name="reason" class="form-control"
+                        placeholder="e.g. Customer requested this kit specifically">
+                </div>
+                <button type="submit" class="btn btn-primary" style="margin-top:12px;">⚡ Override Kit</button>
+            </form>
+        </div>
+    </div>
+
     <!-- ── Bulk Action Bar (sticky, hidden until selections made) ── -->
     <div id="bulkBar"
         style="display:none;position:sticky;top:0;z-index:50;background:var(--surface2);border:1px solid var(--accent);border-radius:8px;padding:10px 16px;margin-bottom:12px;align-items:center;gap:12px;flex-wrap:wrap;">
@@ -365,6 +391,8 @@
                                 onclick="return confirm('Approve and mark as shipped?')">📦</button>
                         </form>
                         {% endif %}
+                        <button type="button" class="btn btn-sm btn-secondary" title="Override kit"
+                            onclick="openOverride('{{ d.customer_id }}', '{{ d.kit_sku or "" }}')">⇄</button>
                         <form method="POST" action="/decisions/{{ d.id }}/reject" style="display:inline;">
                             <button type="submit" class="btn btn-sm btn-danger" title="Reject"
                                 onclick="return confirm('Reject this decision?')">✕</button>
@@ -405,6 +433,33 @@
         var isHidden = fullEl.style.display === 'none';
         shortEl.style.display = isHidden ? 'none' : 'inline';
         fullEl.style.display = isHidden ? 'inline' : 'none';
+    }
+
+    function openOverride(customerId, currentKitSku) {
+        var form = document.getElementById('overrideForm');
+        form.action = '/customers/' + customerId + '/override-kit';
+        var select = document.getElementById('overrideKitSelect');
+        select.innerHTML = '<option value="">Loading…</option>';
+        document.getElementById('overrideModal').style.display = 'flex';
+
+        fetch('/customers/' + customerId + '/override-kits-json')
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.error || !data.kits || data.kits.length === 0) {
+                    select.innerHTML = '<option value="">No alternative kits available</option>';
+                    return;
+                }
+                var opts = '<option value="">— Choose a kit —</option>';
+                data.kits.forEach(function (k) {
+                    var label = k.sku + (k.sku === currentKitSku ? ' (currently assigned)' : '');
+                    if (k.rejected_at) { label += ' — rejected ' + k.rejected_at.slice(0, 10); }
+                    opts += '<option value="' + k.id + '">' + label + '</option>';
+                });
+                select.innerHTML = opts;
+            })
+            .catch(function () {
+                select.innerHTML = '<option value="">Failed to load kits</option>';
+            });
     }
 
     var selectAllEl = document.getElementById('selectAll');

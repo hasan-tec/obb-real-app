@@ -524,7 +524,7 @@
                         <select name="kit_id" class="form-control" required>
                             <option value="">— Choose a kit —</option>
                             {% for k in override_kits %}
-                            <option value="{{ k.id }}">{{ k.sku }} — T{{ k.trimester }}{% if k.is_welcome_kit %} (Welcome){% endif %} — {{ k.quantity_available }} in stock</option>
+                            <option value="{{ k.id }}">{{ k.sku }} — T{{ k.trimester }}{% if k.is_welcome_kit %} (Welcome){% endif %} — {{ k.quantity_available }} in stock{% if k.rejected_at %} — rejected {{ k.rejected_at[:10] }}{% endif %}</option>
                             {% endfor %}
                         </select>
                     </div>
@@ -540,6 +540,16 @@
             <p style="font-size:12px; color: var(--text-dim);">
                 No alternative kits available for this customer's trimester / size right now. Ask Ting to add more kits in the Kits page.
             </p>
+            {% endif %}
+            {% if rejected_kits %}
+            <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);">
+                <div style="font-size:12px;color:var(--text-dim);margin-bottom:6px;">
+                    Excluded from Recurate this cycle — rejected earlier, won't be auto-suggested again until this customer's next shipment:
+                </div>
+                {% for r in rejected_kits %}
+                <span class="badge badge-red" style="margin:0 4px 4px 0;display:inline-block;" title="Rejected {{ r.rejected_at }}">{{ r.sku }} — rejected {{ r.rejected_at[:10] }}</span>
+                {% endfor %}
+            </div>
             {% endif %}
         </div>
     </div>

@@ -1896,6 +1896,47 @@ def load_customer_shipments_with_items(customer_id: str) -> list[dict]:
     return enriched_shipments
 
 
+def get_rejected_kit_map(db, customer_id: str, shipments: list[dict]) -> dict[str, str]:
+    """Kit SKUs staff have rejected for this customer since their last shipment (the
+    current, still-open curation cycle) — mapped to the rejection timestamp.
+    A shipment closes out the cycle, so a kit rejected before it becomes eligible
+    again for the next one (Thread 18: this is Recurate-scoped, not a permanent block).
+
+    Excludes system auto-rejections (Shopify hold auto-pause, Cratejoy cancellation
+    reconcile) so a hold->resume->recurate cycle doesn't wrongly re-exclude the kit
+    that was simply on hold — only staff-initiated rejects count.
+    """
+    last_shipment_at = max((s.get("created_at") for s in shipments if s.get("created_at")), default=None)
+
+    query = (
+        db.table("decisions")
+        .select("kit_sku, reason, created_at")
+        .eq("customer_id", customer_id)
+        .eq("status", "rejected")
+        .order("created_at")
+    )
+    if last_shipment_at:
+        query = query.gt("created_at", last_shipment_at)
+    rows = query.execute().data or []
+
+    rejected: dict[str, str] = {}
+    for r in rows:
+        kit_sku = r.get("kit_sku")
+        if not kit_sku:
+            continue
+        reason = r.get("reason") or ""
+        if reason.startswith("[Shopify hold]") or reason.startswith("Auto-rejected:"):
+            continue
+        rejected[kit_sku] = r["created_at"]  # rows ordered ascending — keeps latest reject per SKU
+
+    if rejected:
+        logger.info(
+            "[REJECTED KITS] customer=%s cycle_since=%s rejected_skus=%s",
+            customer_id, last_shipment_at or "ever", list(rejected.keys()),
+        )
+    return rejected
+
+
 def get_eligible_override_kits(db, cust: dict, enriched_shipments: list, exclude_kit_sku: str | None = None) -> list[dict]:
     """Return all kits this customer is eligible for using the same logic as the auto-engine,
     minus the kit already auto-assigned (passed as exclude_kit_sku).
@@ -1969,6 +2010,11 @@ def get_eligible_override_kits(db, cust: dict, enriched_shipments: list, exclude
     for ki in (all_kit_items.data or []):
         kit_items_map.setdefault(ki["kit_id"], set()).add(ki["item_id"])
 
+    # Tag (don't exclude) kits rejected this cycle — Override is the deliberate manual
+    # channel, so staff can still knowingly re-pick one; the tag is what makes the
+    # rejection visible instead of a kit silently missing from the list.
+    rejected_map = get_rejected_kit_map(db, cust.get("id"), enriched_shipments)
+
     valid_kits = []
     for kit in size_filtered:
         if kit["sku"] in received_kit_skus:
@@ -1978,11 +2024,13 @@ def get_eligible_override_kits(db, cust: dict, enriched_shipments: list, exclude
         kit_item_ids = kit_items_map.get(kit["id"], set())
         if kit_item_ids and kit_item_ids & blocked_item_ids:
             continue
+        kit["rejected_at"] = rejected_map.get(kit["sku"])
         valid_kits.append(kit)
 
     logger.info(
-        "[OVERRIDE KITS] customer=%s T%s size=%s → %d valid override kits (excluded auto=%s)",
+        "[OVERRIDE KITS] customer=%s T%s size=%s → %d valid override kits (excluded auto=%s, tagged rejected=%d)",
         cust.get("email"), trimester, clothing_size, len(valid_kits), exclude_kit_sku or "none",
+        sum(1 for k in valid_kits if k.get("rejected_at")),
     )
     return valid_kits
 
@@ -2033,7 +2081,7 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
     logger.info(f"[DECISION ENGINE] Customer: {cust.get('email')}, T{trimester}, Size: {clothing_size or 'unknown (no size on record)'}")
 
     # 2. Get customer's item history from past shipments
-    shipments = db.table("shipments").select("id, kit_sku").eq("customer_id", customer_id).execute()
+    shipments = db.table("shipments").select("id, kit_sku, created_at").eq("customer_id", customer_id).execute()
     received_item_ids = set()
     received_kit_skus = set()
 
@@ -2049,6 +2097,10 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
             received_item_ids.add(si["item_id"])
 
     logger.info(f"[DECISION ENGINE] History: {len(received_kit_skus)} kits received, {len(received_item_ids)} items received")
+
+    # Thread 18: kits staff already rejected this cycle (Recurate scope, not permanent —
+    # see get_rejected_kit_map docstring). Excluded from auto-suggestion below.
+    rejected_kit_map = get_rejected_kit_map(db, customer_id, shipments.data or [])
 
     # Build blocked items list (received items + their alternatives).
     # Single bulk fetch instead of 2 queries per item to avoid N+1 under webhook load.
@@ -2126,6 +2178,10 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
             logger.info(f"[DECISION ENGINE] Kit {kit['sku']} excluded: already received by customer")
             continue
 
+        if kit["sku"] in rejected_kit_map:
+            logger.info(f"[DECISION ENGINE] Kit {kit['sku']} excluded: rejected this cycle (at {rejected_kit_map[kit['sku']]})")
+            continue
+
         kit_item_ids = kit_items_map.get(kit["id"], set())
 
         if not kit_item_ids:
@@ -2140,14 +2196,15 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
 
         valid_kits.append(kit)
 
-    logger.info(f"[DECISION ENGINE] After duplicate check: {len(valid_kits)} valid kits remaining")
+    logger.info(f"[DECISION ENGINE] After duplicate + rejected check: {len(valid_kits)} valid kits remaining")
 
     if not valid_kits:
+        rejected_note = f" {len(rejected_kit_map)} kit(s) excluded as rejected this cycle." if rejected_kit_map else ""
         return {
             "decision_type": "needs-curation",
-            "reason": f"All T{trimester} kits have duplicate items with customer history. "
+            "reason": f"All T{trimester} kits have duplicate items with customer history or were rejected this cycle. "
                       f"Checked {len(filtered)} kits, blocked {len(blocked_item_ids)} items. "
-                      f"Customer received {len(received_kit_skus)} previous kits.",
+                      f"Customer received {len(received_kit_skus)} previous kits.{rejected_note}",
             "kit_id": None,
             "kit_sku": None,
         }
@@ -4609,6 +4666,15 @@ async def customer_detail(request: Request, customer_id: str):
                 break
         override_kits = get_eligible_override_kits(db, cust.data, shipments, exclude_kit_sku=auto_kit_sku)
 
+        # Thread 18 visibility ask — "why isn't this kit getting assigned to them":
+        # list kits rejected this cycle so staff can see what Recurate is excluding.
+        rejected_kit_map = get_rejected_kit_map(db, customer_id, shipments)
+        rejected_kits = sorted(
+            ({"sku": sku, "rejected_at": rejected_at} for sku, rejected_at in rejected_kit_map.items()),
+            key=lambda r: r["rejected_at"],
+            reverse=True,
+        )
+
         return templates.TemplateResponse("customer_detail.html", {
             "request": request,
             "customer": cust.data,
@@ -4616,6 +4682,7 @@ async def customer_detail(request: Request, customer_id: str):
             "shipments": shipments,
             "kits": kits_list.data or [],
             "override_kits": override_kits,
+            "rejected_kits": rejected_kits,
             "auto_kit_sku": auto_kit_sku,
             "stored_trimester": stored_trimester,
             "live_trimester": live_trimester,
@@ -7923,6 +7990,39 @@ async def edit_item(
 # MANUAL KIT OVERRIDE
 # ═══════════════════════════════════════════════════════════
 
+@app.get("/customers/{customer_id}/override-kits-json")
+async def override_kits_json(customer_id: str):
+    """Lazy-loaded eligible override kits for the Decisions page's Override control —
+    fetched on demand per row instead of precomputing for every row on page load."""
+    try:
+        db = get_supabase()
+        cust = db.table("customers").select("*").eq("id", customer_id).single().execute()
+        if not cust.data:
+            logger.warning(f"[OVERRIDE KITS JSON] Customer {customer_id} not found")
+            return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+        shipments = load_customer_shipments_with_items(customer_id)
+
+        auto_kit_sku = None
+        pending = db.table("decisions").select("decision_type, status, kit_sku").eq("customer_id", customer_id).eq("status", "pending").execute()
+        for d in (pending.data or []):
+            if d.get("decision_type") == "auto" and d.get("kit_sku"):
+                auto_kit_sku = d["kit_sku"]
+                break
+
+        override_kits = get_eligible_override_kits(db, cust.data, shipments, exclude_kit_sku=auto_kit_sku)
+        logger.info(f"[OVERRIDE KITS JSON] customer={customer_id} → {len(override_kits)} eligible kit(s)")
+        return JSONResponse({
+            "kits": [
+                {"id": k["id"], "sku": k["sku"], "rejected_at": k.get("rejected_at")}
+                for k in override_kits
+            ]
+        })
+    except Exception as e:
+        logger.error(f"[OVERRIDE KITS JSON] Error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.post("/customers/{customer_id}/override-kit")
 async def manual_override_kit(
     request: Request,
@@ -7934,15 +8034,17 @@ async def manual_override_kit(
     try:
         db = get_supabase()
         if not kit_id or kit_id.strip() == "":
+            sep = "&" if "?" in _post_action_redirect(request) else "?"
             return RedirectResponse(
-                f"/customers/{customer_id}?msg={quote('Please select a kit')}&msg_type=error",
+                f"{_post_action_redirect(request)}{sep}msg={quote('Please select a kit')}&msg_type=error",
                 status_code=303,
             )
 
         kit = db.table("kits").select("sku, trimester").eq("id", kit_id).single().execute()
         if not kit.data:
+            sep = "&" if "?" in _post_action_redirect(request) else "?"
             return RedirectResponse(
-                f"/customers/{customer_id}?msg={quote('Kit not found')}&msg_type=error",
+                f"{_post_action_redirect(request)}{sep}msg={quote('Kit not found')}&msg_type=error",
                 status_code=303,
             )
 
@@ -8002,15 +8104,17 @@ async def manual_override_kit(
             override_reason,
             "info",
         )
+        sep = "&" if "?" in _post_action_redirect(request) else "?"
         return RedirectResponse(
-            f"/customers/{customer_id}?msg={quote(f'Override created — {kit_sku} is now pending approval')}&msg_type=success",
+            f"{_post_action_redirect(request)}{sep}msg={quote(f'Override created — {kit_sku} is now pending approval')}&msg_type=success",
             status_code=303,
         )
     except Exception as e:
         logger.error(f"[OVERRIDE] Error: {e}", exc_info=True)
         await log_activity("decision", f"Failed to create manual override: {e}", "", "error")
+        sep = "&" if "?" in _post_action_redirect(request) else "?"
         return RedirectResponse(
-            f"/customers/{customer_id}?msg={quote('Failed to create override')}&msg_type=error",
+            f"{_post_action_redirect(request)}{sep}msg={quote('Failed to create override')}&msg_type=error",
             status_code=303,
         )
 
@@ -8225,54 +8329,20 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                         logger.warning(f"[BULK ACTION] Skipping recurate for {did[:8]} — {len(other_pending.data)} other pending decision(s) exist for customer {cust_id_rc[:8]}")
                         skipped += 1
                         continue
-                    # Reject the old decision first
-                    db.table("decisions").update({"status": "rejected"}).eq("id", did).execute()
-                    # Run the decision engine fresh
-                    kit_decision = await assign_kit(cust_id_rc, date.today())
-                    if kit_decision["decision_type"] == "incomplete-data":
-                        logger.warning(f"[BULK ACTION] Recurate incomplete-data for {did[:8]}")
+                    # Reject the old decision first (no-op if already rejected)
+                    if current_status == "pending":
+                        db.table("decisions").update({"status": "rejected"}).eq("id", did).execute()
+                    # Delegate to the SAME shared core the single-customer Recurate button
+                    # uses — the old inline version here duplicated this logic and drifted:
+                    # it used a stale trimester snapshot and never carried forward order_id/
+                    # order_type/gift ship-to/billing snapshot, so a bulk-recurated gift
+                    # subscription would ship to the account holder instead of the recipient.
+                    rc_result = await _recurate_customer_core(db, cust_id_rc, background_tasks, reason_prefix="Bulk-re-curated")
+                    if rc_result["status"] != "ok":
+                        logger.warning(f"[BULK ACTION] Recurate {rc_result['status']} for {did[:8]} ({cust_id_rc[:8]}): {rc_result['message']}")
                         skipped += 1
                         continue
-                    trimester_rc = d.get("trimester")
-                    new_decision = {
-                        "customer_id": cust_id_rc,
-                        "kit_id": kit_decision.get("kit_id"),
-                        "kit_sku": kit_decision.get("kit_sku"),
-                        "decision_type": kit_decision["decision_type"],
-                        "reason": f"Bulk re-curate: {kit_decision['reason']}",
-                        "status": "pending",
-                        "order_id": d.get("order_id"),
-                        "platform": d.get("platform"),
-                        "trimester": trimester_rc,
-                        "ship_date": date.today().isoformat(),
-                    }
-                    db.table("decisions").insert(new_decision).execute()
-                    logger.info(f"[BULK ACTION] Re-curated {did[:8]} → {kit_decision['decision_type']}")
-                    # Sync to Google Sheets: update old row + write new row
-                    cust_data_rc = d.get("customers", {}) or {}
-                    cust_email_rc = cust_data_rc.get("email", "")
-                    cust_name_rc = f"{cust_data_rc.get('first_name', '')} {cust_data_rc.get('last_name', '')}".strip()
-                    old_order_id_rc = d.get("order_id", "")
-                    update_decision_status_in_sheet(
-                        email=cust_email_rc,
-                        order_id=old_order_id_rc,
-                        new_status="re-curated",
-                        reason_prefix="Bulk-re-curated",
-                    )
-                    write_decision_to_sheet({
-                        "date": date.today().isoformat(),
-                        "customer_name": cust_name_rc,
-                        "email": cust_email_rc,
-                        "platform": "re-curate",
-                        "trimester": trimester_rc,
-                        "order_type": "re-curate",
-                        "kit_sku": kit_decision.get("kit_sku", "—"),
-                        "decision_type": kit_decision["decision_type"],
-                        "reason": f"[Bulk-re-curated] {kit_decision['reason']}",
-                        "order_id": old_order_id_rc or "",
-                        "due_date": "",
-                        "clothing_size": "",
-                    })
+                    logger.info(f"[BULK ACTION] Re-curated {did[:8]} → {rc_result['kit_decision']['decision_type']}")
                     success += 1
 
             except Exception as row_err:
