@@ -1015,6 +1015,14 @@ def run_monthly_report(
                         res["reason"] = (
                             f"Safe: {kit.get('sku')} (reassigned — earlier safe kits out of stock)"
                         )
+                    # Recompute alternatives against what's actually left, excluding the kit
+                    # just assigned — otherwise a reassigned customer shows the same SKU as both
+                    # their recommendation and their alternative, which reads as a bug on screen.
+                    res["alternative_kit_skus"] = [
+                        kit_by_id[alt_id]["sku"]
+                        for alt_id in (res.get("safe_kit_ids") or [])
+                        if alt_id != kit_id and remaining_stock.get(alt_id, 0) > 0
+                    ][:3]
                     covered_count += 1
                     break
             else:
