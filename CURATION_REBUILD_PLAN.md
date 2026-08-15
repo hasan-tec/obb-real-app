@@ -745,7 +745,13 @@ real thing to chase, but it is a reconciliation task, not a blocker.
 8 products"*, 9:08), which is explicitly a **non-goal** for us (§6 — a human picks the items). It
 never enters the pool or the DO-NOT-USE calculation. Removed from the blocker list entirely.
 
-## 10.7 The ONE thing still genuinely uncertain: the per-layer month window
+## 10.7 RESOLVED IN §11 — the window EXTENDS. Section kept for history.
+
+> **Superseded 2026-08-15 (§11.1).** This was called "the one genuine blocker" and it should not have
+> been. The answer was in the Loom transcript the whole time, and the video confirms it visually.
+> **The lower-trimester window extends back, it does not shift.** Read §11.
+
+## 10.7 (historical) The per-layer month window
 
 §5.2, and it is the only §5 item that survives. The evidence is genuinely mixed and I am not going to
 resolve it by picking whichever reading is convenient:
@@ -832,3 +838,573 @@ We have her actual September answers on screen, so this is directly checkable:
   shifted by one — so `AUG CP21`'s list should be September's shifted back a month. Two of her past
   months (`AUG CP21/CP31/CP41`, `JULY CO21/CO31/CO41`) are visible as tabs and could be requested as
   a second validation set if the September check is ambiguous.
+
+---
+
+# 11. FOURTH PASS (2026-08-15) — the "blocker" was answerable all along
+
+Hasan asked whether the two remaining questions could have been answered from material already in
+hand (Loom transcript, the video, and the Aug 3 meeting transcript). **Yes — both.** I was
+over-cautious in §10.7 and asked Sheena a question the transcript already answers. Recording it
+properly here so it doesn't get re-asked.
+
+## 11.1 ~~RESOLVED — the window EXTENDS~~ **WRONG — CORRECTED IN §12. Do not use this section.**
+
+> **This conclusion is incorrect.** §12 has the authoritative rule, taken from Sheena's own Word
+> document (the artifact she writes the block list in, which I had never seen when I wrote this).
+> The window **SHIFTS back 3 months per layer**; it does not extend. What follows is kept only so the
+> error is traceable.
+
+## 11.1 (WRONG, historical) The lower-trimester window EXTENDS back, it does not shift
+
+§10.7 called this "the one genuine blocker" and framed it as shift-vs-extend. **It's extend**, and
+there are three independent confirmations.
+
+**1. The Loom transcript says it outright.** The lines I had already read, verbatim:
+
+```
+12:21  This one for WKE1 May, April and March.
+12:25  So, May, April, and March, May, April, and March.
+12:34  So that will be WKE one and then.
+12:39  BQ 11 and then there's BP 11.
+```
+
+She names **all three** — WKE1, BQ11 *and* BP11 — for T3's T1 layer. I fixated on the "May, April and
+March" window (which suggested a shift) and under-weighted the list she actually reads out one line
+later. The window phrase describes where the *older* kit sits; the list is what actually gets blocked.
+
+**2. The video confirms it visually.** Frame at 12:40 on the `SEPT CQ31` sheet, scrolled right:
+
+```
+col J = CO21/22/23/24   col K = CN21   col L = WKE1   col M = BQ11   col N = BP11
+```
+
+Column N's item list is **identical, in the same order, 8 of 8**, to the `BP11` column on the
+`SEPT CQ21` sheet (SUNFLOWERMOTHERHOOD, HAPPYSHOPPE, WILLOWCOLLECTIVE, ATTITUDE+STRETCHMARK,
+BIRTHKEEPINGBYBEKAH, PANTSEXTENDER, AZALA+COOLINGBODYBALM, NURIA+HYDRATE). So the T3 sheet carries
+both T1 renewal kits.
+
+**3. The contrast with the T2 sheet holds.** On `SEPT CQ21` she says *"it's safe to delete BP11"*
+(5:25) — T2's T1 layer keeps only WKE1 + BQ11.
+
+**So the rule is:**
+
+| Curating | T1 layer contains | Span |
+|---|---|---|
+| T2 | WKE1, BQ11 | last ~3 months of T1 kits |
+| T3 | WKE1, BQ11, **BP11** | last ~6 months of T1 kits |
+
+Each trimester deeper reaches ~3 months further back, because a T3 customer has been subscribed
+longer and has therefore seen more past kits. This makes §10.8's pseudocode concrete — the window for
+layer L when curating trimester T is **the last `3 × (T − L + 1)` months**, not a fixed 3-month window
+and not a shifted one.
+
+**Consequence for §10.7's "default wide and flag it" hedge: no longer needed.** We know the rule.
+Implement it directly.
+
+## 11.2 The 407 figure — origin traced, and a contradiction worth knowing about
+
+**Origin:** the Aug 3 meeting, not the Loom. Sheena reads the numbers out one at a time —
+T2 = 139 (line 544), T3 = 142 (line 628), T4 = 114 (line 630), T1 = 12 — and Tony recaps them as
+*"the 12 139 142 and 114"* (line 665). Sum = 407.
+
+**How she builds them (meeting, ~line 668):** from the **attribution sheet**, *"a spreadsheet where
+[Amayis] shared to us … whenever there are new customers from both from new orders and renewals would
+populate"*. Tony restates it as *"an auto pool … for all orders that need to be essentially orders
+that need to be shipped, including renewals as well as new orders"*, then filters by due date to split
+trimesters. Sheena: *"Yes, correct."*
+
+**The contradiction.** In the meeting, both Sheena and Tony describe that sheet as containing **new
+orders AND renewals**. In the Loom she says of the order-data tab *"this is where the new orders would
+enter daily"* (13:30). But in Slack (2026-08-13) she answered *"that sheet only have renewal
+customers."*
+
+Those cannot all be true of the same sheet. Most likely reading: the sheet **auto-populates with
+both**, and she **filters to renewals** when producing the T1–T4 curation counts — which would make
+her Slack answer right about the counts and the meeting right about the sheet. But that is a
+reconciliation I am inferring, not something anyone stated.
+
+**Why it matters:** it decides whether our Shopify-only renewal figure of 375 should be compared
+against 407 directly (→ 32 customers genuinely missing from our data) or against something smaller
+(→ smaller or no gap). Do **not** tune the pool against 407 until this is settled. This is now the
+only genuinely open question in the whole plan.
+
+**Also worth noting from the same meeting:** Tony's own articulation of why the recency filter is
+wrong is sharper than anything in §1 — *"we can't curate based on what we've shipped in the past. We
+have to curate based on which customers require a shipment, because customers cancel … that number
+shifts monthly … our customer list is not static."* That is exactly the justification for the
+decisions-based pool, from the client, unprompted.
+
+## 11.3 Process note — check what we already have before asking
+
+Both §10.7 and the first-timers question were answerable from files already on disk. The first-timers
+one Sheena had *already* answered in Slack ("that sheet only have renewal customers") and it was still
+carried in a follow-up draft. Cost: a round-trip with a client who is stretched thin, and a call
+booked over something the transcript answers.
+
+**Rule going forward:** before adding anything to a question list for Sheena, grep the Loom
+transcript, the Aug 3 meeting transcript, and pull the relevant video frames first. Only what survives
+all three gets asked.
+
+## 11.4 Updated blocker list
+
+**Genuinely open — exactly one:**
+- §11.2. Does her 407 (12/139/142/114) include first-time customers or not? The meeting and her Slack
+  reply disagree. Everything else about reconciliation waits on this.
+
+**Answered, do not re-ask:**
+- Per-layer window → §11.1, extends back, `3 × (T − L + 1)` months.
+- `CO31`/`CN31` blocked → §10.2.
+- T4 same principle → §10.4.
+- Kit build-month derivable from our own DB → §10.1.
+- 8-products stop condition, out of scope → §10.6.
+- Trimester boundaries match to the day → §7b.4 / §7b.3b.
+
+**Ready to build, blocked on nothing:** §3.2 blocking rebuild per §10.8 + **§12's** window rule (NOT
+§11.1's — that was wrong), the scheduler day-3 move (§10.9 item 2), and the §9.8 list items 4–7.
+
+---
+
+# 12. THE AUTHORITATIVE BLOCKING RULE (2026-08-15) — from Sheena's Word document
+
+Hasan supplied screenshots of the **Word document** Sheena builds the block list in — the artifact
+referenced at Loom 1:19 (*"I typically would just use a pen and paper… but for this demonstration, I
+would be doing it on Word"*). This is the explicit statement of the rule and it **corrects §11.1**,
+which concluded the opposite.
+
+## 12.1 What the document says, verbatim
+
+```
+SEPTEMBER CURATION
+
+        T2                          T3
+SEP  – T2                    SEP  – T3
+AUG  – T2 – T1               AUG  – T3 – T2
+JULY – T2 – T1               JULY – T3 – T2
+JUNE – T2 – T1               JUNE – T3 – T2
+MAY  -                       MAY  -        - T1
+APR  -                       APR  -        - T1
+MAR  -                       MAR  -        - T1
+FEB  -                       FEB  -
+JAN  –                       JAN  –
+DEC  -                       DEC  -
+```
+
+Read it as: **"for month X, block the kits of trimester Y that were built in month X."** The months run
+down the left; the trimester tags say which layer is in scope for that month.
+
+## 12.1b CONFIRMED BY SHEENA IN WRITING (2026-08-15)
+
+Asked directly — *"When you're picking items for a T3 box, do you avoid using anything from the last
+three months of T1 kits, or anything from three months further back than that?"* — she replied:
+
+> *"When curating a T3 box, we always look within the 3-month period that corresponds to T3. The
+> reason is that pregnancy is divided into 3 trimesters, with each trimester covering roughly 3
+> months… So the rule isn't simply 'avoid anything from the last 3 months of T1' or 'avoid anything
+> older than 3 months.' It's more about identifying which 3-month trimester period the box belongs
+> to, then curating based on that period.*
+> *For example: T1 = months 1–3, T2 = months 4–6, T3 = months 7–9.*
+> *The important thing for the system is that each trimester has its own 3-month window, and the
+> products assigned to that trimester should be evaluated within that window."*
+
+This independently confirms §12.2's shift model, from her own description of the mechanism: a customer
+in T3 is at pregnancy months 7–9, so she was in T2 three months ago and T1 six months ago. Each layer
+therefore gets **its own** 3-month window, offset by ~3 months per layer — not one window that grows.
+
+**§11.1's "extend" reading is now doubly refuted** (Word doc + her written confirmation). The
+spreadsheet columns that suggested it were captured mid-deletion.
+
+## 12.2 The rule
+
+**The window SHIFTS BACK 3 months per trimester layer below the one being curated. It does not extend.**
+
+For curating trimester **T** in cycle month **M**, with depth `d = T − L` for each layer `L`:
+
+| depth | layer | months blocked |
+|---|---|---|
+| 0 | T itself | M, M−1, M−2, M−3 |
+| 1 | T−1 | M−1, M−2, M−3 |
+| 2 | T−2 | M−4, M−5, M−6 |
+| 3 | T−3 | M−7, M−8, M−9 |
+
+Both the **welcome kit** and the **renewal kit** of each in-scope layer/month are blocked, and **all
+size variants** of a renewal kit (they differ by ~2 items each — §10.3).
+
+**Why it's shaped this way — it tracks the customer's own history.** A customer who is T3 this
+September was T2 roughly three months ago (Jun–Aug) and T1 roughly six months ago (Mar–May). The rule
+blocks precisely what that cohort could already have received. That is also why depth 0 reaches one
+month further forward than depth 1: the current month's own kit for the trimester being curated is in
+scope, but a lower layer's current-month kit is not, because this cohort has already moved past it.
+
+## 12.3 Why §11.1 got it wrong, and what that means for the spreadsheet evidence
+
+§11.1 concluded "extend" from the `SEPT CQ31` spreadsheet showing **both** `BQ11` and `BP11` columns
+populated. Under §12.2's rule, T3's T1 layer is Mar/Apr/May only, so `BQ11` (a Jun–Aug kit) should
+**not** be there.
+
+Most likely explanation: she builds each month's sheet by **deleting from the previous month's sheet**
+(3:28 — *"since I already built this one, so it's easier for me to just delete the SKUs that we no
+longer be included"*), so the frame I captured was mid-deletion. The spoken line *"BQ 11 and then
+there's BP 11"* (12:39) reads equally well as her scanning the schedule to locate the right kit.
+
+**The Word document wins**: it is her explicit plan of which months map to which layers, written before
+the spreadsheet work, and it is internally consistent across both the T2 and T3 pages. The spreadsheet
+is a working artifact captured mid-edit.
+
+**Validation this gives us for free:** if our implementation is right, `SEPT CQ31`'s T1 layer should
+resolve to `WKE1 + BP11` and **not** `BQ11`. That is a direct, checkable prediction — see §12.5.
+
+## 12.3b VERIFIED AGAINST LIVE DATA (2026-08-15) — three findings that change the implementation
+
+A verification pass against the live DB proved the §12.4 sketch below is **wrong in three places**.
+One rule does not fit all kit types. Corrected shape is in §12.4b.
+
+### (a) `age_rank`, not modal ship month, is the build-month key
+
+```
+month(age_rank r) = 2024-03 + (r − 65) months     — exact, 1:1, 0 ambiguous ranks across 65→93
+age_rank is assigned per SKU-prefix block:  CM=91  CN=92  CO=93  CP=94  →  CQ (Sept 2026) = 95
+```
+
+**Modal ship month is blind exactly where it is needed.** `OBB-CP-21/31/41` (Aug 2026) have **zero
+shipments** — when you curate month M you are standing in M−1, and that month's kit has not shipped
+yet. So modal ship month can *never* resolve the depth-0/depth-1 M−1 cell. This retires §10.1's
+recommendation. Trust `age_rank` only for `r ≥ 65`; ranks 55/56 are out-of-sequence legacy kits.
+
+Also: `kits.name` is unreliable — `OBB-CE-31 KITS` is named "OCT 2025 - CE-31" but ships in 2025-09.
+
+### (b) T1 kits cannot be resolved by month at all — use recency rank
+
+There are only **four T1 renewal kits in the entire database**: `AB11`(28), `BO11`(67), `BP11`(68),
+`BQ11`(69). T1 renewals are made roughly **annually**, not monthly, so "the T1 kit of June 2026" does
+not exist. `BQ11` has **zero shipments ever**; `BP11`'s 47 shipments spread across 11 months at 12.8%
+modal concentration.
+
+Their `age_rank` **absolute** values are meaningless for T1 (BP11's 68 would decode to 2024-06, but
+it is named "JULY 2025 - BP-11"). Their **relative order** is chronologically correct, and selecting
+the d-th most recent reproduces Sheena exactly:
+
+| depth | curating | selector | result | matches her sheet |
+|---|---|---|---|---|
+| 1 | T2 | newest T1 renewal | **BQ11** | ✅ |
+| 2 | T3 | 2nd newest | **BP11** | ✅ |
+| 3 | T4 | 3rd newest | BO11 | (predicted) |
+
+### (c) Welcome kits span many months — a month filter silently drops them
+
+| kit | shipments | distinct months | modal | modal conc. |
+|---|---|---|---|---|
+| WKE1 (T1) | 258 | 15 | 2026-07 | 13.6% |
+| WKH2 (T2) | 374 | 12 | 2026-07 | 19.0% |
+| WKC3 (T3) | 358 | **30** | **2024-03** | 15.6% |
+
+WKC3's modal month is 2024-03, which falls in **no** September-2026 window — a "built in month M"
+rule would have **silently dropped WKC3 from the T3 block list**, which Sheena does block. Correct
+selector: `is_welcome_kit = TRUE AND trimester = L`, take `max(age_rank)`, tie-break
+`quantity_available > 0`. Yields WKE1 / WKH2 / WKC3 / AP41 — exactly her set.
+
+> **Data hazard:** `'OBB-WK-G2 KIT'` (0 shipments) and `'OBB-WK-G2 KITS'` (747 shipments) both exist
+> sharing `age_rank` 10008. A naive max-age_rank picker can select the empty one. Tie-break on
+> `quantity_available`.
+
+### (d) Match against Sheena's actual columns
+
+- **SEPT CQ21 (T2): EXACT MATCH, 9/9.** WKH2, CP21, CO21/22/23/24, CN21, WKE1, BQ11. Zero missing,
+  zero extra.
+- **SEPT CQ31 (T3): all 13 of her columns reproduced, but 3 EXTRA** — CO22, CO23, CO24. She
+  enumerated all four size variants for the **depth-0** T3 layer (`CO31/32/33/34`) but listed only
+  `CO21` for the **depth-1** T2 layer. Since all variants share one `age_rank`, any month filter
+  picks up all four automatically.
+  **Genuinely ambiguous** — (i) clerical omission, so the union is right, or (ii) deliberate, so
+  deeper layers block only the base size. The variants differ by ~2 items each, so it is a real
+  behavioural difference. **See §12.6 — one question for Sheena.** Safe default meanwhile: block all
+  variants (over-blocking is recoverable; under-blocking ships a duplicate).
+
+### (e) Why the existing kit query cannot be reused
+
+`run_monthly_report:661` loads `is_welcome_kit = False AND quantity_available > 0`. Blocking needs
+**welcome kits** *and* **zero-stock kits** — a kit built in June blocks regardless of leftover stock.
+The rebuild must issue its own `kits` query.
+
+## 12.4b Corrected implementation shape
+
+```
+build_month(kit)      = 2024-03 + (kit.age_rank − 65) months        # only for age_rank >= 65
+layer_window(d, M)    = {M, M-1, M-2, M-3}          if d == 0
+                        {M-1, M-2, M-3}             if d == 1
+                        {s, s-1, s-2} where s = M - (3d - 2)   if d >= 2
+
+blocked_kits(T, M):
+    for d in 0 .. T-1:
+        L = T - d
+        # 1. welcome kit of this layer — NEVER month-filtered
+        add active welcome kit: is_welcome_kit AND trimester == L, max(age_rank),
+                                tie-break quantity_available > 0
+        # 2. renewal kits of this layer
+        if L == 1:  add the (max(d-1, 0))-th most recent T1 renewal kit    # recency, not month
+        else:       add every trimester-L renewal kit whose build_month ∈ layer_window(d, M)
+                    (all size variants come along automatically — they share one age_rank)
+    DO NOT USE = union of kit_items over those kits ; CAN USE = every other item
+```
+
+Month arithmetic must use an absolute month index (`year*12 + month-1`) so Dec→Jan rollover is free —
+T4 curation reaches back to December of the prior year.
+
+## 12.4 (superseded sketch) Implementation shape
+
+```
+build_month(kit)  = modal ship month of kit_sku in `shipments`
+                    (fallback: 2-letter SKU prefix, CA=2025-05, +1 month per letter — §10.1)
+
+blocked_kits(T, M):
+    for d in 0 .. T-1:
+        L = T - d
+        months = [M, M-1, M-2, M-3]        if d == 0
+                 [M-1, M-2, M-3]           if d == 1
+                 [M-3d+2, M-3d+1, M-3d]    if d >= 2      # d=2 -> M-4,M-5,M-6
+        for each kit K with trimester(K) == L and build_month(K) in months:
+            include K, ALL its size variants, and the layer's welcome kit
+    DO NOT USE = union of kit_items over those kits
+    CAN USE    = every other item
+```
+
+Binary. No percentages, no risk tiers. `RISK_HIGH_THRESHOLD` / `RISK_MEDIUM_THRESHOLD`
+(`curation_report.py:28-29`) have no counterpart in her process and get deleted, not tuned.
+
+## 12.4c DESIGN SPEC (2026-08-15) — reviewed, but DO NOT implement as-is (see §12.4d)
+
+A design pass plus three adversarial review lenses ran against this. The spec below is sound in
+structure and was independently confirmed to reproduce Sheena's T2 sheet exactly — but the reviews
+found **five defects**, two of which are real bugs in the spec itself. Fix those first (§12.4d).
+
+**Additional verification this pass:**
+- Epoch formula cross-checked against `kits.name` text: r=65 → "MAR 2024 - BM-\*", r=93 → "JULY 2026
+  - CO-\*", r=94 → "AUG 2026 - CP-\*". Exact, no drift.
+- T1 renewals confirmed live: `AB11`(28), `BO11`(67, qty 0), `BP11`(68, qty 10), `BQ11`(69, qty 50).
+  age_rank DESC order is exactly BQ11 → BP11 → BO11 → AB11.
+- `curation_report.html:309` / `:356` **hardcode** the badge text and only test `== 'HIGH'`, so the
+  choice of non-blocked label (`NONE` vs `LOW`) has **zero template blast radius**.
+- Dec/Jan rollover needs no special-casing: Python's `divmod` floors toward −∞, so
+  `_month_str_add("2026-01", -1)` → `"2025-12"` falls out for free.
+
+**Shape (condensed):**
+
+```python
+AGE_RANK_EPOCH_MONTH = "2024-03";  AGE_RANK_EPOCH_RANK = 65;  AGE_RANK_MIN_TRUSTED = 65
+
+_month_idx(s)         = year*12 + (month-1)                 # absolute index, rollover-free
+month_to_age_rank(s)  = 65 + (_month_idx(s) - _month_idx("2024-03"))
+
+_window_months(depth, M):
+    depth 0 -> [0,-1,-2,-3] ; depth 1 -> [-1,-2,-3]
+    depth d>=2 -> start = -(3d-2); [start, start-1, start-2]
+
+blocked_kits(T, M, kit_index):
+    for layer in range(T, 0, -1):
+        depth = T - layer
+        if layer == 1:  take t1_renewal_sorted[max(depth,1) - 1]      # recency, never month
+        else:           for m in _window_months(depth, M):
+                            r = month_to_age_rank(m)
+                            if r >= AGE_RANK_MIN_TRUSTED: add by_month[(layer, r)]
+        add active welcome kit for `layer`                             # every layer, never month-filtered
+```
+
+`load_kits_for_blocking(db)` is called **once per run** (not per trimester) and is deliberately
+unfiltered by `quantity_available` / `is_welcome_kit` — `run_monthly_report:661`'s in-stock query
+stays untouched, since that one drives kit *assignment*, which legitimately must respect stock.
+
+**Backwards compatibility — recommended approach:** add `cycle_month: Optional[str] = None`. When
+`None`, run the legacy percentage path verbatim. `projection_engine.py` needs **zero changes**: it
+calls with exactly the five existing kwargs, so it keeps the legacy path, and Mode B's `extra_blocked`
+union (`:141-149`) — which writes into `customer_items_in_window` — keeps working untouched.
+
+**This is deliberate, not laziness:** the Forward Planner projects 3–6 months ahead, and the kits that
+*would* be blocked in those future months **do not exist in the DB yet** (CQ/CR/CS have no rows). Under
+kit-recipe blocking a future month would return a partial-then-empty block list, producing a visible
+"cliff" between horizon months that reflects data availability, not real risk — actively misleading on
+a view Ting and Sheena read as forward guidance. A `None` sentinel that *never computes a substitute
+month* also avoids the trap where every horizon month silently resolves to the same window.
+
+## 12.4d FIVE DEFECTS FOUND IN REVIEW — fix before implementing
+
+**D1 — CRITICAL (spec bug): the welcome-kit tiebreak selects the WRONG row.**
+The spec's prose says the final tiebreak is `sku` DESC, but the code is
+`min(candidates, key=lambda k: (-age_rank, -qty, k["sku"]))` — `sku` **ascending**. Verified in
+Python: `"OBB-WK-G2 KIT" < "OBB-WK-G2 KITS"` is `True`, so `min()` picks the **zero-shipment**
+duplicate — the exact opposite of the stated safety intent. Both rows carry a full 8-item recipe, so
+when it fires it blocks the wrong 8 items. Dormant today only because WKH2 (10009) wins outright.
+The same inverted key sits in `t1_renewal_sorted`. **Fix:** use `max()` with an un-negated key.
+
+**D2 — HIGH: the empty-trimester early return is no longer correct.**
+`if group_size == 0: return [], []` fires *before* `cycle_month` is inspected. That was right under
+the percentage rule (blocking depended on the customer group); under kit-recipe blocking the block
+list **does not depend on customers at all**. Not hypothetical: T1's live pool is already down to
+**6 customers**, so a zero month is realistic — and when it happens `curation_run_items` silently
+gets zero rows for that trimester even though `blocked_kits(1, "2026-09")` returns a real
+`{BQ11, WKE1}`.
+
+**D3 — MEDIUM: `app.py:5741` sort collapses.** The saved-report view re-sorts `do_not_use` by
+`-blocked_pct`, which under the binary rule is a **constant 100.0** for every row — so on-screen order
+degenerates to whatever order PostgREST happens to return. The design audits the duplicate predicate
+at `:5735` but stops one line short of `:5741`. Needs a secondary key in the same change set.
+
+**D4 — MEDIUM: the "X / Y" column becomes self-contradictory.** `curation_report.html:298` renders
+`blocked_count / group_size` (e.g. "3 / 9") immediately beside `:301`'s `blocked_pct` (now always
+"100.0%"). A reader sees "3 / 9 → 100.0%" and reasonably calls it a bug. This is the *same* pattern
+the spec proudly fixes for expired items, reintroduced for every ordinary blocked item. Sheena and
+Ting are the actual audience for this table — decide the display before shipping.
+
+**D5 — LOW (accuracy of a claim, not code): the epoch verification overclaims.** "Verified against
+`kits.name` for r=65→94" — but `kits.name` is **NULL for all 9 rows at age_rank 91 (`CM`) and all 3 at
+92 (`CN`)**, so 12 of 30 ranks had no text to check. The sequence is unbroken and neighbours (90 = APR
+2026, 93 = JULY 2026) make 91/92 = MAY/JUN 2026 near-certain by continuity — but that is inference, not
+confirmation. These ranks are not idle: `blocked_kits(4, "2026-06")` puts both `CM-41` and `CN-41`
+into the blocked set.
+
+**Also flagged, not blocking:** no log line if a blocked kit resolves to an empty recipe (5 of 200
+kits have zero `kit_items`, all with `age_rank < 65` so excluded today) — contrary to CLAUDE.md's
+logging standard.
+
+## 12.4e Confirmed SOUND under review (checked, not assumed)
+
+- **T2 (SEPT CQ21): EXACT 9/9**, hand-walked against live rows.
+- **No hard breaks anywhere** — Forward Planner, `_save_report_details`, Sheets export, and the
+  template's risk-level/threshold logic all verified against live schema and actual call sites. No
+  KeyError, no CHECK violation, no NUMERIC(5,2) overflow, no tuple-shape mismatch. `'NONE'` correctly
+  falls to `can_use` at `app.py:5735` with zero code change.
+- **T4 across the Dec/Jan boundary works:** `blocked_kits(4, "2026-06")` → T2 layer at depth 2 →
+  `"2025-12"` → rank 86 → the real `OBB-CH-21/22/23/24` rows named "DEC 2025 - CH-2x".
+- **T1 curation, missing-month cells, and the not-yet-existing cycle-month kit** all resolve to empty
+  lists without error. `month_to_age_rank("2026-09") == 95`; zero kit rows exist at 95.
+- **`item_alternatives` expansion should survive** — it models physical substitutability, orthogonal
+  to how the blocked set is derived. Only 8 rows, and dropping it risks under-blocking a registered
+  duplicate-equivalent.
+
+## 12.4f The CO22/23/24 ambiguity is REAL, and it is not cosmetic
+
+Quantified at the item level: all four `CO-2x` rows share `age_rank 93`, each has exactly 8 items,
+and **CO-22, CO-23 and CO-24 each contribute exactly 1 item not present in CO-21.** So the T3 run
+would carry up to 3 genuinely distinct extra items into DO-NOT-USE.
+
+**Structural, not a coding slip:** layer 2 at depth 1 (inside a T3 curation) and layer 2 at depth 0
+(a T2 curation) hit the *identical* `by_month[(2, 93)]` bucket. Nothing in the data model can
+distinguish "block CO-21 only" from "block all CO-2x" at different depths without a depth-conditioned
+variant filter.
+
+**Safe default: keep the union** (over-blocking costs a kit slot; under-blocking ships a duplicate).
+**Ask Sheena — and ask for the general rule, since this recurs for every multi-variant prefix at every
+depth ≥ 1:** *"Your T3 sheet's T2-layer row lists only CO21, but the T3-layer row above lists all four
+CO31/32/33/34 — was that shorthand for the whole CO-2x block, or deliberate (deeper layers block only
+the base size)?"*
+
+## 12.5 Acceptance test — we already know the right answers
+
+Curating **September 2026**, the implementation must produce exactly:
+
+| Curating | Expected blocked kits |
+|---|---|
+| T2 | WKH2, CP21, CO21(+22/23/24), CN21, WKE1, BQ11 — and **not** BP11 |
+| T3 | WKC3, CP31, CO31(+32/33/34), CN31, WKH2, CP21, CO21, CN21, WKE1, BP11 — and **not** BQ11 |
+
+The T2 row matches her spreadsheet columns exactly (including BP11 being deleted, 5:25). The T3 row is
+the §12.3 prediction. If T3 comes out with `BQ11` in it, either the rule or our build-month resolution
+is wrong — investigate rather than accepting it.
+
+## 12.5b Implementation checklist (nothing built yet — this is the ordered to-do)
+
+1. Fix **D1** (welcome-kit + T1 tiebreak → `max()`, un-negated key) before anything else.
+2. Fix **D2** (move the empty-trimester early return *after* the kit-recipe branch, or drop it there).
+3. Decide **D4**'s display, then implement `blocked_kits` + the `generate_item_risk_report` rewrite.
+4. Fix **D3** (`app.py:5741` secondary sort key) in the same change set.
+5. Re-verify against §12.5's acceptance test — T2 must be 9/9 exact; T3 will be 13/13 + the 3 CO
+   variants until Sheena answers §12.4f.
+6. `projection_engine.py`: **no changes** (legacy path via `cycle_month=None`).
+7. Deferred, needs its own authorisation: the `EXPIRED` badge — `risk_level` is CHECK-constrained to
+   `HIGH/MEDIUM/LOW/NONE`, so it needs migration **021** *plus* an `app.py:5735` widen *plus* a
+   template badge change, and CLAUDE.md forbids touching templates outside a UI task. The interim win
+   is free: expired items go from "0/N · 0.0% · HIGH" to "0/N · 100.0% · HIGH", which at least stops
+   reading as a bug.
+8. Data hygiene, separate: the `OBB-WK-G2 KIT` / `OBB-WK-G2 KITS` duplicate pair should be cleaned up
+   in Supabase directly.
+
+## 12.6 Still open
+
+Only §11.2 remains: does her 407 (12/139/142/114) include first-time customers? The Aug 3 meeting and
+her 2026-08-13 Slack reply contradict each other. Do not tune the pool against 407 until settled.
+
+---
+
+# 13. IMPLEMENTED (2026-08-15) — §12.5b's checklist, built and audited
+
+All 8 items in §12.5b's checklist are done, plus §10.9's other backend-only "ready to build" items.
+
+**`curation_report.py`:** added `load_kits_for_blocking()`, `blocked_kits()`, `compute_blocked_items()`,
+the `_month_idx/_month_add/month_to_age_rank/_window_offsets` helpers, and
+`_generate_item_risk_report_kit_recipe()`. `generate_item_risk_report()` gained an optional
+`cycle_month`/`kit_index`/`kit_items_map` param set — D1 (tiebreak) and D2 (empty-trimester early
+return ordering) both fixed in the new path. `run_monthly_report()` now always calls it with
+`cycle_month=report_month`, so the live monthly report is 100% kit-recipe blocking. The legacy
+percentage path (`cycle_month=None`) is untouched byte-for-byte except the D3 sort-tiebreak fix, and
+stays load-bearing: `projection_engine.py`'s Forward Planner calls `generate_item_risk_report()` with
+no `cycle_month` (it has no kit build-month for future months — see §12.4c), so it silently keeps
+using the legacy branch. Zero changes to `projection_engine.py` itself. Also ported the kit-stock
+coverage cap from `projection_engine.py:366-376` into `run_monthly_report`'s step 8a (§10.9 item 6).
+
+**`app.py`:** D3 sort-tiebreak fix at the saved-report view (~5741). Scheduler trigger moved day 1 → 3,
+`pool_source="shipments"` pin dropped so the unattended run now uses the new pool too (§10.9 item 2,
+Hasan's 2026-08-13 decision).
+
+**Verification:**
+- Live read-only script against the real DB: `blocked_kits(2, "2026-09", ...)` = the exact 9 kits
+  §12.5 predicts (WKH2, CP21, CO21/22/23/24, CN21, WKE1, BQ11 — no BP11). `blocked_kits(3, "2026-09", ...)`
+  = the predicted 13 + the documented CO22/23/24 over-block (§12.4f) = 16 kits, no BQ11. Exact match,
+  both trimesters.
+- Full read-only `run_monthly_report(report_month="2026-08")` end-to-end: every DO-NOT-USE item across
+  all 4 trimesters has `blocked_pct == 100.0` and `risk_level == 'HIGH'` (binary, confirmed live, not
+  just by code inspection). T1 (6 live customers) still produced a real 30-item block list — the D2 fix
+  holds under real data, not just the empty-pool edge case.
+- `tests/test_engine.py`: 6/6 pass. (`tests/test_phase2.py` can't even be collected without a running
+  local server — pre-existing, unrelated to this work, not touched.)
+- Independent Sonnet-subagent audit (adversarial, hand-traced against the plan's own stated live-data
+  facts): verdict CORRECT. Found one cosmetic bug — `_monthly_report_scheduler`'s docstring still said
+  "checks... if it's the 1st" after the trigger moved to day 3. Fixed.
+
+## 13.1 Stock-aware kit allocation (2026-08-15) — replaces the aggregate cap
+
+The ported §3.5 cap (`covered <= total trimester stock`) turned out to be the wrong denominator and
+was replaced the same day. Two Sonnet audits plus live measurement agreed:
+`evaluate_existing_kit_coverage()` is stateless per customer, so a kit with 2 units was recommended
+to every customer whose history pointed at it. Measured on run `f7842b2a`: BT-32 (stock 4) → 45
+customers, BQ-41 (stock 26) → 34, BP-41 (stock 2) → 9, BT-21 (stock 3) → 29, BC-21 (stock 100) →
+105. **121 customers were promised a kit that did not physically exist.** The aggregate cap never
+fired because each trimester's total stock was comfortably above its covered count — a big recent
+kit (CP-31: 200, CP-41: 150) carried the slack while small kits were exhausted.
+
+Replaced with a single allocation pass holding `remaining_stock` per kit, assigning each customer
+their oldest safe kit that still has units and falling through their full safe list when one runs
+out. `evaluate_existing_kit_coverage()` now also returns `safe_kit_ids` (the complete ordered list,
+not just the 3 alternatives surfaced in the UI) so the caller can reallocate. The aggregate cap is
+gone — per-kit allocation subsumes it.
+
+Result (2026-08, ship 14): **zero over-promised kits in every trimester.** T2 136 covered (now
+spread over 5 kits, BC-21 capped at exactly its 100), T3 151 → **141** (10 customers have no
+in-stock safe kit), T4 43 covered but redistributed onto idle BT-41/BV-41 stock instead of
+oversubscribing BQ-41/BP-41. Build quantities unchanged this month only because the 100-unit
+warehouse minimum dominates; in a month where it doesn't, the old numbers would have been too low.
+
+**Open policy question, defaulted not decided:** when a scarce kit runs out, who gets it? The pass
+processes customers fewest-safe-kits-first (so a scarce kit isn't consumed by someone who had other
+options), tie-broken on `customer_id` for determinism. That maximises coverage but is an engine
+default, not a stated business rule — if Sheena has a real priority order (longest subscribed,
+earliest due date), it belongs in that sort key.
+
+**Deliberately not done, per CLAUDE.md ("never touch templates unless the task is specifically UI") and
+"never guess, ask Hasan" — flagged, not silently skipped:**
+- D4's display decision and the EXPIRED badge (§12.5b item 7) both require a `templates/` change (the
+  EXPIRED badge also needs migration 021 for the `risk_level` CHECK constraint). Needs an explicit
+  UI-task go-ahead.
+- Ship day 14 → 15 (§3.4): still only "weakly supported" per the plan's own words — not a confirmed
+  standing rule. Left at 14.
+- Rendering `renewal_by_platform` (already computed, §9.4): same template-touching constraint as D4.
+- §11.2 (Sheena's 407 provenance) and the CO22/23/24 union-vs-base-size question (§12.4f): both
+  genuinely open business-rule questions for Sheena, not implementation blockers — unchanged from §12.6.

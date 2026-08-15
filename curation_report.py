@@ -25,8 +25,15 @@ DEFAULT_SHIP_DAY = 14             # 14th of the month
 DEFAULT_WAREHOUSE_MIN = 100       # minimum kit build quantity
 DEFAULT_LOOKBACK_MONTHS = 4       # months to look back for DO NOT USE
 DEFAULT_RECENCY_MONTHS = 3        # only include customers whose last shipment was within X months
-RISK_HIGH_THRESHOLD = 60.0        # >= 60% blocked = HIGH risk
-RISK_MEDIUM_THRESHOLD = 25.0      # >= 25% blocked = MEDIUM risk
+RISK_HIGH_THRESHOLD = 60.0        # legacy percentage path only (projection_engine.py) — see generate_item_risk_report
+RISK_MEDIUM_THRESHOLD = 25.0      # legacy percentage path only (projection_engine.py) — see generate_item_risk_report
+
+# ─── Kit-recipe blocking (CURATION_REBUILD_PLAN.md §12) ───
+# Kit build-month is derived from age_rank, not shipment dates — see §12.3b(a).
+# age_rank r corresponds to calendar month AGE_RANK_EPOCH_MONTH + (r - AGE_RANK_EPOCH_RANK).
+AGE_RANK_EPOCH_MONTH = "2024-03"
+AGE_RANK_EPOCH_RANK = 65
+AGE_RANK_MIN_TRUSTED = 65          # ranks below this are legacy one-offs, not a reliable monthly sequence
 
 
 # ─── Trimester Calculation (same as Phase 1) ───
@@ -56,6 +63,152 @@ def calc_lookback_window(ship_date: date, lookback_months: int = DEFAULT_LOOKBAC
     # End is the last day of the month before the ship month
     lookback_end = date(ship_date.year, ship_date.month, 1) - timedelta(days=1)
     return lookback_start, lookback_end
+
+
+# ─── Kit-Recipe Blocking (CURATION_REBUILD_PLAN.md §12) ───
+#
+# Replaces the percentage-of-group DO NOT USE calculation for the live monthly report.
+# Sheena blocks at the kit-recipe level: for the trimester being curated and every
+# trimester below it, block that layer's welcome kit plus its recent renewal kits.
+# The window shifts back 3 months per layer below the one being curated (§12.2/§12.4b),
+# except T1 renewals, which are made ~annually and are selected by recency rank instead
+# of a month window (§12.3b(b) — there are only 4 T1 renewal kits in the whole DB).
+
+def _month_idx(month_str: str) -> int:
+    """Absolute month index (year*12 + month-1) for arithmetic that's rollover-free."""
+    year, month = int(month_str[:4]), int(month_str[5:7])
+    return year * 12 + (month - 1)
+
+
+def _month_add(month_str: str, delta: int) -> str:
+    """month_str shifted by delta months, e.g. _month_add('2026-01', -1) == '2025-12'."""
+    idx = _month_idx(month_str) + delta
+    year, month0 = divmod(idx, 12)
+    return f"{year:04d}-{month0 + 1:02d}"
+
+
+def month_to_age_rank(month_str: str) -> int:
+    """The age_rank a kit built in month_str would carry. See §12.3b(a)."""
+    return AGE_RANK_EPOCH_RANK + (_month_idx(month_str) - _month_idx(AGE_RANK_EPOCH_MONTH))
+
+
+def _window_offsets(depth: int) -> list[int]:
+    """Month offsets (relative to the cycle month) blocked for a layer at this depth.
+    depth 0 = the trimester being curated itself; depth 1, 2, 3 = layers below it."""
+    if depth == 0:
+        return [0, -1, -2, -3]
+    if depth == 1:
+        return [-1, -2, -3]
+    start = -(3 * depth - 2)
+    return [start, start - 1, start - 2]
+
+
+def load_kits_for_blocking(db) -> dict:
+    """
+    Load every kit (deliberately unfiltered by quantity_available / is_welcome_kit —
+    a kit built in a blocked month is blocked regardless of leftover stock) and index it
+    for blocked_kits(). Call once per run, not once per trimester.
+
+    Returns {
+        "by_layer_age_rank": {(trimester, age_rank): [kit, ...]},   # renewal kits only
+        "welcome_by_trimester": {trimester: kit},                   # one active welcome kit per trimester
+        "t1_renewal_sorted": [kit, ...],                            # T1 renewals, newest age_rank first
+    }
+    """
+    all_kits = _paginate_all(db.table("kits").select("*"))
+
+    by_layer_age_rank = defaultdict(list)
+    welcome_candidates = defaultdict(list)
+    t1_renewal = []
+
+    for k in all_kits:
+        trimester = k.get("trimester")
+        if trimester is None:
+            continue
+        if k.get("is_welcome_kit"):
+            welcome_candidates[trimester].append(k)
+            continue
+        age_rank = k.get("age_rank")
+        if age_rank is not None:
+            by_layer_age_rank[(trimester, age_rank)].append(k)
+        if trimester == 1:
+            t1_renewal.append(k)
+
+    # D1 fix (plan §12.4d): tiebreak must MAXIMIZE age_rank, then quantity_available, then sku —
+    # a min() over a negated key silently preferred a zero-stock duplicate SKU (e.g. picking
+    # 'OBB-WK-G2 KIT' with 0 shipments over 'OBB-WK-G2 KITS' with 747, at the same age_rank).
+    welcome_by_trimester = {}
+    for trimester, candidates in welcome_candidates.items():
+        welcome_by_trimester[trimester] = max(
+            candidates,
+            key=lambda k: (k.get("age_rank") or 0, k.get("quantity_available") or 0, k.get("sku") or ""),
+        )
+
+    t1_renewal_sorted = sorted(t1_renewal, key=lambda k: k.get("age_rank") or 0, reverse=True)
+
+    logger.info(
+        "[CURATION] Kit-blocking index loaded: %d renewal (trimester,age_rank) buckets, "
+        "%d welcome kits, %d T1 renewal kits",
+        len(by_layer_age_rank), len(welcome_by_trimester), len(t1_renewal_sorted),
+    )
+
+    return {
+        "by_layer_age_rank": dict(by_layer_age_rank),
+        "welcome_by_trimester": welcome_by_trimester,
+        "t1_renewal_sorted": t1_renewal_sorted,
+    }
+
+
+def blocked_kits(trimester: int, cycle_month: str, kit_index: dict) -> set[str]:
+    """
+    The set of kit ids DO-NOT-USE for `trimester`, curating in `cycle_month` (e.g. "2026-09").
+    Rule: CURATION_REBUILD_PLAN.md §12.2/§12.4b — for each layer L from `trimester` down to 1,
+    block that layer's active welcome kit plus its renewal kits in the layer's month window
+    (T1 renewals use recency rank instead of a month window — see module docstring above).
+    """
+    kit_ids: set[str] = set()
+    t1_list = kit_index["t1_renewal_sorted"]
+
+    for layer in range(trimester, 0, -1):
+        depth = trimester - layer
+
+        if layer == 1:
+            idx = max(depth - 1, 0)
+            if idx < len(t1_list):
+                kit_ids.add(t1_list[idx]["id"])
+        else:
+            for offset in _window_offsets(depth):
+                month = _month_add(cycle_month, offset)
+                rank = month_to_age_rank(month)
+                if rank >= AGE_RANK_MIN_TRUSTED:
+                    for kit in kit_index["by_layer_age_rank"].get((layer, rank), []):
+                        kit_ids.add(kit["id"])
+
+        welcome_kit = kit_index["welcome_by_trimester"].get(layer)
+        if welcome_kit:
+            kit_ids.add(welcome_kit["id"])
+
+    return kit_ids
+
+
+def compute_blocked_items(
+    trimester: int,
+    cycle_month: str,
+    kit_index: dict,
+    kit_items_map: dict[str, set],
+    alt_map: dict[str, set],
+) -> tuple[set[str], set[str]]:
+    """Blocked kit ids and their item ids, expanded through registered alternatives
+    (§12.4e — alternatives model physical substitutability, orthogonal to how the
+    blocked set is derived, and dropping them risks under-blocking a real duplicate)."""
+    kit_ids = blocked_kits(trimester, cycle_month, kit_index)
+    item_ids: set[str] = set()
+    for kid in kit_ids:
+        item_ids.update(kit_items_map.get(kid, set()))
+    expanded = set(item_ids)
+    for iid in list(item_ids):
+        expanded.update(alt_map.get(iid, set()))
+    return expanded, kit_ids
 
 
 # ─── Bulk Data Loaders ───
@@ -487,6 +640,9 @@ def evaluate_existing_kit_coverage(
         "alternative_kit_skus": alternatives,
         "reason": f"Safe: {primary['sku']} (age_rank={primary.get('age_rank', 0)}, {len(safe_kits)} safe kits available)",
         "blocking_item_count": len(blocked_items),
+        # Every safe kit for this customer, oldest first — the caller needs the full list
+        # (not just the top 3 shown in the UI) to reallocate when a kit runs out of stock.
+        "safe_kit_ids": [k["id"] for k in safe_kits],
     }
 
 
@@ -498,17 +654,31 @@ def generate_item_risk_report(
     customer_items_in_window: dict[str, set],
     all_items: list[dict],
     alt_map: dict[str, set],
+    cycle_month: Optional[str] = None,
+    kit_index: Optional[dict] = None,
+    kit_items_map: Optional[dict] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Generate DO NOT USE and CAN USE item lists for a trimester.
-    
-    DO NOT USE: Items that ≥25% of the trimester group received in the lookback window.
-    CAN USE: Everything else, sorted by age_rank (oldest first).
-    
+
+    Two modes:
+    - cycle_month given (the live monthly report): kit-recipe blocking per
+      CURATION_REBUILD_PLAN.md §12 — binary, independent of customer-group size.
+      Requires kit_index (load_kits_for_blocking) and kit_items_map.
+    - cycle_month=None (legacy, kept for projection_engine.py's Forward Planner —
+      it has no kit build-month for future months, see plan §12.4c): percentage-of-group
+      blocking, unchanged from the original implementation.
+
     Returns: (do_not_use_list, can_use_list)
     Each item dict has: item_id, name, sku, blocked_count, group_size, blocked_pct, risk_level
     """
     group_size = len(trimester_customers)
+
+    if cycle_month is not None:
+        return _generate_item_risk_report_kit_recipe(
+            trimester, group_size, cycle_month, all_items, alt_map, kit_index, kit_items_map,
+        )
+
     if group_size == 0:
         return [], []
 
@@ -579,12 +749,81 @@ def generate_item_risk_report(
         else:
             can_use.append(entry)
 
-    # Sort DO NOT USE by blocked_pct desc
-    do_not_use.sort(key=lambda x: -x["blocked_pct"])
+    # Sort DO NOT USE by blocked_pct desc, name as a stable secondary key
+    do_not_use.sort(key=lambda x: (-x["blocked_pct"], x["name"]))
     # Sort CAN USE by age — items don't have age_rank directly, but we use blocked_pct asc then name
     can_use.sort(key=lambda x: (x["blocked_pct"], x["name"]))
 
     logger.info(f"[CURATION] T{trimester}: DO NOT USE = {len(do_not_use)} items, CAN USE = {len(can_use)} items")
+
+    return do_not_use, can_use
+
+
+def _generate_item_risk_report_kit_recipe(
+    trimester: int,
+    group_size: int,
+    cycle_month: str,
+    all_items: list[dict],
+    alt_map: dict[str, set],
+    kit_index: Optional[dict],
+    kit_items_map: Optional[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Kit-recipe blocking path — see generate_item_risk_report's docstring.
+
+    Binary and independent of customer-group size (plan §12.4d D2 — the empty-trimester
+    early return in the legacy path is wrong here: a trimester with 0 customers this month
+    still has a real block list, e.g. T1's pool is already down to single digits)."""
+    if kit_index is None or kit_items_map is None:
+        raise ValueError("cycle_month blocking requires kit_index and kit_items_map")
+
+    blocked_item_ids, blocked_kit_ids = compute_blocked_items(
+        trimester, cycle_month, kit_index, kit_items_map, alt_map,
+    )
+
+    do_not_use = []
+    can_use = []
+    today = date.today()
+
+    for item in all_items:
+        iid = item["id"]
+
+        expiry_raw = item.get("expiry_date")
+        is_expired = False
+        if expiry_raw:
+            try:
+                expiry_dt = date.fromisoformat(str(expiry_raw)[:10])
+                if expiry_dt < today:
+                    is_expired = True
+            except (ValueError, TypeError):
+                pass
+
+        blocked = is_expired or (iid in blocked_item_ids)
+        risk = "HIGH" if blocked else "NONE"
+
+        entry = {
+            "item_id": iid,
+            "name": item.get("name", "Unknown"),
+            "sku": item.get("sku", ""),
+            "blocked_count": group_size if blocked else 0,
+            "group_size": group_size,
+            "blocked_pct": 100.0 if blocked else 0.0,
+            "risk_level": risk,
+            "unit_cost": item.get("unit_cost"),
+            "category": item.get("category"),
+            "is_expired": is_expired,
+            "quantity_available": item.get("quantity_available") or 0,
+            "inventory_synced_at": item.get("inventory_synced_at"),
+        }
+
+        (do_not_use if blocked else can_use).append(entry)
+
+    do_not_use.sort(key=lambda x: (-x["blocked_pct"], x["name"]))
+    can_use.sort(key=lambda x: (x["blocked_pct"], x["name"]))
+
+    logger.info(
+        "[CURATION] T%d kit-recipe (%s): %d kits blocked -> DO NOT USE = %d items, CAN USE = %d items",
+        trimester, cycle_month, len(blocked_kit_ids), len(do_not_use), len(can_use),
+    )
 
     return do_not_use, can_use
 
@@ -677,6 +916,9 @@ def run_monthly_report(
     # ── Step 5: Load item alternatives ──
     alt_map = load_item_alternatives(db)
 
+    # ── Step 5b: Load kit-recipe blocking index (§12) — unfiltered by stock/welcome, once per run ──
+    kit_index = load_kits_for_blocking(db)
+
     # ── Step 6: Load all items ──
     all_items = db.table("items").select("*").order("name").execute()
     all_items_list = all_items.data or []
@@ -732,16 +974,77 @@ def run_monthly_report(
                 **result,
             })
 
-            if not result["needs_new_curation"]:
-                covered_count += 1
+        # 8a2: Allocate kits against real stock.
+        # evaluate_existing_kit_coverage() answers "which kits COULD this customer receive"
+        # per-customer, with no knowledge of the other customers, so a kit with 2 units in
+        # stock was being recommended to every customer whose history pointed at it.
+        # Measured 2026-08-15: BT-32 (stock 4) recommended to 45 customers, BQ-41 (stock 26)
+        # to 34, BP-41 (stock 2) to 9. An aggregate covered<=total_stock cap does NOT catch
+        # this — the trimester total is comfortably under budget while individual kits are
+        # exhausted and a big recent kit sits idle.
+        #
+        # Fix: one pass holding remaining stock, assigning each customer their oldest safe
+        # kit that still has units and falling through to their next safe kit when it runs
+        # out. Keeps the existing oldest-first (age_rank) rule — it just makes it aware of
+        # what physically exists.
+        #
+        # Customers are processed fewest-safe-kits-first so a scarce kit is not consumed by
+        # someone who had other options while a customer with only that one option falls
+        # through to "needs new curation". Tie-break on customer_id purely for determinism.
+        # NOTE: this ordering is an engine default chosen to maximise coverage, not a stated
+        # business rule — if Sheena has a real priority order, it belongs here.
+        kit_by_id = {k["id"]: k for k in tri_kits}
+        remaining_stock = {k["id"]: (k.get("quantity_available") or 0) for k in tri_kits}
 
-        # 8b: Generate DO NOT USE / CAN USE
+        allocatable = [r for r in customer_results if not r["needs_new_curation"]]
+        allocatable.sort(key=lambda r: (len(r.get("safe_kit_ids") or []), r["customer_id"]))
+
+        covered_count = 0
+        reallocated = 0
+        exhausted = 0
+        for res in allocatable:
+            original_kit_id = res.get("recommended_kit_id")
+            for kit_id in (res.get("safe_kit_ids") or []):
+                if remaining_stock.get(kit_id, 0) > 0:
+                    remaining_stock[kit_id] -= 1
+                    kit = kit_by_id.get(kit_id, {})
+                    res["recommended_kit_id"] = kit_id
+                    res["recommended_kit_sku"] = kit.get("sku")
+                    if kit_id != original_kit_id:
+                        reallocated += 1
+                        res["reason"] = (
+                            f"Safe: {kit.get('sku')} (reassigned — earlier safe kits out of stock)"
+                        )
+                    covered_count += 1
+                    break
+            else:
+                # Every kit this customer could safely receive is out of stock.
+                exhausted += 1
+                res["needs_new_curation"] = True
+                res["recommended_kit_id"] = None
+                res["recommended_kit_sku"] = None
+                res["alternative_kit_skus"] = []
+                res["reason"] = (
+                    f"All {len(res.get('safe_kit_ids') or [])} safe T{tri} kits are out of stock"
+                )
+
+        logger.info(
+            "[CURATION] T%d stock-aware allocation: %d covered, %d reassigned to a later safe kit, "
+            "%d had every safe kit exhausted (total stock %d)",
+            tri, covered_count, reallocated, exhausted,
+            sum(k.get("quantity_available") or 0 for k in tri_kits),
+        )
+
+        # 8b: Generate DO NOT USE / CAN USE — kit-recipe blocking (§12), binary
         do_not_use, can_use = generate_item_risk_report(
             trimester=tri,
             trimester_customers=tri_customers,
             customer_items_in_window=window_history,
             all_items=all_items_list,
             alt_map=alt_map,
+            cycle_month=report_month,
+            kit_index=kit_index,
+            kit_items_map=kit_items_map,
         )
 
         # 8c: Build quantity

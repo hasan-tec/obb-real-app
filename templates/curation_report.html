@@ -17,53 +17,37 @@
             style="border-left: 3px solid var(--yellow); background: rgba(255,193,7,0.08); padding: 14px 18px; border-radius: 6px; margin-bottom: 20px;">
             <strong style="color: var(--yellow);">⚡ How It Works</strong>
             <p style="margin: 6px 0 0; color: var(--text-dim); font-size: 0.9em;">
-                This report analyzes ALL renewal customers, projects their trimesters for the target ship date,
-                checks existing kit coverage, and generates DO NOT USE / CAN USE item lists per trimester.
-                It also calculates recommended build quantities for the warehouse.
+                Takes every customer due a box this month (cancellations already excluded), works out each
+                one's trimester for the ship date, then blocks every item that appears in a recently built
+                kit — this trimester's kits, plus the kits they'd have received in earlier trimesters.
+                What's left is the CAN USE pool. It also flags who's already covered by kits in stock and
+                how many new units the warehouse needs to build.
             </p>
         </div>
         <form method="POST" action="/curation-report/generate"
             onsubmit="this.querySelector('button[type=submit]').disabled=true; this.querySelector('button[type=submit]').textContent='Generating...';">
             <div class="form-row"
-                style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 16px; align-items: end;">
+                style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 16px; align-items: end;">
                 <div class="form-group">
                     <label>Report Month</label>
                     <input type="month" name="report_month" value="{{ default_month }}" required
                         style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
                 </div>
                 <div class="form-group">
-                    <label>Ship Day</label>
+                    <label title="The date this month's boxes actually ship. This sets each customer's trimester, so change it if the build/ship days move this month.">Ship
+                        Day</label>
                     <input type="number" name="ship_day" value="14" min="1" max="28"
                         style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
                 </div>
                 <div class="form-group">
-                    <label>Warehouse Minimum</label>
+                    <label title="Smallest batch the warehouse will build. Raise it if you want to build more than the number strictly needed.">Warehouse
+                        Minimum</label>
                     <input type="number" name="warehouse_min" value="100" min="1"
                         style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
-                </div>
-                <div class="form-group">
-                    <label>Lookback (months)</label>
-                    <input type="number" name="lookback_months" value="4" min="1" max="12"
-                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;">
-                </div>
-                <div class="form-group">
-                    <label
-                        title="Only show customers whose last shipment was within this many months. Set 0 to include all.">Active
-                        Since (months)</label>
-                    <input type="number" name="recency_months" value="3" min="0" max="24"
-                        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; width: 100%;"
-                        title="0 = no filter (include all history). 3 = only customers who shipped in last 3 months.">
                 </div>
                 <button type="submit" class="btn btn-primary" style="height: 38px;">
                     📊 Generate Report
                 </button>
-            </div>
-            <div style="margin-top: 10px;">
-                <label
-                    style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text-dim); font-size: 0.9em;">
-                    <input type="checkbox" name="include_paused" value="1" style="accent-color: var(--accent);">
-                    Include paused subscriptions
-                </label>
             </div>
         </form>
     </div>
@@ -145,11 +129,7 @@
         <h3>{{ report.executive.report_month }} — Monthly Curation Report</h3>
         <span style="color: var(--text-dim); font-size: 0.85em;">
             Ship date: {{ report.executive.ship_date }} &nbsp;|&nbsp;
-            Generated: {{ report.executive.generated_at }} &nbsp;|&nbsp;
-            Lookback: {{ report.executive.lookback_months }} months ({{ report.executive.lookback_window }})
-            &nbsp;|&nbsp;
-            Active since: {% if report.executive.recency_months %}last {{ report.executive.recency_months }} months{%
-            else %}all history{% endif %}
+            Generated: {{ report.executive.generated_at }}
         </span>
     </div>
     <div style="padding: 20px;">
@@ -159,20 +139,23 @@
                 <div class="value">{{ report.executive.total_renewal_customers }}</div>
                 <div class="sub">customers shipping</div>
             </div>
+            {% if report.executive.renewal_by_platform %}
+            <div class="stat-card" style="border-left: 3px solid var(--green);">
+                <div class="label">Shopify Renewal</div>
+                <div class="value" style="color: var(--green);">
+                    {{ report.executive.renewal_by_platform.get('shopify', 0) }}</div>
+                <div class="sub">Shopify orders only</div>
+            </div>
+            <div class="stat-card" style="border-left: 3px solid var(--blue, var(--accent));">
+                <div class="label">Cratejoy Renewal</div>
+                <div class="value">{{ report.executive.renewal_by_platform.get('cratejoy', 0) }}</div>
+                <div class="sub">counted separately</div>
+            </div>
+            {% endif %}
             <div class="stat-card">
                 <div class="label">New Customers</div>
                 <div class="value">{{ report.executive.total_new_customers }}</div>
                 <div class="sub">welcome kit track</div>
-            </div>
-            <div class="stat-card">
-                <div class="label">Warehouse Min</div>
-                <div class="value">{{ report.executive.warehouse_minimum }}</div>
-                <div class="sub">units per kit build</div>
-            </div>
-            <div class="stat-card">
-                <div class="label">Trimesters Active</div>
-                <div class="value">{{ report.executive.trimesters | length }}</div>
-                <div class="sub">T1 / T2 / T3 / T4</div>
             </div>
         </div>
     </div>
@@ -283,10 +266,8 @@
                     <th>Item</th>
                     <th>SKU</th>
                     <th>Category</th>
-                    <th>Blocked By</th>
-                    <th>Blocked %</th>
+                    <th>Why blocked</th>
                     <th>Stock</th>
-                    <th>Risk</th>
                 </tr>
             </thead>
             <tbody>
@@ -295,22 +276,18 @@
                     <td><strong>{{ item.name }}</strong></td>
                     <td style="color: var(--text-dim); font-size: 0.9em;">{{ item.sku }}</td>
                     <td>{{ item.category or '—' }}</td>
-                    <td>{{ item.blocked_count }} / {{ item.group_size }}</td>
                     <td>
-                        <strong
-                            style="color: {% if item.blocked_pct >= 60 %}var(--red){% else %}var(--yellow){% endif %};">
-                            {{ item.blocked_pct }}%
-                        </strong>
+                        {% if item.is_expired %}
+                        <span class="badge badge-red">EXPIRED</span>
+                        {% endif %}
+                        {% if item.blocked_by_kits %}
+                        <span style="font-size: 0.85em;">In {{ item.blocked_by_kits | join(', ') }}</span>
+                        {% elif not item.is_expired %}
+                        <span style="color: var(--text-dim); font-size: 0.85em;">Recently used</span>
+                        {% endif %}
                     </td>
                     <td style="text-align: right; font-variant-numeric: tabular-nums;">
                         {% if item.inventory_synced_at %}{{ item.quantity_available }}{% else %}<span style="color: var(--text-dim);">—</span>{% endif %}
-                    </td>
-                    <td>
-                        {% if item.risk_level == 'HIGH' %}
-                        <span class="badge badge-red">HIGH</span>
-                        {% else %}
-                        <span class="badge badge-yellow">MEDIUM</span>
-                        {% endif %}
                     </td>
                 </tr>
                 {% endfor %}
@@ -337,9 +314,7 @@
                     <th>SKU</th>
                     <th>Category</th>
                     <th>Cost</th>
-                    <th>Blocked %</th>
                     <th>Stock</th>
-                    <th>Safety</th>
                 </tr>
             </thead>
             <tbody>
@@ -349,11 +324,9 @@
                     <td style="color: var(--text-dim); font-size: 0.9em;">{{ item.sku }}</td>
                     <td>{{ item.category or '—' }}</td>
                     <td>{% if item.unit_cost %}${{ "%.2f" | format(item.unit_cost) }}{% else %}—{% endif %}</td>
-                    <td>{{ item.blocked_pct }}%</td>
                     <td style="text-align: right; font-variant-numeric: tabular-nums;">
                         {% if item.inventory_synced_at %}{{ item.quantity_available }}{% else %}<span style="color: var(--text-dim);">—</span>{% endif %}
                     </td>
-                    <td><span class="badge badge-green">LOW</span></td>
                 </tr>
                 {% endfor %}
             </tbody>

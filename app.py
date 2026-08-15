@@ -1206,7 +1206,7 @@ def _refresh_customer_trimesters(db, today: date) -> dict:
 
 
 def _monthly_report_scheduler():
-    """Background thread that checks once per hour if it's the 1st and triggers the report."""
+    """Background thread that checks once per hour if it's the 3rd and triggers the report."""
     import time as _time
     last_run_month = None
     last_cj_daily_day = None  # Cratejoy daily sync guard (replaces the retired monthly sweep)
@@ -1220,8 +1220,15 @@ def _monthly_report_scheduler():
             now = datetime.utcnow()
             current_month_key = f"{now.year}-{now.month:02d}"
             current_day_key = now.strftime("%Y-%m-%d")
-            # Trigger on 1st of month, after 6 AM UTC, only once per month
-            if now.day == 1 and now.hour >= 6 and last_run_month != current_month_key:
+            # Trigger on the 3rd of the month, after 6 AM UTC, only once per month.
+            # Was day 1 (audit finding C1, CURATION_REBUILD_PLAN.md 9.11): measured live,
+            # only 0-2 decisions exist by day-1 06:00 UTC (most land 07:00-18:00 UTC that
+            # same day), which would silently auto-generate a near-empty report under the
+            # decisions-pool default. By day 3 the bulk have landed, so the decisions pool
+            # (run_monthly_report's default pool_source) is safe to use unattended — the
+            # explicit pool_source="shipments" pin is no longer needed. Hasan's decision,
+            # 2026-08-13, plan §10.9 item 2.
+            if now.day == 3 and now.hour >= 6 and last_run_month != current_month_key:
                 if _schedule_lock(f"curation_{current_month_key}"):
                     logger.info(f"[SCHEDULER] Monthly auto-run triggered for {current_month_key}")
                     try:
@@ -1237,16 +1244,6 @@ def _monthly_report_scheduler():
                             include_paused=False,
                             lookback_months=4,
                             recency_months=3,
-                            # Pinned to the OLD pool explicitly (2026-08-13, audit finding C1).
-                            # This fires on day 1 at the first hourly tick >=6am UTC — measured
-                            # live: 0-2 decisions exist for the new month by then (most land
-                            # 07:00-18:00 UTC same day or later), so the decisions-pool default
-                            # would silently auto-generate a near-empty report every month. The
-                            # interactive form (curation_report_page) already defaults to the
-                            # current month and correctly gets the new pool; only this unattended
-                            # 6am path needs to wait for a real decision on retiming before it
-                            # switches over — see CURATION_REBUILD_PLAN.md 9.9/9.11.
-                            pool_source="shipments",
                         )
                         # Save to DB
                         run_insert = db.table("curation_runs").insert({
@@ -5261,7 +5258,13 @@ async def remove_item_alternative(
 # CURATION REPORT ROUTES (Phase 2)
 # ═══════════════════════════════════════════════════════════════════
 
-from curation_report import run_monthly_report
+from curation_report import (
+    run_monthly_report,
+    load_kits_for_blocking,
+    blocked_kits,
+    _paginate_all,
+    DEFAULT_LOOKBACK_MONTHS,
+)
 from projection_engine import project_forward, load_committed_items
 import json as json_module
 
@@ -5387,23 +5390,25 @@ async def generate_curation_report(
     report_month: str = Form(...),
     ship_day: int = Form(14),
     warehouse_min: int = Form(100),
-    lookback_months: int = Form(4),
-    recency_months: int = Form(3),
-    include_paused: str = Form(""),
 ):
     """Start curation report generation as a background job.
     Returns immediately (HTTP 303) to avoid Heroku's 30-second H12 timeout.
     The client polls /curation-report/job/{job_id}/status for completion.
+
+    lookback_months / recency_months / include_paused are no longer form fields: under
+    kit-recipe blocking (CURATION_REBUILD_PLAN.md §12) the DO NOT USE list is derived from
+    kit build months, not a shipment lookback window, and the decisions-based pool selects
+    on subscription_status directly rather than shipment recency. They were live controls
+    that silently changed nothing, so the UI no longer offers them. The values below are
+    kept only because curation_runs still records them.
     """
-    paused = include_paused in ("1", "on", "true")
-    recency = recency_months if recency_months > 0 else None
     params = {
         "report_month": report_month,
         "ship_day": ship_day,
         "warehouse_min": warehouse_min,
-        "lookback_months": lookback_months,
-        "recency_months": recency,
-        "include_paused": paused,
+        "lookback_months": DEFAULT_LOOKBACK_MONTHS,
+        "recency_months": None,
+        "include_paused": False,
     }
     job_id = _create_job("curation_report", params)
     logger.info(f"[CURATION GEN] Started background job {job_id} for {report_month}")
@@ -5665,13 +5670,50 @@ async def view_curation_report(request: Request, run_id: str, msg: str = "", msg
         item_rows = []
         offset = 0
         while True:
-            batch = db.table("curation_run_items").select("*, items(name, sku, category, unit_cost, quantity_available, inventory_synced_at)").eq("run_id", run_id).range(offset, offset + 999).execute()
+            batch = db.table("curation_run_items").select("*, items(name, sku, category, unit_cost, quantity_available, inventory_synced_at, expiry_date)").eq("run_id", run_id).range(offset, offset + 999).execute()
             item_rows.extend(batch.data or [])
             if len(batch.data or []) < 1000:
                 break
             offset += 1000
 
         logger.info(f"[CURATION VIEW] Loaded {len(cust_rows)} customers, {len(item_rows)} items")
+
+        # Which kit put each item on the DO NOT USE list — recomputed here rather than stored,
+        # so no schema change is needed. Sheena's own working sheet has one column per blocked
+        # kit, so naming the kit is the explanation she already thinks in. If the kits table has
+        # changed since the run was generated, an item may not resolve to a kit; the template
+        # falls back to a generic label rather than showing something wrong.
+        blocked_by_by_tri: dict[int, dict[str, list[str]]] = {}
+        try:
+            view_kit_index = load_kits_for_blocking(db)
+            kit_sku_by_id, kit_items_for_view = {}, {}
+            for bucket in view_kit_index["by_layer_age_rank"].values():
+                for k in bucket:
+                    kit_sku_by_id[k["id"]] = k["sku"]
+            for k in view_kit_index["welcome_by_trimester"].values():
+                kit_sku_by_id[k["id"]] = k["sku"]
+            for k in view_kit_index["t1_renewal_sorted"]:
+                kit_sku_by_id[k["id"]] = k["sku"]
+            for ki in _paginate_all(db.table("kit_items").select("kit_id, item_id")):
+                kit_items_for_view.setdefault(ki["kit_id"], set()).add(ki["item_id"])
+
+            for tri in [1, 2, 3, 4]:
+                item_to_kits: dict[str, set] = {}
+                for kid in blocked_kits(tri, report_month, view_kit_index):
+                    sku = kit_sku_by_id.get(kid)
+                    if not sku:
+                        continue
+                    for iid in kit_items_for_view.get(kid, set()):
+                        item_to_kits.setdefault(iid, set()).add(sku)
+                blocked_by_by_tri[tri] = {i: sorted(s) for i, s in item_to_kits.items()}
+            logger.info(
+                "[CURATION VIEW] Blocked-by-kit annotations built for %s: %s",
+                report_month, {t: len(v) for t, v in blocked_by_by_tri.items()},
+            )
+        except Exception as e:
+            # Purely explanatory — never let it take the report down.
+            logger.warning("[CURATION VIEW] Could not build blocked-by-kit annotations: %s", e, exc_info=True)
+            blocked_by_by_tri = {}
 
         # Load inventory status (kits with stock)
         all_kits = db.table("kits").select("*").eq("is_welcome_kit", False).gt("quantity_available", 0).order("age_rank").execute()
@@ -5719,6 +5761,13 @@ async def view_curation_report(request: Request, run_id: str, msg: str = "", msg
             for ir in item_rows:
                 if ir["trimester"] == tri:
                     item_info = ir.get("items", {}) or {}
+                    expiry_raw = item_info.get("expiry_date")
+                    is_expired = False
+                    if expiry_raw:
+                        try:
+                            is_expired = date.fromisoformat(str(expiry_raw)[:10]) < date.today()
+                        except (ValueError, TypeError):
+                            pass
                     entry = {
                         "item_id": ir["item_id"],
                         "name": item_info.get("name", "Unknown"),
@@ -5731,14 +5780,19 @@ async def view_curation_report(request: Request, run_id: str, msg: str = "", msg
                         "risk_level": ir["risk_level"],
                         "quantity_available": item_info.get("quantity_available") or 0,
                         "inventory_synced_at": item_info.get("inventory_synced_at"),
+                        "is_expired": is_expired,
+                        "blocked_by_kits": blocked_by_by_tri.get(tri, {}).get(ir["item_id"], []),
                     }
                     if ir["risk_level"] in ("HIGH", "MEDIUM"):
                         tri_do_not_use.append(entry)
                     else:
                         tri_can_use.append(entry)
 
-            # Sort DO NOT USE by blocked_pct desc, CAN USE by blocked_pct asc
-            tri_do_not_use.sort(key=lambda x: -x["blocked_pct"])
+            # Sort DO NOT USE by blocked_pct desc (name as stable secondary key — under
+            # kit-recipe blocking blocked_pct is a constant 100.0, so without this the
+            # on-screen order degenerates to whatever PostgREST happens to return),
+            # CAN USE by blocked_pct asc
+            tri_do_not_use.sort(key=lambda x: (-x["blocked_pct"], x["name"]))
             tri_can_use.sort(key=lambda x: (x["blocked_pct"], x["name"]))
 
             covered = sum(1 for c in tri_customers if not c["needs_new_curation"])
