@@ -8179,6 +8179,16 @@ async def manual_override_kit(
 # BULK DECISION ACTIONS
 # ═══════════════════════════════════════════════════════════
 
+# Guard against a double-submitted bulk action. A double-click, or the same form posted from
+# two tabs, fires the identical POST twice; both requests passed the "other pending decision"
+# check before either had written, so each created its own new decision row for the same
+# customer. Measured live 2026-08-17: two runs one second apart, 104 ids each, every
+# "Bulk-re-curated" line written twice, after which every later run skipped 100% because the
+# stacking guard then saw the duplicates.
+_bulk_action_inflight: set = set()
+_bulk_action_inflight_lock = threading.Lock()
+
+
 @app.post("/decisions/bulk-action")
 async def bulk_decision_action(request: Request, background_tasks: BackgroundTasks):
     """Bulk approve or ship multiple decisions at once."""
@@ -8200,20 +8210,57 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
             sep = "&" if redirect_qs else ""
             return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=No+decisions+selected&msg_type=error", status_code=303)
 
+        # Reject an identical concurrent submission — see _bulk_action_inflight above.
+        inflight_key = "%s:%s" % (
+            action,
+            hashlib.sha1("|".join(sorted(decision_ids)).encode()).hexdigest(),
+        )
+        with _bulk_action_inflight_lock:
+            if inflight_key in _bulk_action_inflight:
+                logger.warning(
+                    "[BULK ACTION] Duplicate submit ignored — action=%s count=%d key=%s",
+                    action, len(decision_ids), inflight_key[-12:],
+                )
+                dup_msg = quote("That bulk %s is already running - wait for it to finish" % action)
+                sep = "&" if redirect_qs else ""
+                return RedirectResponse(
+                    f"/decisions?{redirect_qs}{sep}msg={dup_msg}&msg_type=error",
+                    status_code=303,
+                )
+            _bulk_action_inflight.add(inflight_key)
+        logger.info(
+            "[BULK ACTION] Claimed in-flight key=%s (action=%s, %d ids)",
+            inflight_key[-12:], action, len(decision_ids),
+        )
+
         success = failed = skipped = 0
         # Issue #2 — one shared VeraCore ReferenceNumber tag for this whole approval run,
         # so warehouse can group/sort the batch in Order Inquiry.
         bulk_batch_ref = _make_batch_ref()
 
-        # Issue 10 — bulk-fetch all decisions in ONE query instead of one per id
-        all_decisions_result = (
-            db.table("decisions")
-            .select("*, customers(email, first_name, last_name, subscription_status)")
-            .in_("id", decision_ids)
-            .execute()
+        # Issue 10 — bulk-fetch all decisions instead of one query per id.
+        # MUST chunk the id list. PostgREST/Kong put every id into the request URL, so a single
+        # .in_() across the whole selection fails outright past ~600-700 ids (measured: 600 ok,
+        # 700 -> HTTP 400, 1900 -> client-side InvalidURL). With ~1,900 pending decisions, using
+        # "select all" on /decisions blew that limit and the route died here before writing any
+        # activity row, which is why the failure never showed up in the activity log. Same CHUNK
+        # pattern the Pirate Ship export route already uses.
+        decisions_map: dict[str, dict] = {}
+        ID_CHUNK = 100
+        for _cs in range(0, len(decision_ids), ID_CHUNK):
+            _chunk = decision_ids[_cs:_cs + ID_CHUNK]
+            _batch = (
+                db.table("decisions")
+                .select("*, customers(email, first_name, last_name, subscription_status)")
+                .in_("id", _chunk)
+                .execute()
+            )
+            for _d in (_batch.data or []):
+                decisions_map[_d["id"]] = _d
+        logger.info(
+            "[BULK ACTION] Pre-fetched %d/%d decisions in %d chunk(s)",
+            len(decisions_map), len(decision_ids), (len(decision_ids) + ID_CHUNK - 1) // ID_CHUNK,
         )
-        decisions_map: dict[str, dict] = {d["id"]: d for d in (all_decisions_result.data or [])}
-        logger.info(f"[BULK ACTION] Pre-fetched {len(decisions_map)}/{len(decision_ids)} decisions")
 
         # Issue 9 — pre-fetch kit_items for all pending kits, then bulk INSERT shipment_items once
         pending_kit_ids = list({
@@ -8430,6 +8477,15 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
     except Exception as e:
         logger.error(f"[BULK ACTION] Fatal error: {e}", exc_info=True)
         return RedirectResponse(f"/decisions?msg={quote('Bulk action failed: ' + str(e))}&msg_type=error", status_code=303)
+    finally:
+        # Always release the in-flight claim, including on the error path above — otherwise a
+        # single failed run would permanently block that same selection from being retried.
+        try:
+            with _bulk_action_inflight_lock:
+                _bulk_action_inflight.discard(inflight_key)
+            logger.info("[BULK ACTION] Released in-flight key=%s", inflight_key[-12:])
+        except NameError:
+            pass  # request failed before the key was built
 
 
 # ═══════════════════════════════════════════════════════════

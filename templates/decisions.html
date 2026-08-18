@@ -480,7 +480,14 @@
         if (countEl) countEl.textContent = checked.length;
     }
 
+    var _bulkSubmitting = false;
+
     function submitBulk(action) {
+        // Stop a double-click or an impatient second click firing the same POST twice. Two
+        // concurrent runs each created their own decision row for the same customer, which then
+        // made every later run skip 100% of the batch (seen live 2026-08-17, two runs 1s apart).
+        // The server rejects duplicate submits too; this just avoids the round trip.
+        if (_bulkSubmitting) { return; }
         var form = document.getElementById('bulkForm');
         form.querySelector('[name=action]').value = action;
         form.querySelectorAll('[name=decision_ids]').forEach(function (el) { el.remove(); });
@@ -504,6 +511,10 @@
                 form.appendChild(obInp);
             }
         }
+        _bulkSubmitting = true;
+        document.querySelectorAll('#bulkBar button, #bulkBar input[type=submit]').forEach(function (b) {
+            b.disabled = true;
+        });
         form.submit();
     }
 
