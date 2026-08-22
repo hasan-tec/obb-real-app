@@ -8385,6 +8385,31 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                 offset += 1000
         pending_shipment_items: list[dict] = []  # collected across all decisions, bulk-inserted after loop
 
+        # Pre-fetch stock for every kit that a pending decision in this batch could decrement
+        # (approve, or ship-from-pending — same pending_kit_ids set already built above),
+        # then decrement in memory during the loop instead of one select + one update per
+        # decision. Same N+1 class as the kit_items/sheet-sync fixes above: with a kit
+        # appearing in dozens of decisions in one batch, that was dozens of round trips for a
+        # single kit row. Written back in ONE upsert() after the loop — same pattern already
+        # used elsewhere in this file (e.g. curation_committed_items) for "many rows, each
+        # with its own new value, in one call".
+        kit_stock: dict[str, dict] = {}
+        if pending_kit_ids:
+            ID_CHUNK_KITS = 100
+            for _ks in range(0, len(pending_kit_ids), ID_CHUNK_KITS):
+                _kchunk = pending_kit_ids[_ks:_ks + ID_CHUNK_KITS]
+                _kbatch = (
+                    db.table("kits").select("id, sku, quantity_available")
+                    .in_("id", _kchunk)
+                    .execute()
+                )
+                for _k in (_kbatch.data or []):
+                    kit_stock[_k["id"]] = {"sku": _k["sku"], "quantity_available": _k["quantity_available"]}
+            logger.info(
+                "[BULK ACTION] Pre-fetched stock for %d/%d kits referenced by this batch",
+                len(kit_stock), len(pending_kit_ids),
+            )
+
         for did in decision_ids:
             try:
                 d = decisions_map.get(did)
@@ -8406,14 +8431,15 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                         skipped += 1
                         continue
                     db.table("decisions").update({"status": "approved"}).eq("id", did).execute()
-                    # Decrement kit stock
+                    # Decrement kit stock — in memory against the pre-fetch above, written back
+                    # in one upsert() after the loop instead of a select+update per decision.
                     kit_id = d.get("kit_id")
-                    if kit_id:
-                        kit = db.table("kits").select("sku, quantity_available").eq("id", kit_id).single().execute()
-                        if kit.data:
-                            new_qty = max(0, kit.data["quantity_available"] - 1)
-                            db.table("kits").update({"quantity_available": new_qty}).eq("id", kit_id).execute()
-                            logger.debug(f"[BULK ACTION] Kit {kit.data['sku']} stock → {new_qty}")
+                    if kit_id and kit_id in kit_stock:
+                        kit_stock[kit_id]["quantity_available"] = max(0, kit_stock[kit_id]["quantity_available"] - 1)
+                        logger.debug(
+                            "[BULK ACTION] Kit %s stock -> %d (pending write)",
+                            kit_stock[kit_id]["sku"], kit_stock[kit_id]["quantity_available"],
+                        )
                     # Create draft shipment; collect shipment_items for bulk insert after loop
                     draft_ship = {
                         "customer_id":      d["customer_id"],
@@ -8451,12 +8477,11 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                         logger.debug(f"[BULK ACTION] Skip ship on {did[:8]} — customer is paused/on hold")
                         skipped += 1
                         continue
-                    # Decrement stock if still pending
-                    if current_status == "pending" and d.get("kit_id"):
-                        kit = db.table("kits").select("sku, quantity_available").eq("id", d["kit_id"]).single().execute()
-                        if kit.data:
-                            new_qty = max(0, kit.data["quantity_available"] - 1)
-                            db.table("kits").update({"quantity_available": new_qty}).eq("id", d["kit_id"]).execute()
+                    # Decrement stock if still pending — same in-memory pattern as approve above.
+                    if current_status == "pending" and d.get("kit_id") and d["kit_id"] in kit_stock:
+                        _sk = kit_stock[d["kit_id"]]
+                        _sk["quantity_available"] = max(0, _sk["quantity_available"] - 1)
+                        logger.debug("[BULK ACTION] Kit %s stock -> %d (pending write)", _sk["sku"], _sk["quantity_available"])
                     db.table("decisions").update({"status": "shipped"}).eq("id", did).execute()
                     # Stamp ship_date on existing draft shipment or create new
                     existing = db.table("shipments").select("id").eq("customer_id", d["customer_id"]).ilike("notes", f"%decision {did[:8]}%").execute()
@@ -8545,6 +8570,24 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                 logger.info(f"[BULK ACTION] Bulk-inserted {len(pending_shipment_items)} shipment_items in one call")
             except Exception as si_bulk_err:
                 logger.error(f"[BULK ACTION] Bulk shipment_items insert failed: {si_bulk_err}", exc_info=True)
+
+        # One bulk write of every decremented kit's new stock, instead of the select+update
+        # per decision this replaced. upsert() on the primary key does an UPDATE for existing
+        # rows and only touches the columns given (id, quantity_available), leaving every
+        # other column on the kit untouched — same technique already used elsewhere in this
+        # file for "many rows, each with its own new value, in one call".
+        if kit_stock:
+            try:
+                stock_rows = [
+                    {"id": kid, "quantity_available": v["quantity_available"]}
+                    for kid, v in kit_stock.items()
+                ]
+                db.table("kits").upsert(stock_rows).execute()
+                logger.info(
+                    "[BULK ACTION] Bulk-updated stock for %d kit(s) in one upsert call", len(stock_rows),
+                )
+            except Exception as stock_bulk_err:
+                logger.error(f"[BULK ACTION] Bulk kit stock update failed: {stock_bulk_err}", exc_info=True)
 
         # One batched Google Sheets sync for the whole run instead of one per decision —
         # bulk_sync_sheet_statuses already catches its own exceptions, so a Sheets hiccup
