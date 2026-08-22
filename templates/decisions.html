@@ -202,6 +202,32 @@
         </div>
     </div>
 
+    <!-- ── Bulk Progress Overlay ──
+         Bulk actions on 100+ rows legitimately take minutes. With no feedback Sheena assumed
+         it had failed, hit back, and clicked again — which on 2026-08-22 produced overlapping
+         concurrent runs and double-shipped 13 decisions. This blocks the screen for the whole
+         request so there is nothing to click twice. -->
+    <div id="bulkProgress"
+        style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.72);
+               align-items:center;justify-content:center;">
+        <div style="background:var(--surface2);border:1px solid var(--accent);border-radius:12px;
+                    padding:28px 34px;max-width:460px;text-align:center;">
+            <div class="bulk-spinner"
+                style="width:44px;height:44px;margin:0 auto 18px;border:4px solid var(--border);
+                       border-top-color:var(--accent);border-radius:50%;animation:bulkspin 0.9s linear infinite;"></div>
+            <div id="bulkProgressTitle" style="font-size:16px;font-weight:600;color:var(--text);margin-bottom:8px;">
+                Processing…
+            </div>
+            <div style="font-size:13px;color:var(--text-dim);line-height:1.6;">
+                This can take a few minutes for large batches.<br>
+                <strong style="color:var(--yellow);">Do not refresh, go back, or click again.</strong><br>
+                The page will reload by itself when it finishes.
+            </div>
+            <div id="bulkProgressElapsed" style="margin-top:14px;font-size:12px;color:var(--text-dim);"></div>
+        </div>
+    </div>
+    <style>@keyframes bulkspin { to { transform: rotate(360deg); } }</style>
+
     <!-- ── Bulk Action Bar (sticky, hidden until selections made) ── -->
     <div id="bulkBar"
         style="display:none;position:sticky;top:0;z-index:50;background:var(--surface2);border:1px solid var(--accent);border-radius:8px;padding:10px 16px;margin-bottom:12px;align-items:center;gap:12px;flex-wrap:wrap;">
@@ -482,6 +508,27 @@
 
     var _bulkSubmitting = false;
 
+    function showBulkProgress(action, count) {
+        var verb = { approve: 'Approving', ship: 'Shipping', reject: 'Rejecting', recurate: 'Re-curating' }[action] || 'Processing';
+        var t = document.getElementById('bulkProgressTitle');
+        if (t) { t.textContent = verb + ' ' + count + ' decision' + (count === 1 ? '' : 's') + '…'; }
+        var box = document.getElementById('bulkProgress');
+        if (box) { box.style.display = 'flex'; }
+        // Elapsed counter, so a long run visibly looks alive rather than hung.
+        var started = Date.now();
+        var el = document.getElementById('bulkProgressElapsed');
+        setInterval(function () {
+            if (!el) { return; }
+            var sec = Math.floor((Date.now() - started) / 1000);
+            el.textContent = 'Elapsed: ' + Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
+        }, 1000);
+    }
+
+    // If the run is still going, warn before the tab is closed or navigated away from.
+    window.addEventListener('beforeunload', function (e) {
+        if (_bulkSubmitting) { e.preventDefault(); e.returnValue = ''; }
+    });
+
     function submitBulk(action) {
         // Stop a double-click or an impatient second click firing the same POST twice. Two
         // concurrent runs each created their own decision row for the same customer, which then
@@ -515,6 +562,7 @@
         document.querySelectorAll('#bulkBar button, #bulkBar input[type=submit]').forEach(function (b) {
             b.disabled = true;
         });
+        showBulkProgress(action, checked.length);
         form.submit();
     }
 

@@ -8272,13 +8272,17 @@ async def manual_override_kit(
 # BULK DECISION ACTIONS
 # ═══════════════════════════════════════════════════════════
 
-# Guard against a double-submitted bulk action. A double-click, or the same form posted from
-# two tabs, fires the identical POST twice; both requests passed the "other pending decision"
-# check before either had written, so each created its own new decision row for the same
-# customer. Measured live 2026-08-17: two runs one second apart, 104 ids each, every
-# "Bulk-re-curated" line written twice, after which every later run skipped 100% because the
-# stacking guard then saw the duplicates.
-_bulk_action_inflight: set = set()
+# Guard against concurrent bulk actions touching the SAME decision twice.
+#
+# History: the first version of this guard keyed on a hash of the whole sorted id list, which
+# only caught an *identical* resubmit. That was not enough. Measured live 2026-08-22: two bulk
+# ships of 137 and 103 rows started seconds apart with OVERLAPPING but not identical
+# selections, so the two hashes differed, both were allowed through, and 13 decisions were
+# each shipped twice — two shipment rows written at the identical second referencing the same
+# decision id. Keying on the individual decision ids instead closes that: any decision already
+# being processed by another in-flight request is skipped rather than double-processed,
+# regardless of how the two selections overlap.
+_bulk_action_inflight_decisions: set = set()
 _bulk_action_inflight_lock = threading.Lock()
 
 
@@ -8303,27 +8307,36 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
             sep = "&" if redirect_qs else ""
             return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=No+decisions+selected&msg_type=error", status_code=303)
 
-        # Reject an identical concurrent submission — see _bulk_action_inflight above.
-        inflight_key = "%s:%s" % (
-            action,
-            hashlib.sha1("|".join(sorted(decision_ids)).encode()).hexdigest(),
-        )
+        # Claim these decisions — see _bulk_action_inflight_decisions above. Anything already
+        # being processed by another in-flight request is dropped from THIS run rather than
+        # processed twice.
+        requested_count = len(decision_ids)
         with _bulk_action_inflight_lock:
-            if inflight_key in _bulk_action_inflight:
-                logger.warning(
-                    "[BULK ACTION] Duplicate submit ignored — action=%s count=%d key=%s",
-                    action, len(decision_ids), inflight_key[-12:],
-                )
-                dup_msg = quote("That bulk %s is already running - wait for it to finish" % action)
-                sep = "&" if redirect_qs else ""
-                return RedirectResponse(
-                    f"/decisions?{redirect_qs}{sep}msg={dup_msg}&msg_type=error",
-                    status_code=303,
-                )
-            _bulk_action_inflight.add(inflight_key)
+            contended = [d for d in decision_ids if d in _bulk_action_inflight_decisions]
+            claimed_ids = [d for d in decision_ids if d not in _bulk_action_inflight_decisions]
+            _bulk_action_inflight_decisions.update(claimed_ids)
+
+        if contended:
+            logger.warning(
+                "[BULK ACTION] %d of %d decision(s) already in-flight in another request — "
+                "skipping those to avoid double-processing (action=%s)",
+                len(contended), requested_count, action,
+            )
+        if not claimed_ids:
+            logger.warning("[BULK ACTION] Every selected decision is already being processed — nothing to do")
+            dup_msg = quote("That bulk %s is already running - wait for it to finish" % action)
+            sep = "&" if redirect_qs else ""
+            return RedirectResponse(
+                f"/decisions?{redirect_qs}{sep}msg={dup_msg}&msg_type=error",
+                status_code=303,
+            )
+
+        # Everything below operates only on the ids this request actually owns.
+        decision_ids = claimed_ids
+        skipped_contended = len(contended)
         logger.info(
-            "[BULK ACTION] Claimed in-flight key=%s (action=%s, %d ids)",
-            inflight_key[-12:], action, len(decision_ids),
+            "[BULK ACTION] Claimed %d/%d decision(s) (action=%s)",
+            len(claimed_ids), requested_count, action,
         )
 
         success = failed = skipped = 0
@@ -8594,6 +8607,10 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
         # never fails the bulk action itself (Sheets mirrors the DB, isn't the source of truth).
         bulk_sync_sheet_statuses(sheet_sync_queue)
 
+        # Decisions dropped because another request already owned them count as skipped, so
+        # the number Sheena sees reconciles with what she selected.
+        skipped += skipped_contended
+
         await log_activity(
             "decision",
             f"Bulk {action}: {success} succeeded, {skipped} skipped, {failed} failed",
@@ -8614,14 +8631,14 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
         logger.error(f"[BULK ACTION] Fatal error: {e}", exc_info=True)
         return RedirectResponse(f"/decisions?msg={quote('Bulk action failed: ' + str(e))}&msg_type=error", status_code=303)
     finally:
-        # Always release the in-flight claim, including on the error path above — otherwise a
-        # single failed run would permanently block that same selection from being retried.
+        # Always release the claimed decisions, including on the error path above — otherwise a
+        # single failed run would permanently block those decisions from being retried.
         try:
             with _bulk_action_inflight_lock:
-                _bulk_action_inflight.discard(inflight_key)
-            logger.info("[BULK ACTION] Released in-flight key=%s", inflight_key[-12:])
+                _bulk_action_inflight_decisions.difference_update(claimed_ids)
+            logger.info("[BULK ACTION] Released %d in-flight decision claim(s)", len(claimed_ids))
         except NameError:
-            pass  # request failed before the key was built
+            pass  # request failed before any ids were claimed
 
 
 # ═══════════════════════════════════════════════════════════
