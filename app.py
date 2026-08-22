@@ -256,15 +256,44 @@ def write_decision_to_sheet(decision_data: dict):
         logger.error(f"[GSHEETS] Error writing to sheet: {e}", exc_info=True)
 
 
+def _find_sheet_row(all_values: list, email: str, order_id: str) -> int | None:
+    """
+    Row number (1-indexed, gspread-style) of the most recent row in an already-fetched
+    get_all_values() snapshot matching email + order_id, or None if no match.
+    Handles both old column layout (email at col D/index 3) and new layout (email at
+    col E/index 4). Searches bottom-to-top to find the MOST RECENT matching row.
+
+    Pure lookup, no I/O — shared by update_decision_status_in_sheet (single-decision
+    routes) and bulk_sync_sheet_statuses (the bulk-action route), so the matching logic
+    can't drift between them the way the old bulk-recurate code once did (see the
+    "delegate to the SAME shared core" comment on _recurate_customer_core).
+    """
+    target_email = (email or "").strip().lower()
+    if "@" not in target_email:
+        return None
+    target_order_id = str(order_id or "").strip()
+    for idx in range(len(all_values) - 1, 0, -1):  # reverse, skip header at idx 0
+        row = all_values[idx]
+        row_email_old = (row[3] if len(row) > 3 else "").strip().lower()
+        row_email_new = (row[4] if len(row) > 4 else "").strip().lower()
+        row_order_id = (row[9] if len(row) > 9 else "").strip()
+        email_match = (row_email_old == target_email) or (row_email_new == target_email)
+        if email_match and row_order_id == target_order_id:
+            return idx + 1  # gspread is 1-indexed
+    return None
+
+
 def update_decision_status_in_sheet(email: str, order_id: str, new_status: str, reason_prefix: str = ""):
     """
     Update an EXISTING row in Google Sheets instead of appending a duplicate.
-    Finds the row by email + order_id (searches bottom-to-top to find most recent match).
-    Handles both old column layout (email at col D/index 3) and new layout (email at col E/index 4).
     Updates:
       - Column G (decision_status) → new_status
       - Column I (reason) → prepend prefix to existing reason
     Falls back to logging a warning if the row is not found.
+
+    Single-decision routes only (one API round trip per call). A loop calling this once
+    per item does one full-sheet get_all_values() scan PER ITEM — see
+    bulk_sync_sheet_statuses for the batched equivalent used by bulk actions.
     """
     try:
         ws = get_gsheet()
@@ -272,28 +301,13 @@ def update_decision_status_in_sheet(email: str, order_id: str, new_status: str, 
             logger.info("[GSHEETS] Skipping update — Google Sheets not configured")
             return
 
-        all_values = ws.get_all_values()
-        target_row = None
-        target_email = email.strip().lower()
-
         # Guard: if email doesn't look valid, skip (catches decision_id[:8] fallback)
-        if "@" not in target_email:
+        if "@" not in (email or "").strip().lower():
             logger.warning(f"[GSHEETS] Skipping update — '{email}' is not a valid email")
             return
 
-        target_order_id = str(order_id or "").strip()
-
-        # Search bottom-to-top to find the MOST RECENT matching row
-        for idx in range(len(all_values) - 1, 0, -1):  # reverse, skip header at idx 0
-            row = all_values[idx]
-            # Check email at both old position (col D, index 3) and new position (col E, index 4)
-            row_email_old = (row[3] if len(row) > 3 else "").strip().lower()
-            row_email_new = (row[4] if len(row) > 4 else "").strip().lower()
-            row_order_id = (row[9] if len(row) > 9 else "").strip()
-            email_match = (row_email_old == target_email) or (row_email_new == target_email)
-            if email_match and row_order_id == target_order_id:
-                target_row = idx + 1  # gspread is 1-indexed
-                break
+        all_values = ws.get_all_values()
+        target_row = _find_sheet_row(all_values, email, order_id)
 
         if target_row:
             # Update decision_status column in-place: G (col 7)
@@ -308,6 +322,74 @@ def update_decision_status_in_sheet(email: str, order_id: str, new_status: str, 
             logger.warning(f"[GSHEETS] Row not found for email={email}, order_id={order_id} — cannot update status to '{new_status}'")
     except Exception as e:
         logger.error(f"[GSHEETS] Error updating sheet row: {e}", exc_info=True)
+
+
+def bulk_sync_sheet_statuses(updates: list[tuple[str, str, str, str]]) -> None:
+    """
+    Batched equivalent of update_decision_status_in_sheet for the bulk-action route.
+
+    WHY THIS EXISTS: bulk_decision_action used to call update_decision_status_in_sheet
+    once per selected decision, and that function calls ws.get_all_values() — a full
+    scan of the whole sheet — on every call. For a 100+ row bulk action that's 100+
+    sequential synchronous Google Sheets API round trips inside a single HTTP request.
+    Two things happen: Heroku's router drops the request at 30 seconds regardless of
+    what's still running behind it (H12 — the dyno keeps working, but the browser gets
+    Heroku's generic "Application error" page), and Google's own read quota is 60
+    requests/minute/user, so a fast enough loop starts drawing 429s partway through.
+    Diagnosed 2026-08-17/18 from Sheena's "application error" report on a 104-row bulk
+    recurate.
+
+    Fetches the sheet ONCE, then writes every update in ONE batch_update() call instead
+    of N separate update_cell() calls — collapsing what was O(N) API round trips into 2
+    regardless of batch size.
+
+    updates: list of (email, order_id, new_status, reason_prefix) — same fields
+    update_decision_status_in_sheet takes per call.
+    """
+    if not updates:
+        return
+    try:
+        ws = get_gsheet()
+        if ws is None:
+            logger.info("[GSHEETS] Skipping bulk sync — Google Sheets not configured")
+            return
+
+        all_values = ws.get_all_values()
+        batch_data = []
+        matched = 0
+        for email, order_id, new_status, reason_prefix in updates:
+            target_row = _find_sheet_row(all_values, email, order_id)
+            if not target_row:
+                logger.warning(
+                    "[GSHEETS] Bulk sync — row not found for email=%s, order_id=%s "
+                    "(status=%s not written)", email, order_id, new_status,
+                )
+                continue
+            matched += 1
+            batch_data.append({"range": f"G{target_row}", "values": [[new_status]]})
+            if reason_prefix:
+                existing_reason = (
+                    all_values[target_row - 1][8] if len(all_values[target_row - 1]) > 8 else ""
+                )
+                if not existing_reason.startswith(f"[{reason_prefix}]"):
+                    batch_data.append({
+                        "range": f"I{target_row}",
+                        "values": [[f"[{reason_prefix}] {existing_reason}"]],
+                    })
+
+        if not batch_data:
+            logger.warning("[GSHEETS] Bulk sync — no rows matched out of %d updates", len(updates))
+            return
+
+        ws.batch_update(batch_data, value_input_option=gspread.utils.ValueInputOption.user_entered)
+        logger.info(
+            "[GSHEETS] Bulk-synced %d/%d decisions in one batch_update call (%d cell writes)",
+            matched, len(updates), len(batch_data),
+        )
+    except Exception as e:
+        # Sheets is a mirror of the DB, not the source of truth — never fail the bulk
+        # action itself over a Sheets hiccup, same as the single-decision function.
+        logger.error(f"[GSHEETS] Bulk sync failed: {e}", exc_info=True)
 
 
 def fix_gsheet_headers():
@@ -7741,6 +7823,7 @@ async def ship_decision(request: Request, decision_id: str):
 async def _recurate_customer_core(
     db, customer_id: str, background_tasks: BackgroundTasks,
     reason_prefix: str = "Re-curated", allow_paused: bool = False,
+    sheet_sync_queue: list | None = None,
 ) -> dict:
     """
     Shared core for re-running the decision engine for a customer. Used by both the
@@ -7753,6 +7836,12 @@ async def _recurate_customer_core(
     matching the original route's error handling.
 
     status values: not_found | blocked_paused | blocked_pending | incomplete_data | ok
+
+    sheet_sync_queue: when given (the bulk-recurate path), the Google Sheets update is
+    appended to this list instead of written immediately, so the caller can batch every
+    row across the whole selection into one bulk_sync_sheet_statuses() call afterward
+    rather than one full-sheet scan per customer. None (the single-customer Recurate
+    button's default) preserves the original immediate-write behavior exactly.
     """
     cust = db.table("customers").select(
         "email, first_name, last_name, due_date, clothing_size, trimester, subscription_status"
@@ -7818,14 +7907,18 @@ async def _recurate_customer_core(
     prior_ctx = _prior_order_context(db, customer_id)
     old_order_id = prior_ctx.get("order_id") or ""
 
-    # Update old decision's sheet row to show "re-curated"
+    # Update old decision's sheet row to show "re-curated" — batched by the caller when
+    # sheet_sync_queue is given (bulk path), written immediately otherwise (single button).
     if email:
-        update_decision_status_in_sheet(
-            email=email,
-            order_id=old_order_id,
-            new_status="re-curated",
-            reason_prefix=reason_prefix,
-        )
+        if sheet_sync_queue is not None:
+            sheet_sync_queue.append((email, old_order_id, "re-curated", reason_prefix))
+        else:
+            update_decision_status_in_sheet(
+                email=email,
+                order_id=old_order_id,
+                new_status="re-curated",
+                reason_prefix=reason_prefix,
+            )
 
     decision_record = {
         "customer_id": customer_id,
@@ -8237,6 +8330,10 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
         # Issue #2 — one shared VeraCore ReferenceNumber tag for this whole approval run,
         # so warehouse can group/sort the batch in Order Inquiry.
         bulk_batch_ref = _make_batch_ref()
+        # Collected (email, order_id, new_status, reason_prefix) tuples across the whole
+        # selection, written to Google Sheets in ONE batched call after the loop instead of
+        # one full-sheet scan per decision — see bulk_sync_sheet_statuses for why.
+        sheet_sync_queue: list[tuple[str, str, str, str]] = []
 
         # Issue 10 — bulk-fetch all decisions instead of one query per id.
         # MUST chunk the id list. PostgREST/Kong put every id into the request URL, so a single
@@ -8334,14 +8431,11 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                         for item_id in kit_items_by_kit.get(kit_id, []):
                             pending_shipment_items.append({"shipment_id": ship_id, "item_id": item_id})
                     logger.info(f"[BULK ACTION] Approved {did[:8]}, draft shipment={ship_id[:8] if ship_id else '?'}")
-                    # Sync status to Google Sheet (matches single approve flow)
+                    # Queue the Google Sheet sync (batched after the loop — matches single
+                    # approve flow's field mapping, just deferred and combined with everyone
+                    # else's in this run instead of one API round trip per decision).
                     cust_email_bulk = (d.get("customers") or {}).get("email", did[:8])
-                    update_decision_status_in_sheet(
-                        email=cust_email_bulk,
-                        order_id=d.get("order_id", ""),
-                        new_status="approved",
-                        reason_prefix="Bulk-approved",
-                    )
+                    sheet_sync_queue.append((cust_email_bulk, d.get("order_id", ""), "approved", "Bulk-approved"))
                     # Phase 3 — Push to VeraCore in background (matches single-approve flow).
                     # Pass the shared batch tag so this run groups under one ReferenceNumber.
                     logger.info("[BULK ACTION] Queuing VeraCore push for %s (background, batch=%s, ship_to_ob=%s)", did[:8], bulk_batch_ref, ship_to_ob)
@@ -8391,14 +8485,9 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                             logger.info(f"[BULK ACTION] Created shipment {bulk_ship_id[:8]} with {len(bulk_kit_items.data or [])} items")
                         else:
                             logger.info(f"[BULK ACTION] Created shipment (no kit_id to populate items)")
-                    # Sync status to Google Sheet (matches single ship flow)
+                    # Queue the Google Sheet sync — see the note on the approve branch above.
                     cust_email_bulk = (d.get("customers") or {}).get("email", did[:8])
-                    update_decision_status_in_sheet(
-                        email=cust_email_bulk,
-                        order_id=d.get("order_id", ""),
-                        new_status="shipped",
-                        reason_prefix="Bulk-shipped",
-                    )
+                    sheet_sync_queue.append((cust_email_bulk, d.get("order_id", ""), "shipped", "Bulk-shipped"))
                     logger.info(f"[BULK ACTION] Shipped {did[:8]}")
                     success += 1
 
@@ -8408,13 +8497,9 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                         skipped += 1
                         continue
                     db.table("decisions").update({"status": "rejected"}).eq("id", did).execute()
+                    # Queue the Google Sheet sync — see the note on the approve branch above.
                     cust_email_bulk = (d.get("customers") or {}).get("email", did[:8])
-                    update_decision_status_in_sheet(
-                        email=cust_email_bulk,
-                        order_id=d.get("order_id", ""),
-                        new_status="rejected",
-                        reason_prefix="Bulk-rejected",
-                    )
+                    sheet_sync_queue.append((cust_email_bulk, d.get("order_id", ""), "rejected", "Bulk-rejected"))
                     logger.info(f"[BULK ACTION] Rejected {did[:8]}")
                     success += 1
 
@@ -8438,7 +8523,10 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                     # it used a stale trimester snapshot and never carried forward order_id/
                     # order_type/gift ship-to/billing snapshot, so a bulk-recurated gift
                     # subscription would ship to the account holder instead of the recipient.
-                    rc_result = await _recurate_customer_core(db, cust_id_rc, background_tasks, reason_prefix="Bulk-re-curated")
+                    rc_result = await _recurate_customer_core(
+                        db, cust_id_rc, background_tasks,
+                        reason_prefix="Bulk-re-curated", sheet_sync_queue=sheet_sync_queue,
+                    )
                     if rc_result["status"] != "ok":
                         logger.warning(f"[BULK ACTION] Recurate {rc_result['status']} for {did[:8]} ({cust_id_rc[:8]}): {rc_result['message']}")
                         skipped += 1
@@ -8457,6 +8545,11 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                 logger.info(f"[BULK ACTION] Bulk-inserted {len(pending_shipment_items)} shipment_items in one call")
             except Exception as si_bulk_err:
                 logger.error(f"[BULK ACTION] Bulk shipment_items insert failed: {si_bulk_err}", exc_info=True)
+
+        # One batched Google Sheets sync for the whole run instead of one per decision —
+        # bulk_sync_sheet_statuses already catches its own exceptions, so a Sheets hiccup
+        # never fails the bulk action itself (Sheets mirrors the DB, isn't the source of truth).
+        bulk_sync_sheet_statuses(sheet_sync_queue)
 
         await log_activity(
             "decision",
