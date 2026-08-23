@@ -367,7 +367,7 @@ def load_renewal_pool_from_decisions(
 
     decisions = _paginate_all(
         db.table("decisions")
-        .select("customer_id, status, created_at, platform")
+        .select("customer_id, status, created_at, platform, order_type")
         .gte("created_at", month_start)
         .lt("created_at", month_end_excl)
     )
@@ -411,20 +411,51 @@ def load_renewal_pool_from_decisions(
         seen.add(cid)
         # Decision platform is the order's platform — what Sheena reconciles against,
         # since she processes Shopify and Cratejoy as separate lists.
-        pool.append({**cust, "decision_platform": d.get("platform")})
+        # order_type is the order's own new/renewal flag — carried through so the
+        # renewal/new split below can use it instead of guessing from shipment history.
+        pool.append({
+            **cust,
+            "decision_platform": d.get("platform"),
+            "order_type": d.get("order_type"),
+        })
 
     logger.info(
         "[CURATION] Pool after dedupe: %d customers (%d decisions dropped — no customer row with a due_date)",
         len(pool), dropped_unresolved,
     )
 
-    # Split renewal vs new on the same rule the shipment-based pool uses: a customer with
-    # at least one shipment is a renewal, everyone else belongs on the welcome-kit track.
+    # Split renewal vs new on the ORDER's own type, not on shipment history.
+    #
+    # The old rule was "any shipment ever => renewal". That silently reclassified every
+    # first-time customer whose box had already shipped this cycle, because shipping it
+    # gave them a shipment row. Measured 2026-08-23 on the August pool: 80 of the 523
+    # "renewals" were first orders (order_type='new'). Two consequences, both live:
+    #   - the renewal count could not be compared against Sheena's renewals-only sheet
+    #     (523 vs her 449; stripping the 80 gives 443, which matches her to within 6)
+    #   - the welcome-kit watchlist read 3 new customers instead of ~80, so it was
+    #     planning welcome-kit stock against a number ~25x too small
+    # `decisions.order_type` is set by the Shopify/Cratejoy intake and is populated on
+    # 2410 of 2485 rows; the shipment heuristic stays as the fallback for the remainder.
     shipments = _paginate_all(db.table("shipments").select("customer_id"))
     has_shipment = {s["customer_id"] for s in shipments}
 
-    renewal_pool = [c for c in pool if c["id"] in has_shipment]
-    new_customers = [c for c in pool if c["id"] not in has_shipment]
+    def _is_renewal(c: dict) -> bool:
+        order_type = c.get("order_type")
+        if order_type == "new":
+            return False
+        if order_type == "renewal":
+            return True
+        return c["id"] in has_shipment  # order_type missing — fall back to shipment history
+
+    renewal_pool = [c for c in pool if _is_renewal(c)]
+    new_customers = [c for c in pool if not _is_renewal(c)]
+
+    unresolved = sum(1 for c in pool if c.get("order_type") not in ("new", "renewal"))
+    logger.info(
+        "[CURATION] Renewal/new split by order_type: %d renewal, %d new "
+        "(%d had no order_type and fell back to shipment history)",
+        len(renewal_pool), len(new_customers), unresolved,
+    )
 
     platform_counts = defaultdict(int)
     for c in renewal_pool:
@@ -1185,6 +1216,13 @@ def run_monthly_report(
             "expected_leftover": tr.get("build_qty", {}).get("expected_leftover", 0),
             "do_not_use_count": len(tr.get("do_not_use", [])),
             "can_use_count": len(tr.get("can_use", [])),
+            # Same Shopify/Cratejoy split the headline already carries, but per trimester.
+            # Sheena's T1-T4 counts are Shopify-only, so a combined per-trimester number
+            # cannot be reconciled against her sheet — this is the line that can.
+            "by_platform": dict(sorted(Counter(
+                c.get("decision_platform") or c.get("platform") or "unknown"
+                for c in tri_custs
+            ).items())),
         }
 
     logger.info(f"[CURATION] ═══════════════════════════════════════════════════")

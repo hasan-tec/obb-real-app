@@ -201,6 +201,13 @@
             Build: {{ ex.recommended_build_qty }} units
             {% if ex.expected_leftover > 0 %}({{ ex.expected_leftover }} leftover){% endif %}
         </div>
+        {% if ex.by_platform %}
+        <div class="sub" style="margin-top: 4px; font-size: 0.8em;">
+            <span style="color: var(--green);">Shopify {{ ex.by_platform.get('shopify', 0) }}</span>
+            &nbsp;·&nbsp;
+            <span style="color: var(--text-dim);">Cratejoy {{ ex.by_platform.get('cratejoy', 0) }}</span>
+        </div>
+        {% endif %}
         <div class="sub" style="margin-top: 4px; font-size: 0.8em; color: var(--text-dim);">
             🚫 {{ ex.do_not_use_count }} blocked &nbsp; ✅ {{ ex.can_use_count }} available
         </div>
