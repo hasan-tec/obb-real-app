@@ -56,6 +56,7 @@
             <div style="margin-top: 12px;">
                 <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text-dim); font-size: 0.9em;"
                     title="On: count everyone from that month's orders, whether or not their box already went out — the whole cycle. Off: count only customers who still need a box right now.">
+                    <input type="hidden" name="include_processed" value="0">
                     <input type="checkbox" name="include_processed" value="1" checked
                         style="accent-color: var(--accent);">
                     Include customers already shipped/processed this cycle
