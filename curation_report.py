@@ -299,7 +299,33 @@ def load_renewal_pool(db, ship_date: date, include_paused: bool = False, recency
     return renewal_pool, new_customers
 
 
-def load_renewal_pool_from_decisions(db, ship_date: date, report_month: str) -> tuple[list[dict], list[dict]]:
+def decisions_exist_in_month(db, month: str) -> bool:
+    """
+    True if ANY decision (any status) was created in `month`. Used by run_monthly_report to
+    decide whether a report month can use its own orders or must fall back to the prior
+    month's (FORWARD_CURATION_PLAN.md Part 2). Deliberately status-unfiltered — a month whose
+    decisions are all already rejected/shipped still counts as "happened" and must resolve to
+    itself, not silently fall back a month. Only a month with ZERO decisions at all (September,
+    before any order has landed) triggers the fallback.
+    """
+    month_start = f"{month}-01"
+    month_end_excl = _month_add(month, 1) + "-01"
+    hit = (
+        db.table("decisions")
+        .select("id")
+        .gte("created_at", month_start)
+        .lt("created_at", month_end_excl)
+        .limit(1)
+        .execute()
+    )
+    return bool(hit.data)
+
+
+def load_renewal_pool_from_decisions(
+    db, ship_date: date, report_month: str,
+    pool_month: Optional[str] = None,
+    include_processed: bool = False,
+) -> tuple[list[dict], list[dict]]:
     """
     Build the monthly pool from the `decisions` table instead of shipment recency.
 
@@ -309,8 +335,11 @@ def load_renewal_pool_from_decisions(db, ship_date: date, report_month: str) -> 
     engine's native equivalent of Sheena's manual order sheet.
 
     Rule (deliberately minimal — see CURATION_REBUILD_PLAN.md 3.1):
-      - decision created within the report month
-      - status NOT IN (rejected, shipped)
+      - decision created within `pool_month` (defaults to `report_month` — see
+        FORWARD_CURATION_PLAN.md Part 2 for when the caller passes a different month)
+      - status NOT IN (rejected, shipped), UNLESS include_processed=True, in which case every
+        decision in the pool month counts — curating a future month needs the whole prior
+        cycle, processed or not, since those customers are expected to renew regardless
       - customer subscription_status IN (active, cancelled-prepaid) — same filter
         load_renewal_pool() already applies by default, and the direct equivalent of
         Sheena deleting a cancellation from her sheet: cancelled-expired is precisely
@@ -321,16 +350,19 @@ def load_renewal_pool_from_decisions(db, ship_date: date, report_month: str) -> 
 
     Trimester is always recomputed live from due_date vs ship_date by project_trimesters()
     — never the frozen decisions.trimester snapshot, which drifts as the ship date moves.
+    This is what makes a forward pool useful: the same pool_month customers land in
+    different trimesters depending on report_month's ship_date.
 
     Returns (renewal_pool, new_customers) to match load_renewal_pool()'s contract.
     """
-    month_start = f"{report_month}-01"
-    year, month = int(report_month.split("-")[0]), int(report_month.split("-")[1])
-    month_end_excl = f"{year + 1}-01-01" if month == 12 else f"{year}-{month + 1:02d}-01"
+    pool_month = pool_month or report_month
+    month_start = f"{pool_month}-01"
+    month_end_excl = _month_add(pool_month, 1) + "-01"
 
     logger.info(
-        "[CURATION] Loading pool from decisions — month=%s window=[%s, %s) ship_date=%s",
-        report_month, month_start, month_end_excl, ship_date,
+        "[CURATION] Loading pool from decisions — report_month=%s pool_month=%s "
+        "window=[%s, %s) ship_date=%s include_processed=%s",
+        report_month, pool_month, month_start, month_end_excl, ship_date, include_processed,
     )
 
     decisions = _paginate_all(
@@ -339,13 +371,17 @@ def load_renewal_pool_from_decisions(db, ship_date: date, report_month: str) -> 
         .gte("created_at", month_start)
         .lt("created_at", month_end_excl)
     )
-    logger.info("[CURATION] Decisions created in %s: %d", report_month, len(decisions))
+    logger.info("[CURATION] Decisions created in %s: %d", pool_month, len(decisions))
 
-    actionable = [d for d in decisions if d.get("status") not in ("rejected", "shipped")]
-    logger.info(
-        "[CURATION] After status filter (excl rejected/shipped): %d kept, %d dropped",
-        len(actionable), len(decisions) - len(actionable),
-    )
+    if include_processed:
+        actionable = decisions
+        logger.info("[CURATION] include_processed=True — keeping all %d decisions regardless of status", len(actionable))
+    else:
+        actionable = [d for d in decisions if d.get("status") not in ("rejected", "shipped")]
+        logger.info(
+            "[CURATION] After status filter (excl rejected/shipped): %d kept, %d dropped",
+            len(actionable), len(decisions) - len(actionable),
+        )
 
     customers = _paginate_all(
         db.table("customers")
@@ -860,6 +896,7 @@ def run_monthly_report(
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
     recency_months: Optional[int] = DEFAULT_RECENCY_MONTHS,
     pool_source: str = "decisions",
+    include_processed: bool = True,
 ) -> dict:
     """
     Run the full monthly curation report.
@@ -889,8 +926,24 @@ def run_monthly_report(
 
     # ── Step 1: Load renewal pool ──
     if pool_source == "decisions":
-        renewal_pool, new_customers = load_renewal_pool_from_decisions(db, ship_date, report_month)
+        # FORWARD_CURATION_PLAN.md Part 2: report_month drives ship_date/trimesters/blocking;
+        # pool_month drives WHO is in the list, and is only different from report_month when
+        # report_month itself has no orders yet (a future month, e.g. curating September while
+        # still in August). Checked with an unfiltered existence query, not the actionable
+        # count, so a month whose orders are all already processed still resolves to itself.
+        if decisions_exist_in_month(db, report_month):
+            pool_month = report_month
+        else:
+            pool_month = _month_add(report_month, -1)
+            logger.info(
+                "[CURATION] No decisions exist yet for %s — falling back to pool_month=%s",
+                report_month, pool_month,
+            )
+        renewal_pool, new_customers = load_renewal_pool_from_decisions(
+            db, ship_date, report_month, pool_month=pool_month, include_processed=include_processed,
+        )
     else:
+        pool_month = report_month
         renewal_pool, new_customers = load_renewal_pool(db, ship_date, include_paused, recency_months)
 
     # ── Step 2: Project trimesters ──
@@ -1106,6 +1159,12 @@ def run_monthly_report(
         "total_new_customers": len(new_customers),
         "recency_months": recency_months,
         "pool_source": pool_source,
+        # FORWARD_CURATION_PLAN.md Part 2 — surfaced explicitly so nobody has to infer where
+        # the pool came from. When pool_month != report_month this is a forward projection:
+        # last cycle's customers, trimesters recomputed at THIS month's ship date.
+        "pool_month": pool_month,
+        "pool_is_forward_projection": pool_month != report_month,
+        "include_processed": include_processed,
         # Sheena curates Shopify and Cratejoy as separate lists, so a combined total
         # cannot be compared against her manual counts. Break it down per platform.
         "renewal_by_platform": dict(sorted(

@@ -5472,6 +5472,7 @@ async def generate_curation_report(
     report_month: str = Form(...),
     ship_day: int = Form(14),
     warehouse_min: int = Form(100),
+    include_processed: str = Form("1"),
 ):
     """Start curation report generation as a background job.
     Returns immediately (HTTP 303) to avoid Heroku's 30-second H12 timeout.
@@ -5483,6 +5484,11 @@ async def generate_curation_report(
     on subscription_status directly rather than shipment recency. They were live controls
     that silently changed nothing, so the UI no longer offers them. The values below are
     kept only because curation_runs still records them.
+
+    include_processed (FORWARD_CURATION_PLAN.md Part 2): defaults checked. Whether the pool
+    counts every decision in the pool month or only ones still unprocessed. Matters for both
+    the current month (Sheena wants the whole cycle, not just what's left) and a forward month
+    (the whole prior cycle is expected to renew regardless of how it was processed).
     """
     params = {
         "report_month": report_month,
@@ -5491,6 +5497,7 @@ async def generate_curation_report(
         "lookback_months": DEFAULT_LOOKBACK_MONTHS,
         "recency_months": None,
         "include_paused": False,
+        "include_processed": include_processed in ("1", "on", "true"),
     }
     job_id = _create_job("curation_report", params)
     logger.info(f"[CURATION GEN] Started background job {job_id} for {report_month}")
@@ -5508,8 +5515,9 @@ def _run_curation_report_job(job_id: str, params: dict):
         lookback_months = params["lookback_months"]
         recency = params["recency_months"]
         paused = params["include_paused"]
+        processed = params.get("include_processed", True)
 
-        logger.info(f"[CURATION JOB] {job_id} — Generating report: month={report_month}, ship_day={ship_day}, wh_min={warehouse_min}, lookback={lookback_months}, recency={recency}")
+        logger.info(f"[CURATION JOB] {job_id} — Generating report: month={report_month}, ship_day={ship_day}, wh_min={warehouse_min}, lookback={lookback_months}, recency={recency}, include_processed={processed}")
 
         year, month_num = int(report_month.split("-")[0]), int(report_month.split("-")[1])
         ship_date = date(year, month_num, ship_day)
@@ -5537,6 +5545,7 @@ def _run_curation_report_job(job_id: str, params: dict):
             include_paused=paused,
             lookback_months=lookback_months,
             recency_months=recency,
+            include_processed=processed,
         )
 
         # Save detailed results to DB

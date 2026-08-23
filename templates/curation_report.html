@@ -22,6 +22,10 @@
                 kit — this trimester's kits, plus the kits they'd have received in earlier trimesters.
                 What's left is the CAN USE pool. It also flags who's already covered by kits in stock and
                 how many new units the warehouse needs to build.
+                <br><br>
+                <strong>Curating ahead?</strong> If the month you pick has no orders yet (it hasn't started),
+                the pool automatically uses last month's customers instead, with their trimesters
+                recalculated for this month's ship date — this month's own kit blocking still applies.
             </p>
         </div>
         <form method="POST" action="/curation-report/generate"
@@ -48,6 +52,14 @@
                 <button type="submit" class="btn btn-primary" style="height: 38px;">
                     📊 Generate Report
                 </button>
+            </div>
+            <div style="margin-top: 12px;">
+                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text-dim); font-size: 0.9em;"
+                    title="On: count everyone from that month's orders, whether or not their box already went out — the whole cycle. Off: count only customers who still need a box right now.">
+                    <input type="checkbox" name="include_processed" value="1" checked
+                        style="accent-color: var(--accent);">
+                    Include customers already shipped/processed this cycle
+                </label>
             </div>
         </form>
     </div>
@@ -132,6 +144,14 @@
             Generated: {{ report.executive.generated_at }}
         </span>
     </div>
+    {% if report.executive.pool_is_forward_projection %}
+    <div style="padding: 10px 20px; background: rgba(255,193,7,0.08); border-top: 1px solid var(--border); font-size: 0.85em; color: var(--yellow);">
+        ⚠ Forward projection — {{ report.executive.report_month }} has no orders yet, so this pool is
+        <strong>{{ report.executive.pool_month }}'s {{ report.executive.total_renewal_customers }} customers</strong>,
+        projected to this month's ship date. Real {{ report.executive.report_month }} cancellations
+        and new orders aren't known yet — treat this as an estimate for planning, not a final count.
+    </div>
+    {% endif %}
     <div style="padding: 20px;">
         <div class="stat-grid">
             <div class="stat-card">

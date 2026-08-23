@@ -174,11 +174,23 @@ Split "who is in the pool" from "what we are curating for".
 | Concept | Value | Drives |
 |---|---|---|
 | `report_month` | e.g. `2026-09` | ship date, trimester recalculation, blocking windows |
-| pool month | always `report_month` minus 1 | which customers are in the list |
+| pool month | `report_month` if it has any orders, else `report_month` minus 1 | which customers are in the list |
 
-**Fixed at one month back. Do not add a picker** — explicit product decision. The Forward
-Planner (`projection_engine.py`) already handles 3–6 month horizons; this report is the
-one-month-ahead curation view.
+**CORRECTION (2026-08-23):** an earlier draft of this table said pool month is "always
+`report_month` minus 1", unconditionally. That is wrong and would have broken the August report
+itself — generating August would pull July's orders instead of August's own. The rule is
+conditional: if the month being curated already has real orders (the normal, current-month
+case), use its own orders, exactly like today. Only fall back one month when the target month
+is empty (the September case — no orders exist yet because September has not happened).
+
+**Fixed at one month back when it does fall back. Do not add a picker** for how many months —
+explicit product decision. The Forward Planner (`projection_engine.py`) already handles 3–6
+month horizons; this report is the one-month-ahead curation view.
+
+Detecting "has any orders" is a single existence check: any `decisions` row with `created_at`
+in `[report_month-01, next_month-01)`, regardless of status. Do not use the actionable-only
+count for this check — a month can have decisions that are all already rejected/shipped and
+still correctly resolve to itself (see August's own case, §PART 2 success criterion 3).
 
 **Include already-processed customers.** For a forward month the pool must include customers
 whose previous-month box already shipped, because they are subscribers and will renew. Without
