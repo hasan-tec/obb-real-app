@@ -524,9 +524,17 @@
         }, 1000);
     }
 
-    // If the run is still going, warn before the tab is closed or navigated away from.
+    // The bulk action's OWN form.submit() is itself a navigation, so this listener fired on
+    // it and Chrome put up "Leave site? Changes that you made may not be saved." over the
+    // progress overlay. Clicking Cancel aborted the navigation, meaning the POST was never
+    // sent at all — the overlay then span forever with the elapsed counter ticking and no
+    // request in flight. Reported live 2026-08-23 (Sheena, 1 decision, 15m29s on the clock).
+    // _bulkFormNavigating suppresses the warning for that one expected navigation only; it is
+    // cleared on the next tick, so closing the tab while the POST is genuinely in flight
+    // still warns.
+    var _bulkFormNavigating = false;
     window.addEventListener('beforeunload', function (e) {
-        if (_bulkSubmitting) { e.preventDefault(); e.returnValue = ''; }
+        if (_bulkSubmitting && !_bulkFormNavigating) { e.preventDefault(); e.returnValue = ''; }
     });
 
     function submitBulk(action) {
@@ -563,7 +571,11 @@
             b.disabled = true;
         });
         showBulkProgress(action, checked.length);
+        _bulkFormNavigating = true;
         form.submit();
+        // Re-arm for a real tab close: the submit's own beforeunload has already fired
+        // synchronously inside form.submit() by the time this runs.
+        setTimeout(function () { _bulkFormNavigating = false; }, 0);
     }
 
     function clearBulkSelection() {
