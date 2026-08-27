@@ -11,6 +11,7 @@ Generates the monthly curation report answering Ting's 7 key questions:
 """
 
 import logging
+import re
 from datetime import date, timedelta
 from collections import defaultdict, Counter
 from typing import Optional
@@ -70,9 +71,14 @@ def calc_lookback_window(ship_date: date, lookback_months: int = DEFAULT_LOOKBAC
 # Replaces the percentage-of-group DO NOT USE calculation for the live monthly report.
 # Sheena blocks at the kit-recipe level: for the trimester being curated and every
 # trimester below it, block that layer's welcome kit plus its recent renewal kits.
-# The window shifts back 3 months per layer below the one being curated (§12.2/§12.4b),
-# except T1 renewals, which are made ~annually and are selected by recency rank instead
-# of a month window (§12.3b(b) — there are only 4 T1 renewal kits in the whole DB).
+# The window shifts back 3 months per layer below the one being curated (§12.2/§12.4b).
+#
+# T1 renewals get the SAME window as every other layer — Sheena's September T3 note lists
+# MAY/APR/MAR in its T1 column, and her SEPT CQ31 sheet blocks BOTH BQ-11 and BP-11 because
+# that window straddles BQ-11's April 2026 build. They are just not built monthly, so their
+# month cannot come from age_rank (for T1 kits age_rank is only an ordering: 69/68/67/28 for
+# kits built Apr-2026/Jul-2025/Apr-2025/Aug-2024). It comes from kits.build_month instead,
+# and a month resolves to whichever T1 kit was current then.
 
 def _month_idx(month_str: str) -> int:
     """Absolute month index (year*12 + month-1) for arithmetic that's rollover-free."""
@@ -85,6 +91,49 @@ def _month_add(month_str: str, delta: int) -> str:
     idx = _month_idx(month_str) + delta
     year, month0 = divmod(idx, 12)
     return f"{year:04d}-{month0 + 1:02d}"
+
+
+_T1_MONTH_RE = re.compile(
+    r"\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\.?\s+(\d{4})\b", re.I
+)
+_MONTH_NUM = {m: i + 1 for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+)}
+
+
+def t1_build_month(kit: dict) -> Optional[str]:
+    """'YYYY-MM' the kit was built, or None if it cannot be determined.
+
+    Prefers the `build_month` column (migration 021). Falls back to the month written into
+    the kit name ('APR 2026 BQ-11', 'JULY 2025 - BP-11') so blocking is still correct on a
+    deploy that lands before the migration is run in Supabase. The column is the durable
+    answer: a name is free text, and a manual kit edit already broke blocking once
+    (is_welcome_kit on BQ-11, 2026-08-21).
+    """
+    explicit = str(kit.get("build_month") or "").strip()
+    if len(explicit) >= 7 and explicit[4] == "-" and explicit[:4].isdigit():
+        return explicit[:7]
+    match = _T1_MONTH_RE.search(kit.get("name") or "")
+    if not match:
+        return None
+    return f"{int(match.group(2)):04d}-{_MONTH_NUM[match.group(1)[:3].upper()]:02d}"
+
+
+def _ship_day_months_back(ship_date: date, months: int) -> date:
+    """The same day-of-month as `ship_date`, `months` months earlier.
+
+    Clamps to the last day of the target month when that month is shorter
+    (ship day 31 -> February). months=0 returns ship_date itself.
+    """
+    if months == 0:
+        return ship_date
+    target = _month_add(f"{ship_date.year:04d}-{ship_date.month:02d}", -months)
+    year, month = int(target[:4]), int(target[5:7])
+    try:
+        return date(year, month, ship_date.day)
+    except ValueError:
+        nxt = _month_add(target, 1)
+        return date(int(nxt[:4]), int(nxt[5:7]), 1) - timedelta(days=1)
 
 
 def month_to_age_rank(month_str: str) -> int:
@@ -113,6 +162,7 @@ def load_kits_for_blocking(db) -> dict:
         "by_layer_age_rank": {(trimester, age_rank): [kit, ...]},   # renewal kits only
         "welcome_by_trimester": {trimester: kit},                   # one active welcome kit per trimester
         "t1_renewal_sorted": [kit, ...],                            # T1 renewals, newest age_rank first
+        "t1_timeline": [(build_month, kit), ...],                   # T1 renewals, OLDEST build month first
     }
     """
     all_kits = _paginate_all(db.table("kits").select("*"))
@@ -146,6 +196,27 @@ def load_kits_for_blocking(db) -> dict:
 
     t1_renewal_sorted = sorted(t1_renewal, key=lambda k: k.get("age_rank") or 0, reverse=True)
 
+    # Oldest first, so "which T1 kit was current in month M" is the last entry <= M.
+    t1_timeline: list[tuple[str, dict]] = []
+    t1_unresolved: list[str] = []
+    for kit in t1_renewal:
+        build_month = t1_build_month(kit)
+        if build_month:
+            t1_timeline.append((build_month, kit))
+        else:
+            t1_unresolved.append(kit.get("sku") or "?")
+    t1_timeline.sort(key=lambda pair: pair[0])
+    if t1_unresolved:
+        logger.error(
+            "[CURATION] No build month on T1 renewal kit(s) %s — set kits.build_month "
+            "(migration 021), or keep the month in the name as 'APR 2026 BQ-11'. Those kits "
+            "cannot be month-blocked and are skipped.", t1_unresolved,
+        )
+    logger.info(
+        "[CURATION] T1 renewal timeline (oldest first): %s",
+        [f"{bm} {k['sku']}" for bm, k in t1_timeline] or "EMPTY — falling back to recency rank",
+    )
+
     logger.info(
         "[CURATION] Kit-blocking index loaded: %d renewal (trimester,age_rank) buckets, "
         "%d welcome kits, %d T1 renewal kits",
@@ -156,6 +227,7 @@ def load_kits_for_blocking(db) -> dict:
         "by_layer_age_rank": dict(by_layer_age_rank),
         "welcome_by_trimester": welcome_by_trimester,
         "t1_renewal_sorted": t1_renewal_sorted,
+        "t1_timeline": t1_timeline,
     }
 
 
@@ -173,9 +245,25 @@ def blocked_kits(trimester: int, cycle_month: str, kit_index: dict) -> set[str]:
         depth = trimester - layer
 
         if layer == 1:
-            idx = max(depth - 1, 0)
-            if idx < len(t1_list):
-                kit_ids.add(t1_list[idx]["id"])
+            # Same month window as every other layer; a month resolves to the T1 kit that
+            # was current then (newest build_month <= that month). Curating T3 for 2026-09
+            # gives MAY/APR/MAR 2026 -> BQ-11 (built Apr) and BP-11 (current through Mar),
+            # which is exactly the pair on Sheena's SEPT CQ31 sheet.
+            timeline = kit_index.get("t1_timeline") or []
+            if timeline:
+                for offset in _window_offsets(depth):
+                    month = _month_add(cycle_month, offset)
+                    current = None
+                    for build_month, kit in timeline:
+                        if build_month > month:
+                            break
+                        current = kit
+                    if current is not None:
+                        kit_ids.add(current["id"])
+            elif t1_list:
+                # No build month on any T1 kit (load_kits_for_blocking logs which). Fall back
+                # to the old recency ladder rather than silently blocking nothing.
+                kit_ids.add(t1_list[min(max(depth - 1, 0), len(t1_list) - 1)]["id"])
         else:
             for offset in _window_offsets(depth):
                 month = _month_add(cycle_month, offset)
@@ -326,6 +414,7 @@ def load_renewal_pool_from_decisions(
     pool_month: Optional[str] = None,
     include_processed: bool = False,
     new_window_start: Optional[date] = None,
+    new_window_end: Optional[date] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Build the monthly pool from the `decisions` table instead of shipment recency.
@@ -476,7 +565,7 @@ def load_renewal_pool_from_decisions(
     # to reproduce 147 exactly.
     if new_window_start is not None:
         window_start = new_window_start.isoformat()
-        window_end = ship_date.isoformat()
+        window_end = (new_window_end or ship_date).isoformat()
         rolling = _paginate_all(
             db.table("decisions")
             .select("customer_id, created_at, platform, order_type")
@@ -1021,20 +1110,27 @@ def run_monthly_report(
             )
         # Welcome-kit track counts first orders since the PREVIOUS boxing run, not the
         # calendar month — see the rolling-window note in load_renewal_pool_from_decisions.
-        prev_ship = date(
-            ship_date.year - 1 if ship_date.month == 1 else ship_date.year,
-            12 if ship_date.month == 1 else ship_date.month - 1,
-            1,
-        )
-        try:
-            prev_ship = prev_ship.replace(day=ship_date.day)
-        except ValueError:
-            # Previous month is shorter (e.g. ship day 31 -> February); clamp to its last
-            # day by stepping back one from the 1st of the ship month.
-            prev_ship = date(ship_date.year, ship_date.month, 1) - timedelta(days=1)
+        #
+        # On a forward projection that window has not closed yet: curating September on
+        # 27 Aug leaves (15 Aug, 15 Sep] only twelve days wide, which read as 42 new
+        # customers against August's real 134 — a partial count presented as a forecast.
+        # The renewal side already handles this by falling back to pool_month, so shift
+        # the welcome window back by the same one cycle and both halves of the report are
+        # measured on the same closed period. Current-month reports are unaffected:
+        # pool_month == report_month leaves back=1, i.e. (ship-1mo, ship] as before.
+        back = 2 if pool_month != report_month else 1
+        window_start = _ship_day_months_back(ship_date, back)
+        window_end = _ship_day_months_back(ship_date, back - 1)
+        if back != 1:
+            logger.info(
+                "[CURATION] Forward projection (%s has no orders yet) — welcome-kit window "
+                "shifted back one cycle to (%s, %s] so it matches the pool_month=%s renewals",
+                report_month, window_start, window_end, pool_month,
+            )
         renewal_pool, new_customers = load_renewal_pool_from_decisions(
             db, ship_date, report_month, pool_month=pool_month,
-            include_processed=include_processed, new_window_start=prev_ship,
+            include_processed=include_processed,
+            new_window_start=window_start, new_window_end=window_end,
         )
     else:
         pool_month = report_month
