@@ -325,6 +325,7 @@ def load_renewal_pool_from_decisions(
     db, ship_date: date, report_month: str,
     pool_month: Optional[str] = None,
     include_processed: bool = False,
+    new_window_start: Optional[date] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Build the monthly pool from the `decisions` table instead of shipment recency.
@@ -456,6 +457,54 @@ def load_renewal_pool_from_decisions(
         "(%d had no order_type and fell back to shipment history)",
         len(renewal_pool), len(new_customers), unresolved,
     )
+
+    # ── New customers use a ROLLING window; renewals stay on the calendar month ──
+    #
+    # The two cohorts genuinely behave differently. Verified against Sheena's own sheets
+    # on 2026-08-23:
+    #   renewals — the subscription charge is a monthly batch. 371 of the 377 rows on her
+    #     August renewal sheet are dated 2026-08-01, so a calendar month IS the cohort.
+    #     Every rolling window tested was materially worse (Jul15->Aug15 gave 403 against
+    #     her 449; the calendar month gives 446). Do not "fix" the renewal side.
+    #   new customers — sign-ups arrive daily and the welcome box goes out whenever it is
+    #     next picked, so that queue is a rolling backlog straddling the month boundary.
+    #     Her "new boxes sent as of the 15th" was 147; counting first orders placed in
+    #     calendar August alone gives ~81, which is why the two never reconciled.
+    #
+    # Window is (previous ship date, this ship date] — everyone who placed a first order
+    # since the last boxing run. Chosen as the business rule rather than a day-count tuned
+    # to reproduce 147 exactly.
+    if new_window_start is not None:
+        window_start = new_window_start.isoformat()
+        window_end = ship_date.isoformat()
+        rolling = _paginate_all(
+            db.table("decisions")
+            .select("customer_id, created_at, platform, order_type")
+            .gt("created_at", window_start)
+            .lte("created_at", window_end + "T23:59:59")
+        )
+        seen_new, rolling_new = set(), []
+        for d in rolling:
+            if d.get("order_type") != "new":
+                continue
+            cid = d["customer_id"]
+            if cid in seen_new:
+                continue
+            cust = customers_by_id.get(cid)
+            if not cust:
+                continue
+            seen_new.add(cid)
+            rolling_new.append({
+                **cust,
+                "decision_platform": d.get("platform"),
+                "order_type": d.get("order_type"),
+            })
+        logger.info(
+            "[CURATION] Welcome-kit track on rolling window (%s, %s]: %d new customers "
+            "(the calendar-month figure would have been %d)",
+            window_start, window_end, len(rolling_new), len(new_customers),
+        )
+        new_customers = rolling_new
 
     platform_counts = defaultdict(int)
     for c in renewal_pool:
@@ -970,8 +1019,22 @@ def run_monthly_report(
                 "[CURATION] No decisions exist yet for %s — falling back to pool_month=%s",
                 report_month, pool_month,
             )
+        # Welcome-kit track counts first orders since the PREVIOUS boxing run, not the
+        # calendar month — see the rolling-window note in load_renewal_pool_from_decisions.
+        prev_ship = date(
+            ship_date.year - 1 if ship_date.month == 1 else ship_date.year,
+            12 if ship_date.month == 1 else ship_date.month - 1,
+            1,
+        )
+        try:
+            prev_ship = prev_ship.replace(day=ship_date.day)
+        except ValueError:
+            # Previous month is shorter (e.g. ship day 31 -> February); clamp to its last
+            # day by stepping back one from the 1st of the ship month.
+            prev_ship = date(ship_date.year, ship_date.month, 1) - timedelta(days=1)
         renewal_pool, new_customers = load_renewal_pool_from_decisions(
-            db, ship_date, report_month, pool_month=pool_month, include_processed=include_processed,
+            db, ship_date, report_month, pool_month=pool_month,
+            include_processed=include_processed, new_window_start=prev_ship,
         )
     else:
         pool_month = report_month
