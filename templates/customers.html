@@ -263,7 +263,7 @@
                 </div>
                 <div style="display:flex;flex-direction:column;gap:3px;">
                     <label style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Search</label>
-                    <input type="text" name="q" value="{{ search_query or '' }}" placeholder="name or email…"
+                    <input type="text" name="q" value="{{ search_query or '' }}" placeholder="name, email, or box receiver…"
                            class="form-control" style="height:32px;font-size:13px;min-width:200px;">
                 </div>
                 <div style="display:flex;gap:8px;align-items:flex-end;">
@@ -301,6 +301,12 @@
                         <a href="/customers/{{ c.id }}">{{ c.first_name or '' }} {{ c.last_name or '' }}</a>
                         {% if not c._has_shipments %}<span class="badge badge-green" style="font-size:10px;margin-left:4px;">New</span>
                         {% else %}<span class="badge badge-dim" style="font-size:10px;margin-left:4px;">Renewal</span>{% endif %}
+                        {# This row surfaced because the search matched a GIFT RECIPIENT, not the
+                           account holder. Say so explicitly — the account still belongs to the
+                           name above, and staff must not treat the two as the same person. #}
+                        {% if c._match_recipient %}
+                        <br><small style="color:var(--accent);">🎁 matched box receiver: {{ c._match_recipient }}</small>
+                        {% endif %}
                     </td>
                     <td style="font-size:12px;">{{ c.email }}</td>
                     <td>
@@ -360,6 +366,12 @@
                         <a href="/customers/{{ c.id }}">{{ c.first_name or '' }} {{ c.last_name or '' }}</a>
                         {% if not c._has_shipments %}<span class="badge badge-green" style="font-size:10px;margin-left:4px;">New</span>
                         {% else %}<span class="badge badge-dim" style="font-size:10px;margin-left:4px;">Renewal</span>{% endif %}
+                        {# This row surfaced because the search matched a GIFT RECIPIENT, not the
+                           account holder. Say so explicitly — the account still belongs to the
+                           name above, and staff must not treat the two as the same person. #}
+                        {% if c._match_recipient %}
+                        <br><small style="color:var(--accent);">🎁 matched box receiver: {{ c._match_recipient }}</small>
+                        {% endif %}
                     </td>
                     <td style="font-size:12px;">{{ c.email }}</td>
                     <td>

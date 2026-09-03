@@ -4394,13 +4394,60 @@ async def customers_page(request: Request):
 
         # Client-side text search on top of server-side filters
         if q:
-            filtered = [
-                c for c in all_customers
-                if q in (c.get("email") or "").lower()
-                or q in (c.get("first_name") or "").lower()
-                or q in (c.get("last_name") or "").lower()
-                or q in f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".lower()
-            ]
+            # Gift orders ship to someone other than the buyer, so staff need to find an account
+            # by the recipient's name too. Only decisions carrying a ship-to name are pulled —
+            # a small subset — and matching happens in Python so no user input reaches a filter
+            # string. A recipient match is a match on an ORDER, not on the account's identity,
+            # so the reason is recorded and shown on the row rather than silently widening results.
+            recipient_matches: dict[str, str] = {}
+            try:
+                # Paginated — past the 1000-row server cap a plain select would silently drop
+                # recipients, making them permanently unfindable with no error shown.
+                gift_offset = 0
+                gift_scanned = 0
+                while True:
+                    gift_batch = (
+                        db.table("decisions")
+                        .select("customer_id, ship_first_name, ship_last_name")
+                        .not_.is_("ship_first_name", "null")
+                        .range(gift_offset, gift_offset + PAGE_SIZE - 1)
+                        .execute()
+                    )
+                    gift_data = gift_batch.data or []
+                    gift_scanned += len(gift_data)
+                    for row in gift_data:
+                        recip = f"{row.get('ship_first_name') or ''} {row.get('ship_last_name') or ''}".strip()
+                        cid = row.get("customer_id")
+                        if cid and recip and q in recip.lower():
+                            recipient_matches.setdefault(cid, recip)
+                    if len(gift_data) < PAGE_SIZE:
+                        break
+                    gift_offset += PAGE_SIZE
+                logger.info(
+                    "[CUSTOMERS PAGE] Recipient search scanned gift orders",
+                    extra={"query": q, "gift_rows": gift_scanned, "matched_accounts": len(recipient_matches)},
+                )
+            except Exception as recip_err:
+                # Never let recipient lookup break the page — fall back to purchaser-only search.
+                logger.error(
+                    "[CUSTOMERS PAGE] Recipient search failed, falling back to purchaser-only — error=%s",
+                    str(recip_err), exc_info=True,
+                )
+
+            filtered = []
+            for c in all_customers:
+                buyer_hit = (
+                    q in (c.get("email") or "").lower()
+                    or q in (c.get("first_name") or "").lower()
+                    or q in (c.get("last_name") or "").lower()
+                    or q in f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".lower()
+                )
+                recip_hit = recipient_matches.get(c.get("id"))
+                if buyer_hit or recip_hit:
+                    # Only label the row when the recipient is the ONLY reason it surfaced,
+                    # so a normal name search doesn't sprout confusing annotations.
+                    c["_match_recipient"] = recip_hit if (recip_hit and not buyer_hit) else None
+                    filtered.append(c)
             logger.info(f"[CUSTOMERS PAGE] Text search '{q}' matched {len(filtered)}/{len(all_customers)}")
         else:
             filtered = all_customers
@@ -4745,6 +4792,44 @@ async def customer_detail(request: Request, customer_id: str):
                 break
         override_kits = get_eligible_override_kits(db, cust.data, shipments, exclude_kit_sku=auto_kit_sku)
 
+        # Gift orders — the purchaser and the person the box ships to are often different.
+        # Both names are snapshotted per decision (migration 019), so the recipient can vary
+        # between orders on the same account. Surface the most recent one plus the full set,
+        # and never collapse them into one "customer name" staff could act on wrongly.
+        purchaser_name = f"{cust.data.get('first_name') or ''} {cust.data.get('last_name') or ''}".strip()
+        latest_recipient = None
+        billing_snapshot = None
+        recipient_history: list[str] = []
+        for d in (decisions.data or []):
+            recip = f"{d.get('ship_first_name') or ''} {d.get('ship_last_name') or ''}".strip()
+            if recip:
+                if latest_recipient is None:
+                    latest_recipient = recip
+                if recip.lower() not in {r.lower() for r in recipient_history}:
+                    recipient_history.append(recip)
+            if billing_snapshot is None and (d.get("billing_first_name") or d.get("billing_address1")):
+                billing_snapshot = {
+                    "name": f"{d.get('billing_first_name') or ''} {d.get('billing_last_name') or ''}".strip(),
+                    "address1": d.get("billing_address1"),
+                    "city": d.get("billing_city"),
+                    "state": d.get("billing_state"),
+                    "zip": d.get("billing_zip"),
+                    "country": d.get("billing_country"),
+                }
+        is_gift_order = bool(
+            latest_recipient and latest_recipient.lower() != purchaser_name.lower()
+        )
+        if is_gift_order:
+            logger.info(
+                "[CUSTOMER DETAIL] Gift order — purchaser and recipient differ",
+                extra={
+                    "customer_id": customer_id,
+                    "purchaser": purchaser_name,
+                    "recipient": latest_recipient,
+                    "distinct_recipients": len(recipient_history),
+                },
+            )
+
         # Thread 18 visibility ask — "why isn't this kit getting assigned to them":
         # list kits rejected this cycle so staff can see what Recurate is excluding.
         rejected_kit_map = get_rejected_kit_map(db, customer_id, shipments)
@@ -4763,6 +4848,11 @@ async def customer_detail(request: Request, customer_id: str):
             "override_kits": override_kits,
             "rejected_kits": rejected_kits,
             "auto_kit_sku": auto_kit_sku,
+            "purchaser_name": purchaser_name,
+            "latest_recipient": latest_recipient,
+            "recipient_history": recipient_history,
+            "billing_snapshot": billing_snapshot,
+            "is_gift_order": is_gift_order,
             "stored_trimester": stored_trimester,
             "live_trimester": live_trimester,
             "trimester_changed": trimester_changed,
