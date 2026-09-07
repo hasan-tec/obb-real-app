@@ -1645,30 +1645,53 @@ def _compute_order_type(db, customer_id: Optional[str]) -> str:
     """
     if not customer_id:
         return "new"
-    try:
-        today_iso = date.today().isoformat()
-        res = (
-            db.table("shipments")
-            .select("id", count="exact")
-            .eq("customer_id", customer_id)
-            .not_.is_("ship_date", "null")
-            .lt("ship_date", today_iso)
-            .limit(1)
-            .execute()
-        )
-        prior = res.count or 0
-        order_type = "renewal" if prior > 0 else "new"
-        logger.info(
-            "[ORDER TYPE] customer=%s prior_real_shipments=%d → %s",
-            customer_id, prior, order_type,
-        )
-        return order_type
-    except Exception as e:
-        logger.warning(
-            "[ORDER TYPE] compute failed for customer=%s: %s — defaulting to 'new'",
-            customer_id, str(e),
-        )
-        return "new"
+
+    today_iso = date.today().isoformat()
+    last_err: Optional[Exception] = None
+    # One retry: the observed failures were transient query errors during large
+    # month-start batches (3 of 494 on 2026-09-01), not a persistent fault.
+    for attempt in (1, 2):
+        try:
+            res = (
+                db.table("shipments")
+                .select("id", count="exact")
+                .eq("customer_id", customer_id)
+                .not_.is_("ship_date", "null")
+                .lt("ship_date", today_iso)
+                .limit(1)
+                .execute()
+            )
+            prior = res.count
+            if prior is None:
+                # A missing count header is NOT zero shipments. The old code did
+                # `res.count or 0`, which silently turned an absent count into
+                # "no history" and stamped a returning customer as 'new'.
+                raise RuntimeError("PostgREST returned no exact count for shipments")
+            order_type = "renewal" if prior > 0 else "new"
+            logger.info(
+                "[ORDER TYPE] customer=%s prior_real_shipments=%d → %s (attempt %d)",
+                customer_id, prior, order_type, attempt,
+            )
+            return order_type
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "[ORDER TYPE] attempt %d failed for customer=%s — error=%s",
+                attempt, customer_id, str(e),
+            )
+
+    # Both attempts failed. Fall back to 'renewal', NOT 'new'.
+    # This value is the New/Renewal badge and the Order Type filter — kit selection is
+    # NOT driven by it (assign_kit derives its own `is_new` from a live shipment read),
+    # so a wrong value here misleads staff during batch processing rather than shipping
+    # the wrong box. 'renewal' is still the safer side: the overwhelming majority of
+    # month-start decisions are renewals, so it is the likelier truth when we cannot
+    # read history, and it fails toward "look closer" rather than "treat as first-time".
+    logger.error(
+        "[ORDER TYPE] compute failed twice for customer=%s — defaulting to 'renewal' (safe side) — error=%s",
+        customer_id, str(last_err), exc_info=True,
+    )
+    return "renewal"
 
 
 def _prior_order_context(db, customer_id: Optional[str]) -> dict:
