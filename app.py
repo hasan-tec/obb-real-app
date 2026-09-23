@@ -638,6 +638,435 @@ def _cj_shipment_ship_date(shipment: dict):
         return None
 
 
+# ═══════════════════════════════════════════════════════════
+# THREADS 20/21 HELPERS — pure functions (no DB, no HTTP) so they are unit-testable.
+# See THREADS_20_21_FIX_PLAN.md. Tests: tests/test_threads_20_21.py
+# ═══════════════════════════════════════════════════════════
+
+# Never attach tracking to a Cratejoy box due further ahead than this (a prepay's future
+# months share one created_at, which is how "most recent unshipped" marked Oct/Nov boxes).
+CJ_TRACKING_MAX_LEAD_DAYS = 10
+
+
+def norm_name(s) -> str:
+    """Normalize a person name for matching: lower-case, drop a trailing 'c/o ...', collapse spaces."""
+    s = str(s or "").lower()
+    s = re.sub(r"\s+c/o\b.*$", "", s)
+    return " ".join(s.split())
+
+
+def _clean(v):
+    """Strip a scalar to a non-empty string, or None."""
+    v = str(v).strip() if v is not None else ""
+    return v or None
+
+
+def ship_to_cols_from_shopify(shipping: dict, fallback_first: str, fallback_last: str) -> dict:
+    """
+    Shopify shipping_address -> decisions ship_* columns.
+    Names always present (falling back to the account holder, as before). The address block is
+    included only when the payload actually has address1, so an update never blanks a good
+    snapshot with an empty payload.
+    """
+    shipping = shipping if isinstance(shipping, dict) else {}
+    cols = {
+        "ship_first_name": _clean(shipping.get("first_name")) or _clean(fallback_first),
+        "ship_last_name": _clean(shipping.get("last_name")) or _clean(fallback_last),
+    }
+    if _clean(shipping.get("address1")):
+        cols.update({
+            "ship_address1": _clean(shipping.get("address1")),
+            "ship_address2": _clean(shipping.get("address2")),
+            "ship_city": _clean(shipping.get("city")),
+            "ship_state": _clean(shipping.get("province")),
+            "ship_zip": _clean(shipping.get("zip")),
+            "ship_country": _clean(shipping.get("country_code")) or "US",
+            "ship_phone": _clean(shipping.get("phone")),
+            "ship_to_source": "order",
+        })
+    return cols
+
+
+def ship_to_cols_from_cratejoy(ship_addr: dict) -> dict:
+    """
+    Cratejoy ship_address -> decisions ship_* columns.
+    Keys seen live: to, street, unit, city, state, zip_code, country, phone_number.
+    Name keys only when `to` is present; address block only when `street` is present.
+    """
+    a = ship_addr if isinstance(ship_addr, dict) else {}
+    cols: dict = {}
+    to = " ".join(str(a.get("to") or a.get("name") or "").split())
+    if to:
+        parts = to.split(" ", 1)
+        cols["ship_first_name"] = parts[0]
+        cols["ship_last_name"] = parts[1] if len(parts) > 1 else None
+    if _clean(a.get("street")):
+        cols.update({
+            "ship_address1": _clean(a.get("street")),
+            "ship_address2": _clean(a.get("unit")),
+            "ship_city": _clean(a.get("city")),
+            "ship_state": _clean(a.get("state")),
+            "ship_zip": _clean(a.get("zip_code")),
+            "ship_country": _clean(a.get("country")) or "US",
+            "ship_phone": _clean(a.get("phone_number")),
+            "ship_to_source": "order",
+        })
+    return cols
+
+
+def decision_ship_to(d: dict, c: dict) -> dict:
+    """
+    THE single source of truth for where a decision's box ships.
+    Returns {name, address1, address2, city, state, zip, country, phone, source}.
+      - address: ALL fields from the decision snapshot when d['ship_address1'] is set,
+        otherwise ALL from the customer row -- never a decision street with a customer city.
+      - name: the decision's ship name pair when ship_first_name is set, else the customer's
+        first/last, else the email.
+      - phone: decision phone, else customer phone (carrier contact).
+    Country is returned raw -- callers normalize (normalize_country) where they need ISO.
+    """
+    d = d or {}
+    c = c or {}
+    if d.get("ship_first_name"):
+        name = f"{d.get('ship_first_name') or ''} {d.get('ship_last_name') or ''}"
+    else:
+        name = f"{c.get('first_name') or ''} {c.get('last_name') or ''}"
+    name = " ".join(name.split()) or (c.get("email") or "")
+    if d.get("ship_address1"):
+        out = {
+            "address1": d.get("ship_address1") or "",
+            "address2": d.get("ship_address2") or "",
+            "city": d.get("ship_city") or "",
+            "state": d.get("ship_state") or "",
+            "zip": d.get("ship_zip") or "",
+            "country": d.get("ship_country") or "US",
+            "source": "decision",
+        }
+    else:
+        out = {
+            "address1": c.get("address_line1") or "",
+            "address2": c.get("address_line2") or "",
+            "city": c.get("city") or "",
+            "state": c.get("province") or "",
+            "zip": c.get("zip") or c.get("zip_code") or "",
+            "country": c.get("country") or "US",
+            "source": "customer",
+        }
+    out["name"] = name
+    out["phone"] = d.get("ship_phone") or c.get("phone") or ""
+    return out
+
+
+def _cj_sub_id_of(shipment: dict) -> str:
+    ff = shipment.get("fulfillments") or []
+    return str((ff[0].get("subscription_id") if ff else "") or "")
+
+
+def pick_cratejoy_shipment_for_tracking(shipments: list, decision: dict, today: date) -> tuple:
+    """
+    Choose the ONE Cratejoy shipment a decision's tracking belongs to.
+    Returns (shipment, "ok") or (None, reason).
+      1. decision has cratejoy_shipment_id -> exactly that shipment, else (None, "not_found").
+      2. else candidates = unshipped, same subscription as decision.order_id (when set), and due
+         no later than today + CJ_TRACKING_MAX_LEAD_DAYS. One -> it. None -> "no_due_box".
+         Several -> the single earliest ship date, else "ambiguous".
+    Rule 2 never returns a box due more than CJ_TRACKING_MAX_LEAD_DAYS ahead.
+    """
+    shipments = shipments or []
+    want = str(decision.get("cratejoy_shipment_id") or "")
+    if want:
+        for s in shipments:
+            if str(s.get("id")) == want:
+                return s, "ok"
+        return None, "not_found"
+
+    horizon = today + timedelta(days=CJ_TRACKING_MAX_LEAD_DAYS)
+    sub = str(decision.get("order_id") or "")
+    cands = []
+    for s in shipments:
+        if (s.get("status") or "").lower() != "unshipped":
+            continue
+        if sub and _cj_sub_id_of(s) != sub:
+            continue
+        sd = _cj_shipment_ship_date(s)
+        if sd is None or sd > horizon:
+            continue
+        cands.append((sd, s))
+    if not cands:
+        return None, "no_due_box"
+    if len(cands) == 1:
+        return cands[0][1], "ok"
+    cands.sort(key=lambda x: x[0])
+    if cands[0][0] < cands[1][0]:
+        return cands[0][1], "ok"
+    return None, "ambiguous"
+
+
+def choose_decision_for_tracking_row(candidates: list, recipient_name: str) -> tuple:
+    """
+    Tie one tracking-file row to exactly one decision (each candidate has an embedded
+    `customers` dict). 0 -> (None, "unmatched"); 1 -> (it, "ok"); several -> keep only those
+    whose ship-to name equals recipient_name (norm_name); exactly one left -> ok, else "ambiguous".
+    """
+    candidates = candidates or []
+    if not candidates:
+        return None, "unmatched"
+    if len(candidates) == 1:
+        return candidates[0], "ok"
+    want = norm_name(recipient_name)
+    if not want:
+        return None, "ambiguous"
+    hits = [d for d in candidates
+            if norm_name(decision_ship_to(d, d.get("customers") or {})["name"]) == want]
+    if len(hits) == 1:
+        return hits[0], "ok"
+    return None, "ambiguous"
+
+
+def recipient_ref_for_shopify(quiz: dict):
+    """'rc:<first Recharge subscription id>' from the order's note attributes, else None."""
+    raw = str((quiz or {}).get("rc_subscription_ids") or "").strip()
+    first = raw.split(",")[0].strip() if raw else ""
+    return f"rc:{first}" if first else None
+
+
+def recipient_ref_for_cratejoy(sub_id):
+    """'cj:<Cratejoy subscription id>', else None."""
+    sub_id = str(sub_id or "").strip()
+    return f"cj:{sub_id}" if sub_id else None
+
+
+def profile_match_name(row: dict) -> str:
+    """The name a customer profile is matched on: its recipient, else the account holder."""
+    return norm_name(row.get("recipient_name")
+                     or f"{row.get('first_name') or ''} {row.get('last_name') or ''}")
+
+
+def resolve_recipient_profile(rows: list, ref, ship_name: str) -> tuple:
+    """
+    Pick which customer profile (one per RECIPIENT) an incoming order/box belongs to.
+    rows = ALL customers rows with this email. Returns (row, action):
+      1. no rows                                                -> (None, "create_new")
+      2. ref and a row.recipient_ref == ref                     -> (row, "match")
+      3. exactly one row whose profile_match_name == ship name  -> (row, "claim" if ref differs, else "match")
+      4. ref and exactly one row with NULL recipient_ref and an empty recipient_name
+         (a legacy profile nobody has claimed yet)              -> (row, "claim")
+      5. no ship name                                           -> (oldest row, "match")
+      6. otherwise                                              -> (None, "create_recipient")
+    Rule 2 wins even when the ship name changed (renewals carry the subscription id), so one
+    person is never split in two just because a spouse's name went on the label.
+    """
+    rows = rows or []
+    if not rows:
+        return None, "create_new"
+    if ref:
+        for r in rows:
+            if r.get("recipient_ref") == ref:
+                return r, "match"
+    want = norm_name(ship_name)
+    if want:
+        hits = [r for r in rows if profile_match_name(r) == want]
+        if len(hits) == 1:
+            r = hits[0]
+            return r, ("claim" if ref and r.get("recipient_ref") != ref else "match")
+    if ref:
+        unclaimed = [r for r in rows if not r.get("recipient_ref")]
+        if len(unclaimed) == 1 and not (unclaimed[0].get("recipient_name") or "").strip():
+            return unclaimed[0], "claim"
+    if not want:
+        # No ship-to name and no subscription match: nothing tells the recipients apart, so keep
+        # today's behaviour (the oldest profile) instead of creating a nameless duplicate.
+        return rows[0], "match"
+    return None, "create_recipient"
+
+
+# ─── Recipient profiles — DB layer (Threads 20/21, plan Part C) ───
+# One customers row per RECIPIENT. These wrap resolve_recipient_profile() with the reads/writes
+# every order path needs, so the Shopify webhook, replay and the Cratejoy paths behave the same.
+
+def load_email_profiles(db, email: str) -> list:
+    """Every customer profile for this purchaser email, oldest first."""
+    if not email:
+        return []
+    rows = (db.table("customers").select("*").ilike("email", email)
+            .order("created_at", desc=False).execute().data or [])
+    # ilike treats "_" as a wildcard (miss_tey20@…) — keep exact matches only
+    return [r for r in rows if (r.get("email") or "").strip().lower() == email.strip().lower()]
+
+
+def _profile_update_fields(row: dict, action: str, ref, ship_name: str) -> dict:
+    """recipient_ref / recipient_name changes implied by a match or claim."""
+    upd: dict = {}
+    if action == "claim" and ref and row.get("recipient_ref") != ref:
+        upd["recipient_ref"] = ref
+    if ship_name and not (row.get("recipient_name") or "").strip():
+        upd["recipient_name"] = ship_name
+    return upd
+
+
+def _is_secondary_profile(row: dict, purchaser_first, purchaser_last) -> bool:
+    """A profile named after its recipient (not the purchaser) — its name must never be
+    overwritten with the purchaser's name from a later order."""
+    return bool(row.get("recipient_name")) and \
+        norm_name(f"{row.get('first_name') or ''} {row.get('last_name') or ''}") != \
+        norm_name(f"{purchaser_first or ''} {purchaser_last or ''}")
+
+
+def _insert_profile(db, rec: dict, email: str, ref, ship_name: str, log_prefix: str):
+    """Insert a profile; if the unique (email, recipient_ref) index says it already exists
+    (two webhooks racing), return the existing one instead."""
+    try:
+        res = db.table("customers").insert(rec).execute()
+        return (res.data or [None])[0]
+    except Exception as e:
+        logger.warning("%s [RECIPIENT] insert failed (%s) — re-resolving email=%s ref=%s", log_prefix, e, email, ref)
+        row, _ = resolve_recipient_profile(load_email_profiles(db, email), ref, ship_name)
+        if row is None:
+            raise
+        return row
+
+
+def ensure_profile_identity(db, rows: list, dry_run: bool = False) -> list:
+    """
+    Self-heal legacy profiles (created before migration 022) BEFORE they are matched: a profile
+    with no recipient_name learns it from its own newest non-rejected decision's ship-to name, and
+    a profile with no recipient_ref learns 'cj:<subscription>' from its newest Cratejoy decision
+    that is tied to a real shipment (daily-sync decisions: order_id = subscription id).
+    Without this, the first box of a SECOND recipient could claim the first recipient's legacy
+    profile (resolve rule 4). Mutates and returns `rows`; writes are skipped when dry_run.
+    """
+    taken_refs = {r.get("recipient_ref") for r in rows if r.get("recipient_ref")}
+    for r in rows:
+        if (r.get("recipient_name") or "").strip() and r.get("recipient_ref"):
+            continue
+        latest = (db.table("decisions")
+                  .select("ship_first_name, ship_last_name, platform, order_id, cratejoy_shipment_id")
+                  .eq("customer_id", r["id"]).neq("status", "rejected")
+                  .order("created_at", desc=True).limit(5).execute().data or [])
+        upd: dict = {}
+        if not (r.get("recipient_name") or "").strip():
+            named = next((d for d in latest if d.get("ship_first_name")), None)
+            if named:
+                upd["recipient_name"] = " ".join(
+                    f"{named.get('ship_first_name') or ''} {named.get('ship_last_name') or ''}".split())
+        if not r.get("recipient_ref"):
+            cj_dec = next((d for d in latest if d.get("platform") == "cratejoy"
+                           and d.get("cratejoy_shipment_id") and d.get("order_id")), None)
+            ref = recipient_ref_for_cratejoy(cj_dec["order_id"]) if cj_dec else None
+            if ref and ref not in taken_refs:
+                upd["recipient_ref"] = ref
+                taken_refs.add(ref)
+        if not upd:
+            continue
+        logger.info("[RECIPIENT] learned identity for legacy profile %s (%s): %s%s",
+                    r["id"], r.get("email"), upd, " (dry run — not saved)" if dry_run else "")
+        if not dry_run:
+            db.table("customers").update(upd).eq("id", r["id"]).execute()
+        r.update(upd)
+    return rows
+
+
+class _ProfileLookup:
+    """Mimics a Supabase result (.data = [row] or []) for code paths written against one row."""
+    def __init__(self, row):
+        self.data = [row] if row else []
+
+
+def pick_one_profile(db, email: str, ship_name: str, log_prefix: str) -> "_ProfileLookup":
+    """
+    For the older single-customer code paths (Cratejoy webhook + its replay — dormant since
+    the daily sync took over): choose ONE existing profile for this email. With several
+    recipient profiles, pick the one whose recipient matches ship_name, else the oldest.
+    Never creates a profile (the daily sync owns Cratejoy onboarding).
+    """
+    rows = ensure_profile_identity(db, load_email_profiles(db, email))
+    if len(rows) <= 1:
+        return _ProfileLookup(rows[0] if rows else None)
+    row, action = resolve_recipient_profile(rows, None, ship_name)
+    if row is None:
+        row = rows[0]
+        logger.warning("%s [RECIPIENT] %s has %d profiles and none matches %r — using the oldest (%s)",
+                       log_prefix, email, len(rows), ship_name, row["id"])
+    else:
+        logger.info("%s [RECIPIENT] %s → profile %s (%s)", log_prefix, email, row["id"], action)
+    return _ProfileLookup(row)
+
+
+def recipient_profile_counts(db, emails) -> dict:
+    """{lower(email): number of recipient profiles} for the given purchaser emails (Threads 20/21 UI)."""
+    wanted = sorted({(e or "").strip().lower() for e in emails if e})
+    counts: dict = {}
+    for i in range(0, len(wanted), 200):
+        chunk = wanted[i:i + 200]
+        try:
+            rows = db.table("customers").select("email").in_("email", chunk).execute().data or []
+        except Exception as e:
+            logger.warning("[RECIPIENT] profile count lookup failed (%d emails): %s", len(chunk), e)
+            continue
+        for r in rows:
+            k = (r.get("email") or "").strip().lower()
+            counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def upsert_shopify_recipient_profile(db, *, email: str, quiz: dict, shipping: dict,
+                                     customer_record: dict, is_subscription_order: bool,
+                                     purchaser_first, purchaser_last, log_prefix: str) -> tuple:
+    """
+    Route a Shopify order to its recipient's profile and write the order's data onto it.
+    Returns (customer_id | None, prior_row | None, action):
+      action = "create_new" | "match" | "claim" | "create_recipient"   (subscription orders)
+             | "address_only" | "skip"                                  (non-subscription orders)
+    Non-subscription orders never create profiles and only touch an existing matching one.
+    """
+    shipping = shipping or {}
+    rows = ensure_profile_identity(db, load_email_profiles(db, email))
+    ship_name = " ".join(f"{shipping.get('first_name') or ''} {shipping.get('last_name') or ''}".split())
+    ref = recipient_ref_for_shopify(quiz)
+    row, action = resolve_recipient_profile(rows, ref, ship_name)
+    logger.info("%s [RECIPIENT] email=%s ref=%s ship_name=%r profiles=%d → action=%s customer=%s",
+                log_prefix, email, ref, ship_name, len(rows), action, (row or {}).get("id"))
+
+    if not is_subscription_order:
+        if row is None:
+            return None, None, "skip"
+        address_only = {k: customer_record[k] for k in
+                        ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country")
+                        if k in customer_record}
+        db.table("customers").update(address_only).eq("id", row["id"]).execute()
+        logger.info("%s Non-sub order — updated address only for profile %s", log_prefix, row["id"])
+        return row["id"], row, "address_only"
+
+    if row is not None:
+        rec = dict(customer_record)
+        rec["platform"] = "shopify"
+        if _is_secondary_profile(row, purchaser_first, purchaser_last):
+            rec.pop("first_name", None)
+            rec.pop("last_name", None)
+        rec.update(_profile_update_fields(row, action, ref, ship_name))
+        _log_platform_change(email, row.get("platform"), "shopify", log_prefix)
+        db.table("customers").update(rec).eq("id", row["id"]).execute()
+        logger.info("%s Updated profile %s (%s): %s", log_prefix, row["id"], action, sorted(rec.keys()))
+        return row["id"], row, action
+
+    rec = dict(customer_record)
+    rec["platform"] = "shopify"
+    rec["subscription_status"] = "active"
+    rec["recipient_name"] = ship_name or None
+    if action == "create_recipient":
+        rec["first_name"] = _clean(shipping.get("first_name")) or rec.get("first_name")
+        rec["last_name"] = _clean(shipping.get("last_name")) or rec.get("last_name")
+        rec["recipient_ref"] = ref or f"name:{norm_name(ship_name)}"
+    else:
+        rec["recipient_ref"] = ref
+    created = _insert_profile(db, rec, email, rec["recipient_ref"], ship_name, log_prefix)
+    cust_id = (created or {}).get("id")
+    logger.info("%s Created %s profile %s for %s (recipient=%r ref=%s)",
+                log_prefix, "RECIPIENT" if action == "create_recipient" else "new", cust_id, email,
+                ship_name, rec["recipient_ref"])
+    return cust_id, None, action
+
+
 async def _cj_enrich_new_customer(client, sub_id: str, ship_address: dict) -> dict:
     """Survey (due/size/gender/daddy) + address for a brand-new customer. Mirrors the webhook."""
     fields: dict = {}
@@ -653,6 +1082,8 @@ async def _cj_enrich_new_customer(client, sub_id: str, ship_address: dict) -> di
     if isinstance(addr, dict):
         if addr.get("street"):
             fields["address_line1"] = addr["street"]
+        if addr.get("unit"):  # apartment / suite (Threads 20/21 P10)
+            fields["address_line2"] = addr["unit"]
         if addr.get("city"):
             fields["city"] = addr["city"]
         if addr.get("state"):
@@ -711,7 +1142,7 @@ async def _cj_refresh_existing_customer(
     raw = await _cj_enrich_new_customer(client, sub_id, ship_addr)
     update: dict = {}
 
-    for field in ("address_line1", "city", "province", "zip", "due_date", "clothing_size"):
+    for field in ("address_line1", "address_line2", "city", "province", "zip", "due_date", "clothing_size"):
         val = raw.get(field)
         if val and val != cust_row.get(field):
             update[field] = val
@@ -781,17 +1212,23 @@ async def process_cratejoy_box(db, client, shipment: dict, today: date, dry_run:
     if db.table("decisions").select("id").eq("cratejoy_shipment_id", ship_id).limit(1).execute().data:
         return "skip_exists"
 
-    # Locate customer (cratejoy_customer_id first, then email)
-    cust_row = None
-    if cj_cust_id:
-        r = db.table("customers").select("*").eq("cratejoy_customer_id", cj_cust_id).limit(1).execute()
-        cust_row = r.data[0] if r.data else None
-    if not cust_row and email:
-        r = db.table("customers").select("*").ilike("email", email).limit(1).execute()
-        cust_row = r.data[0] if r.data else None
+    # Locate the RECIPIENT's profile (Threads 20/21): one profile per recipient, keyed by the
+    # Cratejoy subscription — a purchaser with two subscriptions for two people gets two profiles,
+    # each with its own survey (due date / size), address, history and one-box-a-month guard.
+    profiles = load_email_profiles(db, email)
+    if not profiles and cj_cust_id:  # email changed in Cratejoy
+        profiles = db.table("customers").select("*").eq("cratejoy_customer_id", cj_cust_id).execute().data or []
+    profiles = ensure_profile_identity(db, profiles, dry_run=dry_run)
+    ref = recipient_ref_for_cratejoy(sub_id)
+    recipient = " ".join(str(ship_addr.get("to") or "").split()) if isinstance(ship_addr, dict) else ""
+    cust_row, profile_action = resolve_recipient_profile(profiles, ref, recipient)
+    logger.info("[CJ DAILY] [RECIPIENT] email=%s sub=%s recipient=%r profiles=%d → action=%s customer=%s",
+                email, sub_id, recipient, len(profiles), profile_action, (cust_row or {}).get("id"))
 
     if cust_row is None:
-        # Brand-new signup — onboard fresh (genuinely new → welcome-kit path in assign_kit)
+        # Brand-new signup, or a NEW recipient on an existing purchaser email — onboard a fresh
+        # profile from THIS subscription's survey (genuinely new → welcome-kit path in assign_kit).
+        is_second = profile_action == "create_recipient"
         rec = {
             "email": email,
             "first_name": cust.get("first_name") or None,
@@ -800,16 +1237,33 @@ async def process_cratejoy_box(db, client, shipment: dict, today: date, dry_run:
             "platform": "cratejoy",
             "subscription_status": "active",
             "history_pending": False,
+            "recipient_ref": ref or (f"name:{norm_name(recipient)}" if is_second else None),
+            "recipient_name": recipient or None,
         }
+        if is_second and recipient:
+            parts = recipient.split(" ", 1)
+            rec["first_name"], rec["last_name"] = parts[0], (parts[1] if len(parts) > 1 else None)
         rec.update(await _cj_enrich_new_customer(client, sub_id, ship_addr))
         if dry_run:
-            logger.info("[CJ DAILY] WOULD onboard NEW customer %s + create decision (ship_id=%s)", email, ship_id)
-            return "create_new"
-        ins = db.table("customers").insert(rec).execute()
-        cust_row = ins.data[0] if ins.data else None
+            logger.info("[CJ DAILY] WOULD onboard %s profile %s (%s) + create decision (ship_id=%s)",
+                        "RECIPIENT" if is_second else "NEW customer", email, recipient, ship_id)
+            return "create_recipient" if is_second else "create_new"
+        cust_row = _insert_profile(db, rec, email, rec["recipient_ref"], recipient, "[CJ DAILY]")
         if not cust_row:
             return "error"
-        logger.info("[CJ DAILY] onboarded new customer %s (sub=%s)", email, sub_id)
+        logger.info("[CJ DAILY] onboarded %s profile %s for %s (sub=%s)",
+                    "RECIPIENT" if is_second else "new", cust_row.get("id"), email, sub_id)
+        if is_second:
+            await log_activity(
+                "customer", f"New recipient profile for {email}: {recipient}",
+                f"Cratejoy subscription {sub_id}. Same purchaser now sends boxes to more than one person. "
+                f"If this is actually the same person, ask Hasan to merge the profiles.", "warning")
+    elif not dry_run:
+        upd = _profile_update_fields(cust_row, profile_action, ref, recipient)
+        if upd:
+            db.table("customers").update(upd).eq("id", cust_row["id"]).execute()
+            cust_row.update(upd)
+            logger.info("[CJ DAILY] [RECIPIENT] profile %s %s: %s", cust_row["id"], profile_action, upd)
 
     cust_id = cust_row["id"]
 
@@ -864,14 +1318,8 @@ async def process_cratejoy_box(db, client, shipment: dict, today: date, dry_run:
         "order_type": _compute_order_type(db, cust_id),
         "cratejoy_shipment_id": ship_id,
     }
-    # Gift-aware ship-to recipient name for VeraCore split-address (best-effort)
-    recipient = ""
-    if isinstance(ship_addr, dict):
-        recipient = str(ship_addr.get("to") or ship_addr.get("name") or "").strip()
-    if recipient:
-        parts = recipient.split(" ", 1)
-        decision["ship_first_name"] = parts[0]
-        decision["ship_last_name"] = parts[1] if len(parts) > 1 else None
+    # Recipient name + full address snapshot for THIS box (migration 022)
+    decision.update(ship_to_cols_from_cratejoy(ship_addr))
     db.table("decisions").insert(decision).execute()
     logger.info("[CJ DAILY] decision created — %s kit=%s type=%s ship_id=%s",
                 email, kit.get("kit_sku", "none"), decision["decision_type"], ship_id)
@@ -959,7 +1407,9 @@ async def _cj_reconcile_pending_decisions(db, client, dry_run: bool = False) -> 
     headers = _cj_basic_headers()
     counts: dict = {}
     decisions = (
-        db.table("decisions").select("id, customer_id, cratejoy_shipment_id, ship_first_name, ship_last_name")
+        db.table("decisions").select(
+            "id, customer_id, cratejoy_shipment_id, ship_first_name, ship_last_name, ship_address1, "
+            "ship_address2, ship_city, ship_state, ship_zip, ship_country, ship_phone, ship_to_source")
         .eq("platform", "cratejoy").eq("status", "pending")
         .not_.is_("cratejoy_shipment_id", "null")
         .execute().data or []
@@ -992,15 +1442,16 @@ async def _cj_reconcile_pending_decisions(db, client, dry_run: bool = False) -> 
             await log_activity("decision", f"Auto-rejected decision {d['id'][:8]} — Cratejoy shipment cancelled", f"shipment={ship_id}", "success")
             continue
 
-        # Not cancelled — refresh ship_to (recipient) + ordered_by (buyer) snapshot.
+        # Not cancelled — refresh ship_to (recipient name + FULL address, Threads 20/21 B6) and
+        # ordered_by (buyer) snapshot. A 'manual' ship-to is never overwritten.
         addr = sh.get("ship_address") or {}
         cust = sh.get("customer") or {}
-        recipient = str(addr.get("to") or addr.get("name") or "").strip()
         update: dict = {}
-        if recipient:
-            parts = recipient.split(" ", 1)
-            update["ship_first_name"] = parts[0]
-            update["ship_last_name"] = parts[1] if len(parts) > 1 else None
+        ship_cols = {} if d.get("ship_to_source") == "manual" else ship_to_cols_from_cratejoy(addr)
+        ship_changed = sorted(k for k, v in ship_cols.items()
+                              if k != "ship_to_source" and (d.get(k) or None) != (v or None))
+        if ship_changed:
+            update.update(ship_cols)
         # Prefer first_name/last_name over the composite "name" field — Cratejoy's "name" can
         # include a nickname appended (e.g. "Manda Decker MandaJean"), which splits badly.
         buyer_first = cust.get("first_name") or ""
@@ -1012,13 +1463,15 @@ async def _cj_reconcile_pending_decisions(db, client, dry_run: bool = False) -> 
             bparts = str(cust["name"]).strip().split(" ", 1)
             update["billing_first_name"] = bparts[0]
             update["billing_last_name"] = bparts[1] if len(bparts) > 1 else None
-        if update and (update.get("ship_first_name") != d.get("ship_first_name")
-                       or update.get("ship_last_name") != d.get("ship_last_name")):
+        if ship_changed:
             counts["refreshed"] = counts.get("refreshed", 0) + 1
             if not dry_run:
                 db.table("decisions").update(update).eq("id", d["id"]).execute()
-                logger.info("[CJ RECONCILE] refreshed ship_to for decision=%s -> %s %s",
-                            d["id"], update.get("ship_first_name"), update.get("ship_last_name"))
+                logger.info("[CJ RECONCILE] refreshed ship_to for decision=%s fields=%s -> %s %s, %s %s",
+                            d["id"], ship_changed, update.get("ship_first_name"), update.get("ship_last_name"),
+                            update.get("ship_address1"), update.get("ship_city"))
+            else:
+                logger.info("[CJ RECONCILE] WOULD refresh ship_to for decision=%s fields=%s", d["id"], ship_changed)
         else:
             counts["unchanged"] = counts.get("unchanged", 0) + 1
     return counts
@@ -1029,7 +1482,7 @@ async def _cj_reconcile_customer_statuses(db, client, dry_run: bool = False) -> 
     headers = _cj_basic_headers()
     counts: dict = {}
     customers = (
-        db.table("customers").select("id, email, cratejoy_customer_id, subscription_status")
+        db.table("customers").select("id, email, cratejoy_customer_id, subscription_status, recipient_ref")
         .in_("platform", ["cratejoy", "both"])
         .in_("subscription_status", ["active", "cancelled-prepaid"])
         .not_.is_("cratejoy_customer_id", "null")
@@ -1037,8 +1490,14 @@ async def _cj_reconcile_customer_statuses(db, client, dry_run: bool = False) -> 
     )
     for cust in customers:
         cj_id = cust["cratejoy_customer_id"]
+        # Threads 20/21: a recipient profile follows ITS OWN subscription (recipient_ref 'cj:<id>'),
+        # not "the purchaser's most recent subscription" — two recipients can have different statuses.
+        own_sub = (cust.get("recipient_ref") or "")[3:] if (cust.get("recipient_ref") or "").startswith("cj:") else ""
         try:
-            r = await client.get(f"https://api.cratejoy.com/v1/subscriptions/?customer.id={cj_id}&limit=5", headers=headers)
+            if own_sub:
+                r = await client.get(f"https://api.cratejoy.com/v1/subscriptions/{own_sub}/", headers=headers)
+            else:
+                r = await client.get(f"https://api.cratejoy.com/v1/subscriptions/?customer.id={cj_id}&limit=5", headers=headers)
         except Exception as e:
             logger.error("[CJ RECONCILE] subscription fetch failed customer=%s: %s", cust["id"], e)
             counts["error"] = counts.get("error", 0) + 1
@@ -1046,10 +1505,10 @@ async def _cj_reconcile_customer_statuses(db, client, dry_run: bool = False) -> 
         if r.status_code != 200:
             counts["skip_http_error"] = counts.get("skip_http_error", 0) + 1
             continue
-        subs = r.json().get("results", [])
+        subs = [r.json()] if own_sub else r.json().get("results", [])
         if not subs:
             continue
-        sub = subs[0]  # most recent
+        sub = subs[0]  # this profile's own subscription, else the most recent
         cj_status = (sub.get("status") or "").lower()
 
         if cj_status == "active":
@@ -1067,6 +1526,7 @@ async def _cj_reconcile_customer_statuses(db, client, dry_run: bool = False) -> 
             has_future_unshipped = any(
                 (s.get("status") or "").lower() == "unshipped"
                 and (_cj_shipment_ship_date(s) or date.min) >= date.today()
+                and (not own_sub or _cj_sub_id_of(s) == own_sub)
                 for s in ships
             )
             new_status = "cancelled-prepaid" if has_future_unshipped else "cancelled-expired"
@@ -2489,10 +2949,10 @@ async def shopify_order_webhook(request: Request):
 
         # ─── Upsert customer ───
         if email:
-            existing_customer = db.table("customers").select("*").ilike("email", email).execute()
+            existing_profiles = load_email_profiles(db, email)
 
             # Non-subscription order from unknown email → skip entirely (no ghost customers)
-            if not is_subscription_order and not existing_customer.data:
+            if not is_subscription_order and not existing_profiles:
                 logger.info(f"[SHOPIFY WEBHOOK] Non-sub order from unknown email {email} — skipping entirely, no customer created")
                 await log_activity("webhook", f"Non-sub order skipped — unknown email {email}", f"order={shopify_order_id}, SKUs={[i.get('sku','') for i in line_items]}", "info")
                 return JSONResponse({"status": "skipped", "reason": "non-subscription order from unknown customer"})
@@ -2521,32 +2981,29 @@ async def shopify_order_webhook(request: Request):
                 customer_record["baby_gender"] = baby_gender
             customer_record["wants_daddy_item"] = wants_daddy
 
-            if existing_customer.data:
-                cust_id = existing_customer.data[0]["id"]
-                customer_record["platform"] = "shopify"
-                # Non-sub order for existing customer → address fields only, don't overwrite quiz
-                # data OR platform — a one-off retail item shouldn't override a subscriber's real
-                # platform (see DYNAMIC_CUSTOMER_SYNC_PLAN.md 2.1).
-                if not is_subscription_order:
-                    address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country") if k in customer_record}
-                    db.table("customers").update(address_only).eq("id", cust_id).execute()
-                    logger.info(f"[SHOPIFY WEBHOOK] Non-sub order — updated address only for existing customer: {cust_id}")
-                else:
-                    _log_platform_change(email, existing_customer.data[0].get("platform"), "shopify", "shopify_order_webhook")
-                    db.table("customers").update(customer_record).eq("id", cust_id).execute()
-                    logger.info(f"[SHOPIFY WEBHOOK] Updated existing customer: {cust_id}")
-            else:
-                customer_record["platform"] = "shopify"
-                customer_record["subscription_status"] = "active"
-                result = db.table("customers").insert(customer_record).execute()
-                cust_id = result.data[0]["id"] if result.data else None
-                logger.info(f"[SHOPIFY WEBHOOK] Created new customer: {cust_id}")
+            # Threads 20/21: route the order to its RECIPIENT's profile (one profile per recipient,
+            # same purchaser email) — quiz, address and the decision all land on that profile, so a
+            # second recipient never overwrites the first one's due date / size / address.
+            # Non-sub orders only ever touch an existing matching profile (DYNAMIC_CUSTOMER_SYNC_PLAN.md 2.1).
+            cust_id, prior_profile, profile_action = upsert_shopify_recipient_profile(
+                db, email=email, quiz=quiz, shipping=shipping, customer_record=customer_record,
+                is_subscription_order=is_subscription_order, purchaser_first=first_name,
+                purchaser_last=last_name, log_prefix="[SHOPIFY WEBHOOK]",
+            )
+            if profile_action == "create_recipient":
+                await log_activity(
+                    "customer",
+                    f"New recipient profile for {email}: {ship_first_name or ''} {ship_last_name or ''}".strip(),
+                    f"order={shopify_order_id}. Same purchaser now sends boxes to more than one person. "
+                    f"If this is actually the same person, ask Hasan to merge the profiles.",
+                    "warning",
+                )
 
             # ─── Run Decision Engine (subscription orders only) ───
             # Thread 17: a paused/on-hold customer never gets a new decision queued —
             # customer data above is still upserted (address/quiz stay current), just no
             # curation while paused.
-            existing_sub_status = existing_customer.data[0].get("subscription_status") if existing_customer.data else None
+            existing_sub_status = (prior_profile or {}).get("subscription_status")
             if cust_id and is_subscription_order and existing_sub_status == "paused":
                 logger.info(f"[SHOPIFY WEBHOOK] Customer {cust_id} ({email}) is paused — skipping decision engine")
                 await log_activity("webhook", f"Skipped curation for {email} — customer is paused/on hold",
@@ -2567,8 +3024,8 @@ async def shopify_order_webhook(request: Request):
                     "trimester": trimester,
                     "ship_date": date.today().isoformat(),
                     "order_type": _compute_order_type(db, cust_id),
-                    "ship_first_name": ship_first_name or None,
-                    "ship_last_name": ship_last_name or None,
+                    # Recipient name + full address snapshot for THIS box (migration 022)
+                    **ship_to_cols_from_shopify(shipping, first_name, last_name),
                     "billing_first_name": billing_first_name or None,
                     "billing_last_name": billing_last_name or None,
                     "billing_address1": billing_address1 or None,
@@ -2684,16 +3141,35 @@ async def shopify_customer_webhook(request: Request):
         email = (payload.get("email") or "").strip().lower()
         addr = payload.get("default_address") or {}
 
-        cust_row = None
+        # Threads 20/21: a purchaser can have several recipient profiles, and a gift profile's
+        # address is the RECIPIENT's. customers/update carries the BUYER's own default address, so
+        # it may only write when there is exactly one profile and that profile is not a gift.
+        profiles = []
         if shopify_customer_id:
-            r = db.table("customers").select("id, email").eq("shopify_customer_id", shopify_customer_id).limit(1).execute()
-            cust_row = r.data[0] if r.data else None
-        if not cust_row and email:
-            r = db.table("customers").select("id, email").ilike("email", email).limit(1).execute()
-            cust_row = r.data[0] if r.data else None
+            profiles = db.table("customers").select("id, email, first_name, last_name, recipient_name") \
+                .eq("shopify_customer_id", shopify_customer_id).execute().data or []
+        if not profiles and email:
+            profiles = [{k: pr.get(k) for k in ("id", "email", "first_name", "last_name", "recipient_name")}
+                        for pr in load_email_profiles(db, email)]
+        cust_row = profiles[0] if len(profiles) == 1 else None
+        gift_to = None
+        if cust_row:
+            latest = (db.table("decisions").select("ship_first_name, ship_last_name")
+                      .eq("customer_id", cust_row["id"]).neq("status", "rejected")
+                      .order("created_at", desc=True).limit(1).execute().data or [])
+            recip = f"{(latest[0].get('ship_first_name') or '') if latest else ''} {(latest[0].get('ship_last_name') or '') if latest else ''}"
+            holder = f"{cust_row.get('first_name') or ''} {cust_row.get('last_name') or ''}"
+            if norm_name(recip) and norm_name(recip) != norm_name(holder):
+                gift_to = " ".join(recip.split())
 
-        if not cust_row:
+        if not profiles:
             logger.info(f"[SHOPIFY CUSTOMER WEBHOOK] No matching engine customer for shopify_id={shopify_customer_id} email={email} — skipping, no ghost customer created")
+        elif len(profiles) > 1:
+            logger.info("[SHOPIFY CUSTOMER WEBHOOK] shopify_id=%s email=%s has %d recipient profiles — "
+                        "buyer's default address NOT written to any of them", shopify_customer_id, email, len(profiles))
+        elif gift_to:
+            logger.info("[SHOPIFY CUSTOMER WEBHOOK] profile %s is a gift (ships to %s) — buyer's default address "
+                        "NOT written over the recipient's", cust_row["id"], gift_to)
         elif not addr:
             logger.info(f"[SHOPIFY CUSTOMER WEBHOOK] Customer {cust_row['id']} has no default_address on this payload — nothing to sync")
         else:
@@ -2749,6 +3225,56 @@ async def shopify_customer_webhook(request: Request):
 #   - Never creates a customer (no ghosts) and never creates a decision.
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _sync_order_ship_to_from_shopify(db, shopify_order_id: str, shipping: dict, ship_name: str,
+                                          cust_row: dict, changes: list) -> None:
+    """
+    Threads 20/21 B4 — copy an edited Shopify ship-to onto this order's boxes.
+    Editable = pending, or approved but not yet sent to VeraCore. Shipped / at-VeraCore boxes get
+    one Activity warning per 7 days instead of an update. ship_to_source='manual' is never touched.
+    """
+    ship_cols = ship_to_cols_from_shopify(shipping, "", "")
+    if not ship_name:
+        ship_cols.pop("ship_first_name", None)
+        ship_cols.pop("ship_last_name", None)
+    if not ship_cols:
+        return
+    boxes = (db.table("decisions")
+             .select("id, status, veracore_order_id, ship_to_source, ship_first_name, ship_last_name, "
+                     "ship_address1, ship_address2, ship_city, ship_state, ship_zip, ship_country, ship_phone")
+             .eq("order_id", shopify_order_id).neq("status", "rejected").execute().data or [])
+    for box in boxes:
+        if box.get("ship_to_source") == "manual":
+            logger.info("[SHOPIFY ORDER UPDATED] decision=%s has a manual ship-to — not synced", box["id"])
+            continue
+        diff = sorted(k for k, v in ship_cols.items()
+                      if k != "ship_to_source" and (box.get(k) or None) != (v or None))
+        if not diff:
+            continue
+        old_to = f"{box.get('ship_first_name') or ''} {box.get('ship_last_name') or ''}".strip()
+        new_to = decision_ship_to({**box, **ship_cols}, cust_row)
+        new_line = f"{new_to['name']}, {new_to['address1']}, {new_to['city']} {new_to['state']} {new_to['zip']}"
+        editable = box["status"] == "pending" or (box["status"] == "approved" and not box.get("veracore_order_id"))
+        if editable:
+            db.table("decisions").update(ship_cols).eq("id", box["id"]).execute()
+            logger.info("[SHOPIFY ORDER UPDATED] ship-to synced decision=%s order=%s fields=%s: %s → %s",
+                        box["id"], shopify_order_id, diff, old_to, new_line)
+            changes.append(f"box {box['id'][:8]} ship-to → {new_line}")
+            await log_activity("decision", f"Ship-to updated from Shopify for {cust_row.get('email')}",
+                               f"decision {box['id'][:8]}: {old_to} → {new_line}", "success")
+            continue
+        warn = f"Ship-to changed in Shopify after approval — decision {box['id'][:8]}"
+        logger.warning("[SHOPIFY ORDER UPDATED] %s (status=%s veracore=%s) — not changed; Shopify now: %s",
+                       warn, box["status"], box.get("veracore_order_id"), new_line)
+        recent = (db.table("activity_log").select("id").eq("summary", warn)
+                  .gte("created_at", (datetime.utcnow() - timedelta(days=7)).isoformat())
+                  .limit(1).execute().data or [])
+        if not recent:
+            at_vc = " / at VeraCore" if box.get("veracore_order_id") else ""
+            await log_activity("decision", warn,
+                               f"{cust_row.get('email')}: Shopify now ships to {new_line}. Box is already "
+                               f"{box['status']}{at_vc} — fix the label/VeraCore by hand.", "warning")
+
+
 @app.post("/webhooks/shopify/orders/updated")
 async def shopify_order_updated_webhook(request: Request):
     """Receives Shopify orders/updated. Re-syncs due_date/trimester/size/gender
@@ -2796,14 +3322,29 @@ async def shopify_order_updated_webhook(request: Request):
         email = (customer_data.get("email") or payload.get("email") or "").strip().lower()
         shopify_customer_id = str(customer_data.get("id", "") or "")
 
-        # Find EXISTING customer only — an order edit must never create a ghost.
+        # Find the EXISTING profile only — an order edit must never create a ghost.
+        # Threads 20/21: the order's own decision says exactly which recipient profile it belongs
+        # to (a purchaser can have several). Fall back to recipient matching, then to a unique
+        # shopify_customer_id match.
         cust_row = None
-        if shopify_customer_id:
-            r = db.table("customers").select("*").eq("shopify_customer_id", shopify_customer_id).limit(1).execute()
+        edit_quiz = extract_quiz_data(payload.get("note_attributes", []) or [], payload.get("line_items", []) or [])
+        edit_ref = recipient_ref_for_shopify(edit_quiz)
+        edit_shipping = payload.get("shipping_address") or {}
+        edit_ship_name = " ".join(f"{edit_shipping.get('first_name') or ''} {edit_shipping.get('last_name') or ''}".split())
+        order_dec = (db.table("decisions").select("customer_id").eq("order_id", shopify_order_id)
+                     .order("created_at", desc=True).limit(1).execute().data or []) if shopify_order_id else []
+        if order_dec:
+            r = db.table("customers").select("*").eq("id", order_dec[0]["customer_id"]).limit(1).execute()
             cust_row = r.data[0] if r.data else None
         if not cust_row and email:
-            r = db.table("customers").select("*").ilike("email", email).limit(1).execute()
-            cust_row = r.data[0] if r.data else None
+            cust_row, _edit_action = resolve_recipient_profile(
+                ensure_profile_identity(db, load_email_profiles(db, email)), edit_ref, edit_ship_name)
+        if not cust_row and shopify_customer_id:
+            r = db.table("customers").select("*").eq("shopify_customer_id", shopify_customer_id).limit(2).execute()
+            cust_row = r.data[0] if len(r.data or []) == 1 else None
+        logger.info("[SHOPIFY ORDER UPDATED] order=%s ref=%s ship_name=%r → profile=%s (via %s)",
+                    shopify_order_id, edit_ref, edit_ship_name, (cust_row or {}).get("id"),
+                    "decision" if order_dec else "recipient match")
 
         if not cust_row:
             logger.info(f"[SHOPIFY ORDER UPDATED] No matching engine customer for shopify_id={shopify_customer_id} email={email} — skipping (no ghost)")
@@ -2860,6 +3401,18 @@ async def shopify_order_updated_webhook(request: Request):
                 update[col] = val
                 changes.append(f"{col}→{val}")
 
+        # Claim the Recharge subscription id for this profile the first time an edit carries it
+        # (checkout orders get rc_* attributes a few minutes after orders/create), so renewals
+        # route to this profile even if the label name changes later.
+        if edit_ref and not cust_row.get("recipient_ref"):
+            taken = [pr for pr in load_email_profiles(db, cust_row.get("email") or email)
+                     if pr.get("recipient_ref") == edit_ref and pr["id"] != cust_id]
+            if not taken:
+                update["recipient_ref"] = edit_ref
+                changes.append(f"recipient_ref→{edit_ref}")
+        if edit_ship_name and not (cust_row.get("recipient_name") or "").strip():
+            update["recipient_name"] = edit_ship_name
+
         if update:
             db.table("customers").update(update).eq("id", cust_id).execute()
             logger.info("[SHOPIFY ORDER UPDATED] Synced %s for %s (order=%s): %s",
@@ -2869,6 +3422,11 @@ async def shopify_order_updated_webhook(request: Request):
         else:
             logger.info("[SHOPIFY ORDER UPDATED] No engine-relevant changes for %s (order=%s)",
                         cust_row.get("email"), shopify_order_id)
+
+        # Threads 20/21 B4: keep THIS order's box ship-to (recipient name + address) in step with
+        # Shopify. Open boxes (pending, or approved but not yet at VeraCore) are updated; a box
+        # already shipped / at VeraCore is only flagged. 'manual' ship-tos are never touched.
+        await _sync_order_ship_to_from_shopify(db, shopify_order_id, edit_shipping, edit_ship_name, cust_row, changes)
 
         if webhook_log_id:
             db.table("webhook_logs").update({"status": "processed", "processing_time_ms": int((time.time() - start_time) * 1000)}).eq("id", webhook_log_id).execute()
@@ -3095,7 +3653,10 @@ async def cratejoy_order_webhook(request: Request):
         logger.info(f"[CRATEJOY WEBHOOK] Customer: {email}, Name: {first_name} {last_name}")
 
         if email:
-            existing_customer = db.table("customers").select("*").ilike("email", email).execute()
+            # Threads 20/21: several recipient profiles may share this email — pick the matching one.
+            _cj_to = address_data.get("to") if isinstance(address_data, dict) else ""
+            existing_customer = pick_one_profile(db, email, _cj_to or f"{first_name or ''} {last_name or ''}",
+                                                 "[CRATEJOY WEBHOOK]")
 
             customer_record = {
                 "email": email,
@@ -3916,10 +4477,10 @@ async def replay_webhook(webhook_id: str):
                 logger.info(f"[WEBHOOK REPLAY] NON-SUBSCRIPTION order — SKUs: {[i.get('sku', '') for i in line_items]}, price=${total_price}. Skipping decision engine.")
 
             if email:
-                existing_customer = db.table("customers").select("*").ilike("email", email).execute()
+                existing_profiles = load_email_profiles(db, email)
 
                 # Non-subscription order from unknown email → skip entirely (no ghost customers)
-                if not is_subscription_order and not existing_customer.data:
+                if not is_subscription_order and not existing_profiles:
                     logger.info(f"[WEBHOOK REPLAY] Non-sub order from unknown email {email} — skipping entirely")
                     db.table("webhook_logs").update({"status": "replayed", "replayed_at": date.today().isoformat()}).eq("id", webhook_id).execute()
                     return RedirectResponse(f"/webhooks/{webhook_id}", status_code=303)
@@ -3947,24 +4508,20 @@ async def replay_webhook(webhook_id: str):
                     customer_record["baby_gender"] = baby_gender
                 customer_record["wants_daddy_item"] = wants_daddy
 
-                if existing_customer.data:
-                    cust_id = existing_customer.data[0]["id"]
-                    customer_record["platform"] = "shopify"
-                    # Non-sub order for existing customer → address only, never platform (2.1)
-                    if not is_subscription_order:
-                        address_only = {k: customer_record[k] for k in ("email", "phone", "address_line1", "address_line2", "city", "province", "zip", "country") if k in customer_record}
-                        db.table("customers").update(address_only).eq("id", cust_id).execute()
-                        logger.info(f"[WEBHOOK REPLAY] Non-sub order — updated address only for existing customer: {cust_id}")
-                    else:
-                        _log_platform_change(email, existing_customer.data[0].get("platform"), "shopify", "replay_webhook")
-                        db.table("customers").update(customer_record).eq("id", cust_id).execute()
-                        logger.info(f"[WEBHOOK REPLAY] Updated existing customer: {cust_id}")
-                else:
-                    customer_record["platform"] = "shopify"
-                    customer_record["subscription_status"] = "active"
-                    result = db.table("customers").insert(customer_record).execute()
-                    cust_id = result.data[0]["id"] if result.data else None
-                    logger.info(f"[WEBHOOK REPLAY] Created new customer: {cust_id}")
+                # Threads 20/21: same recipient-profile routing as the live webhook.
+                cust_id, _prior_profile, profile_action = upsert_shopify_recipient_profile(
+                    db, email=email, quiz=quiz, shipping=shipping, customer_record=customer_record,
+                    is_subscription_order=is_subscription_order, purchaser_first=first_name,
+                    purchaser_last=last_name, log_prefix="[WEBHOOK REPLAY]",
+                )
+                if profile_action == "create_recipient":
+                    await log_activity(
+                        "customer",
+                        f"New recipient profile for {email}: {ship_first_name or ''} {ship_last_name or ''}".strip(),
+                        f"order={shopify_order_id} (webhook replay). If this is actually the same person, "
+                        f"ask Hasan to merge the profiles.",
+                        "warning",
+                    )
 
                 if cust_id and is_subscription_order:
                     kit_decision = await assign_kit(cust_id, date.today())
@@ -3982,8 +4539,8 @@ async def replay_webhook(webhook_id: str):
                         "trimester": trimester,
                         "ship_date": date.today().isoformat(),
                         "order_type": _compute_order_type(db, cust_id),
-                        "ship_first_name": ship_first_name or None,
-                        "ship_last_name": ship_last_name or None,
+                        # Recipient name + full address snapshot for THIS box (migration 022)
+                        **ship_to_cols_from_shopify(shipping, first_name, last_name),
                         "billing_first_name": billing_first_name or None,
                         "billing_last_name": billing_last_name or None,
                         "billing_address1": billing_address1 or None,
@@ -4124,7 +4681,10 @@ async def replay_webhook(webhook_id: str):
             logger.info(f"[WEBHOOK REPLAY] CJ customer: {email}, sub_status={sub_status_str}, due_date={due_date}, T{trimester}")
 
             if email:
-                existing_customer = db.table("customers").select("*").ilike("email", email).execute()
+                # Threads 20/21: several recipient profiles may share this email — pick the matching one.
+                _cj_to = address_data.get("to") if isinstance(address_data, dict) else ""
+                existing_customer = pick_one_profile(db, email, _cj_to or f"{first_name or ''} {last_name or ''}",
+                                                     "[WEBHOOK REPLAY]")
                 customer_record = {
                     "email": email,
                     "first_name": first_name or None,
@@ -4565,6 +5125,17 @@ async def customers_page(request: Request):
         filter_qs         = "&".join(filter_qs_parts)
         any_filter_active = bool(f_trimester or f_platform or f_status or f_size or f_order_type or q)
 
+        # Threads 20/21 UI data: purchasers with several recipient profiles are labelled
+        # "N of M recipients" so staff don't mistake them for duplicates.
+        profile_counts = recipient_profile_counts(db, [c.get("email") for c in filtered])
+        by_email: dict = {}
+        for c in sorted(filtered, key=lambda r: r.get("created_at") or ""):
+            by_email.setdefault((c.get("email") or "").strip().lower(), []).append(c["id"])
+        for c in filtered:
+            em = (c.get("email") or "").strip().lower()
+            c["_recipient_count"] = profile_counts.get(em, 1)
+            c["_recipient_index"] = (by_email.get(em, [c["id"]]).index(c["id"]) + 1) if c["id"] in by_email.get(em, []) else 1
+
         return templates.TemplateResponse("customers.html", {
             "request":          request,
             "customers":        filtered,
@@ -4715,6 +5286,7 @@ async def export_customer_pirateship(request: Request, customer_id: str):
             "Order Number", "Kit SKU", "Trimester",
             "Weight (oz)", "Length (in)", "Width (in)", "Height (in)",
             "Customs Description", "Customs Value", "Customs Quantity", "Customs Country of Origin",
+            "OBB Ref",  # Threads 20/21 A6 — map to Pirate Ship "Order ID" so tracking comes back tied to this box
         ])
         DEFAULT_WEIGHT_OZ = 48
         DEFAULT_LENGTH_IN = 10
@@ -4724,10 +5296,11 @@ async def export_customer_pirateship(request: Request, customer_id: str):
             c = d.get("customers") or {}
             # Prefer the decision's ship-to snapshot (gift recipient) over the account holder —
             # same fix as Thread 2/10, applied here so the Pirate Ship label matches the packing slip.
-            ship_first = d.get("ship_first_name") or c.get("first_name") or ""
-            ship_last = d.get("ship_last_name") or c.get("last_name") or ""
-            name = f"{ship_first} {ship_last}".strip()
-            country_iso = _norm_country(c.get("country") or "US")
+            # Ship-to = this box's own snapshot (recipient + address), falling back to the
+            # customer row for pre-migration-022 decisions — decision_ship_to() (Threads 20/21).
+            st = decision_ship_to(d, c)
+            name = st["name"]
+            country_iso = _norm_country(st["country"] or "US")
             is_intl = country_iso != "US"
             if is_intl:
                 customs = _build_customs({"cost_per_kit": None})
@@ -4740,18 +5313,19 @@ async def export_customer_pirateship(request: Request, customer_id: str):
             writer.writerow([
                 name,
                 c.get("email", ""),
-                c.get("address_line1", ""),
-                c.get("address_line2") or "",
-                c.get("city", ""),
-                c.get("province", ""),
-                c.get("zip") or c.get("zip_code", ""),
+                st["address1"],
+                st["address2"],
+                st["city"],
+                st["state"],
+                st["zip"],
                 country_iso,
-                c.get("phone") or "",
+                st["phone"],
                 d.get("order_id", ""),
                 d.get("kit_sku", ""),
                 f"T{d.get('trimester', '')}",
                 DEFAULT_WEIGHT_OZ, DEFAULT_LENGTH_IN, DEFAULT_WIDTH_IN, DEFAULT_HEIGHT_IN,
                 customs_desc, customs_value, customs_qty, customs_origin,
+                f"OBB-{str(d.get('id', ''))[:8]}",
             ])
 
         output.seek(0)
@@ -4862,9 +5436,22 @@ async def customer_detail(request: Request, customer_id: str):
             reverse=True,
         )
 
+        # Threads 20/21 UI data: the other recipient profiles of this purchaser email (banner
+        # "also sends boxes to …") and where this profile's latest box actually ships.
+        sibling_profiles = [
+            {"id": sp["id"],
+             "name": (sp.get("recipient_name") or f"{sp.get('first_name') or ''} {sp.get('last_name') or ''}").strip()
+                     or sp.get("email")}
+            for sp in load_email_profiles(db, cust.data.get("email") or "") if sp["id"] != customer_id
+        ]
+        latest_box = next((d for d in (decisions.data or []) if d.get("status") != "rejected"), None)
+        latest_ship_to = decision_ship_to(latest_box or {}, cust.data)
+
         return templates.TemplateResponse("customer_detail.html", {
             "request": request,
             "customer": cust.data,
+            "sibling_profiles": sibling_profiles,
+            "latest_ship_to": latest_ship_to,
             "decisions": decisions.data or [],
             "shipments": shipments,
             "kits": kits_list.data or [],
@@ -4927,7 +5514,7 @@ async def decisions_page(request: Request):
             # trimester is filtered in Python on the customer's LIVE trimester (below),
             # NOT here — decision.trimester is a frozen snapshot that drifts as the due
             # date nears (Thread 18). due_date is joined so we can recompute it live.
-            qo = db.table("decisions").select("*, customers(email, first_name, last_name, due_date, trimester, clothing_size, address_line1, address_line2, city, province, zip)")
+            qo = db.table("decisions").select("*, customers(email, first_name, last_name, due_date, trimester, clothing_size, address_line1, address_line2, city, province, zip, country, phone)")
             if f_status:
                 qo = qo.eq("status", f_status)
             if f_type:
@@ -5053,6 +5640,14 @@ async def decisions_page(request: Request):
         filter_qs = "&".join(filter_qs_parts)
 
         any_filter_active = bool(f_trimester or f_status or f_type or f_platform or f_order_type or f_month or f_size or q)
+
+        # Threads 20/21 UI data: each box's OWN ship-to (d._ship_to) and how many recipient
+        # profiles its purchaser email has (d._recipient_count — template shows "N recipients").
+        profile_counts = recipient_profile_counts(db, [(d.get("customers") or {}).get("email") for d in all_decisions])
+        for d in all_decisions:
+            c = d.get("customers") or {}
+            d["_ship_to"] = decision_ship_to(d, c)
+            d["_recipient_count"] = profile_counts.get((c.get("email") or "").strip().lower(), 1)
 
         return templates.TemplateResponse("decisions.html", {
             "request":          request,
@@ -6213,12 +6808,55 @@ async def edit_customer(
             "zip": zip.strip() or None,
             "country": country.strip() or "US",
         }
+        before = db.table("customers").select("email, address_line1, address_line2, city, province, zip, country") \
+            .eq("id", customer_id).limit(1).execute().data or [{}]
+        before = before[0]
         db.table("customers").update(record).eq("id", customer_id).execute()
         logger.info(
             f"[CUSTOMER EDIT] Updated customer {customer_id}: T{trimester}, {platform}, "
             f"addr='{address_line1.strip()}' {city.strip()} {province.strip()} {zip.strip()}, daddy={daddy}"
         )
         await log_activity("customer", f"Edited customer {customer_id}", f"T{trimester}, {platform}", "success")
+
+        # Threads 20/21 B7: each box keeps its own ship-to snapshot, so a staff address fix on the
+        # profile must also reach this profile's OPEN boxes (pending, or approved but not yet at
+        # VeraCore) — otherwise the edit would silently stop applying to boxes already queued.
+        addr_keys = ("address_line1", "address_line2", "city", "province", "zip", "country")
+        if any((before.get(k) or None) != (record.get(k) or None) for k in addr_keys):
+            open_boxes = (db.table("decisions").select("id, status, veracore_order_id, ship_to_source")
+                          .eq("customer_id", customer_id).in_("status", ["pending", "approved"])
+                          .execute().data or [])
+            ship_addr = {
+                "ship_address1": record["address_line1"], "ship_address2": record["address_line2"],
+                "ship_city": record["city"], "ship_state": record["province"],
+                "ship_zip": record["zip"], "ship_country": record["country"],
+            }
+            applied, at_vc, manual = [], [], []
+            for box in open_boxes:
+                if box.get("ship_to_source") == "manual":
+                    manual.append(box["id"])
+                elif box["status"] == "approved" and box.get("veracore_order_id"):
+                    at_vc.append(box["id"])
+                else:
+                    db.table("decisions").update(ship_addr).eq("id", box["id"]).execute()
+                    applied.append(box["id"])
+            logger.info("[CUSTOMER EDIT] address change for %s applied to %d open box(es) %s; "
+                        "not changed: %d at VeraCore %s, %d manual %s",
+                        customer_id, len(applied), [a[:8] for a in applied], len(at_vc),
+                        [a[:8] for a in at_vc], len(manual), [m[:8] for m in manual])
+            if applied or at_vc:
+                await log_activity("customer",
+                                   f"Address edit applied to {len(applied)} open box(es) for {before.get('email')}",
+                                   f"{record['address_line1']}, {record['city']} {record['province']} {record['zip']}"
+                                   + (f" — {len(at_vc)} box(es) already at VeraCore NOT changed" if at_vc else ""),
+                                   "warning" if at_vc else "success")
+            msg = f"Saved — address applied to {len(applied)} open box(es)."
+            if at_vc:
+                msg += f" {len(at_vc)} box(es) already sent to VeraCore were NOT changed — update those in VeraCore."
+            if manual:
+                msg += f" {len(manual)} box(es) with a manually set ship-to were left as they are."
+            return RedirectResponse(f"/customers/{customer_id}?msg={quote(msg)}&msg_type={'error' if at_vc else 'success'}",
+                                    status_code=303)
     except Exception as e:
         logger.error(f"[CUSTOMER EDIT] Error: {e}", exc_info=True)
     return RedirectResponse(f"/customers/{customer_id}", status_code=303)
@@ -7183,29 +7821,44 @@ async def test_webhook_cratejoy(request: Request):
 
 # ─── VeraCore submission helper (Phase 3) ───────────────────
 
-def _build_ship_to_from_customer(c: dict) -> dict:
-    """Extract a VeraCore-shaped ship_to block from a customers row."""
+def _build_veracore_ship_to(d: dict, c: dict) -> dict:
+    """VeraCore-shaped ship_to for one decision — address from decision_ship_to() (the box's own
+    snapshot, else the customer row), country normalized to ISO."""
     from veracore_client import normalize_country
-    name = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip() or c.get("email", "")
-    raw_country = c.get("country")
-    normalized_country = normalize_country(raw_country)
+    st = decision_ship_to(d, c)
     ship_to = {
-        "name":     name,
-        "address1": c.get("address_line1", "") or "",
-        "address2": c.get("address_line2", "") or "",
-        "city":     c.get("city", "") or "",
-        "state":    c.get("province", "") or "",
-        "zip":      c.get("zip") or c.get("zip_code", "") or "",
-        "country":  normalized_country,
-        "phone":    c.get("phone", "") or "",
+        "name":     st["name"],
+        "address1": st["address1"],
+        "address2": st["address2"],
+        "city":     st["city"],
+        "state":    st["state"],
+        "zip":      st["zip"],
+        "country":  normalize_country(st["country"]),
+        "phone":    st["phone"],
     }
     logger.info(
-        "[VERACORE SUBMIT] ship_to built — name=%s address1=%s city=%s state=%s zip=%s country=%s (raw=%s)",
+        "[VERACORE SUBMIT] ship_to built — name=%s address1=%s city=%s state=%s zip=%s country=%s (raw=%s, from=%s)",
         ship_to["name"], ship_to["address1"] or "(missing)",
         ship_to["city"], ship_to["state"], ship_to["zip"],
-        ship_to["country"], raw_country,
+        ship_to["country"], st["country"], st["source"],
     )
     return ship_to
+
+
+def veracore_order_id_for(d: dict) -> tuple:
+    """
+    (order_id, rule) for VeraCore — max 20 chars.
+    Cratejoy: the shipment id (unique per box). decisions.order_id is the SUBSCRIPTION id, the
+    same every month of a prepay, so month 2 would reuse month 1's OrderID (Threads 20/21 A7).
+    Others: decisions.order_id (Shopify order id), else OBB-<decision id prefix>.
+    """
+    if d.get("platform") == "cratejoy" and d.get("cratejoy_shipment_id"):
+        raw, rule = str(d["cratejoy_shipment_id"]), "cratejoy_shipment_id"
+    elif d.get("order_id"):
+        raw, rule = str(d["order_id"]), "order_id"
+    else:
+        raw, rule = f"OBB-{str(d.get('id', ''))[:8]}", "decision_id"
+    return raw[:20], rule
 
 
 def get_app_setting(key: str, default: str = "") -> str:
@@ -7311,12 +7964,9 @@ def submit_to_veracore(decision_id: str, batch_ref: Optional[str] = None,
     if vc is None:
         return {"status": "noop", "order_id": None, "error": None}
 
-    ship_to         = _build_ship_to_from_customer(customer)
-
-    # Override ship_to name with recipient's snapshot (gift orders have different first/last than account holder)
-    ship_first = d.get("ship_first_name") or customer.get("first_name", "") or ""
-    ship_last  = d.get("ship_last_name")  or customer.get("last_name", "")  or ""
-    ship_to["name"] = f"{ship_first} {ship_last}".strip() or customer.get("email", "")
+    # The box's own ship-to snapshot (recipient name + address), falling back to the customer row
+    # for decisions created before migration 022 — see decision_ship_to().
+    ship_to         = _build_veracore_ship_to(d, customer)
 
     # Build Ordered By from buyer's billing snapshot.
     # None = self-purchase (Cratejoy or no billing data) → SOAP falls back to ship_to for both blocks.
@@ -7350,14 +8000,11 @@ def submit_to_veracore(decision_id: str, batch_ref: Optional[str] = None,
     is_intl         = ship_to["country"] != "US"
     shipping_method = get_app_setting("veracore_freight_service") or None
     offer_id        = kit.get("veracore_sku") or kit.get("sku")
-    raw_order_id    = d.get("order_id") or f"OBB-{decision_id[:8]}"
-    order_public_id = raw_order_id[:20]  # VeraCore hard limit: 20 chars
-    if len(raw_order_id) > 20:
-        logger.warning("[VERACORE SUBMIT] order_id truncated from %d chars: '%s' → '%s'",
-                       len(raw_order_id), raw_order_id, order_public_id)
+    order_public_id, order_id_rule = veracore_order_id_for(d)  # VeraCore hard limit: 20 chars
+    logger.info("[VERACORE SUBMIT] decision=%s order_id=%s (rule=%s)", decision_id, order_public_id, order_id_rule)
     # Batch grouping (Issue #2): ReferenceNumber = shared run tag, PONumber = Shopify order #.
     reference_number = batch_ref or _make_batch_ref()
-    po_number        = d.get("order_id") or ""   # real Shopify order # ("" for OBB- fallback)
+    po_number        = d.get("order_id") or ""   # Shopify order # / Cratejoy subscription id ("" for OBB- fallback)
     comments        = f"Kit {kit.get('sku','?')} | T{d.get('trimester','?')} | decision {decision_id[:8]}"
 
     logger.info(
@@ -7846,6 +8493,33 @@ async def veracore_sync_expiry_now(request: Request):
                                 status_code=303)
 
 
+# Threads 20/21 — B8: guard against double shipment history (Nicole's duplicate). Duplicate-
+# blocking already prevents the same kit shipping twice to one customer within this window, so
+# a match here is always the same box being shipped twice (e.g. via a race or a stale retry) —
+# reuse it instead of inserting a second shipments row.
+SHIP_DUPLICATE_WINDOW_DAYS = 14
+
+
+def _find_recent_shipment_for_kit(db, customer_id: str, kit_sku) -> Optional[str]:
+    """Return the id of an existing shipment for this customer_id + kit_sku with ship_date
+    within ±SHIP_DUPLICATE_WINDOW_DAYS of today, else None. No kit_sku -> no lookup (nothing
+    to match on)."""
+    if not kit_sku:
+        return None
+    window_start = (date.today() - timedelta(days=SHIP_DUPLICATE_WINDOW_DAYS)).isoformat()
+    window_end = (date.today() + timedelta(days=SHIP_DUPLICATE_WINDOW_DAYS)).isoformat()
+    try:
+        rows = (db.table("shipments").select("id")
+                .eq("customer_id", customer_id).eq("kit_sku", kit_sku)
+                .gte("ship_date", window_start).lte("ship_date", window_end)
+                .order("ship_date", desc=True).limit(1).execute().data or [])
+    except Exception as dup_err:
+        logger.warning("[SHIP] duplicate-shipment lookup failed for customer=%s kit_sku=%s: %s",
+                        customer_id, kit_sku, dup_err)
+        return None
+    return rows[0]["id"] if rows else None
+
+
 @app.post("/decisions/{decision_id}/ship")
 async def ship_decision(request: Request, decision_id: str):
     """
@@ -7892,31 +8566,40 @@ async def ship_decision(request: Request, decision_id: str):
             db.table("shipments").update({"ship_date": date.today().isoformat()}).eq("id", shipment_id).execute()
             logger.info(f"[SHIP] Stamped ship_date on existing draft shipment {shipment_id}")
         else:
-            # Backward compat: decision was approved before this fix — create shipment here
-            shipment_record = {
-                "customer_id": d["customer_id"],
-                "kit_id": d.get("kit_id"),
-                "kit_sku": d.get("kit_sku"),
-                "ship_date": date.today().isoformat(),
-                "trimester_at_ship": d.get("trimester"),
-                "platform": d.get("platform"),
-                "order_id": d.get("order_id"),
-                "notes": f"Auto-created from decision {decision_id[:8]}",
-            }
-            ship_result = db.table("shipments").insert(shipment_record).execute()
-            shipment_id = ship_result.data[0]["id"] if ship_result.data else None
-            logger.info(f"[SHIP] Created new shipment {shipment_id} for decision {decision_id[:8]}")
-            if d.get("kit_id") and shipment_id:
-                kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
-                for ki in (kit_items.data or []):
-                    try:
-                        db.table("shipment_items").insert({
-                            "shipment_id": shipment_id,
-                            "item_id": ki["item_id"],
-                        }).execute()
-                    except Exception as si_err:
-                        logger.warning(f"[SHIP] Could not add shipment_item: {si_err}")
-                logger.info(f"[SHIP] Added {len(kit_items.data or [])} items to shipment")
+            # B8: same customer + kit shipped within the last/next 14 days already? Reuse that
+            # shipment instead of inserting a second one (Nicole's duplicate).
+            dup_shipment_id = _find_recent_shipment_for_kit(db, d["customer_id"], d.get("kit_sku"))
+            if dup_shipment_id:
+                shipment_id = dup_shipment_id
+                db.table("shipments").update({"ship_date": date.today().isoformat()}).eq("id", shipment_id).execute()
+                logger.info(f"[SHIP] reused existing shipment {shipment_id} to avoid duplicate history "
+                            f"(decision {decision_id[:8]})")
+            else:
+                # Backward compat: decision was approved before this fix — create shipment here
+                shipment_record = {
+                    "customer_id": d["customer_id"],
+                    "kit_id": d.get("kit_id"),
+                    "kit_sku": d.get("kit_sku"),
+                    "ship_date": date.today().isoformat(),
+                    "trimester_at_ship": d.get("trimester"),
+                    "platform": d.get("platform"),
+                    "order_id": d.get("order_id"),
+                    "notes": f"Auto-created from decision {decision_id[:8]}",
+                }
+                ship_result = db.table("shipments").insert(shipment_record).execute()
+                shipment_id = ship_result.data[0]["id"] if ship_result.data else None
+                logger.info(f"[SHIP] Created new shipment {shipment_id} for decision {decision_id[:8]}")
+                if d.get("kit_id") and shipment_id:
+                    kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
+                    for ki in (kit_items.data or []):
+                        try:
+                            db.table("shipment_items").insert({
+                                "shipment_id": shipment_id,
+                                "item_id": ki["item_id"],
+                            }).execute()
+                        except Exception as si_err:
+                            logger.warning(f"[SHIP] Could not add shipment_item: {si_err}")
+                    logger.info(f"[SHIP] Added {len(kit_items.data or [])} items to shipment")
 
         cust_email = d.get("customers", {}).get("email", d["customer_id"][:8]) if d.get("customers") else d["customer_id"][:8]
         cust_name = ""
@@ -8624,27 +9307,35 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                         db.table("shipments").update({"ship_date": date.today().isoformat()}).eq("id", existing.data[0]["id"]).execute()
                         logger.info(f"[BULK ACTION] Stamped ship_date on existing draft shipment {existing.data[0]['id'][:8]}")
                     else:
-                        ship_res = db.table("shipments").insert({
-                            "customer_id":      d["customer_id"],
-                            "kit_id":           d.get("kit_id"),
-                            "kit_sku":          d.get("kit_sku"),
-                            "ship_date":        date.today().isoformat(),
-                            "trimester_at_ship": d.get("trimester"),
-                            "platform":         d.get("platform"),
-                            "order_id":         d.get("order_id"),
-                            "notes":            f"Bulk-shipped from decision {did[:8]}",
-                        }).execute()
-                        bulk_ship_id = ship_res.data[0]["id"] if ship_res.data else None
-                        if d.get("kit_id") and bulk_ship_id:
-                            bulk_kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
-                            for ki in (bulk_kit_items.data or []):
-                                try:
-                                    db.table("shipment_items").insert({"shipment_id": bulk_ship_id, "item_id": ki["item_id"]}).execute()
-                                except Exception:
-                                    pass
-                            logger.info(f"[BULK ACTION] Created shipment {bulk_ship_id[:8]} with {len(bulk_kit_items.data or [])} items")
+                        # B8: same customer + kit shipped within the last/next 14 days already?
+                        # Reuse that shipment instead of inserting a second one.
+                        dup_shipment_id = _find_recent_shipment_for_kit(db, d["customer_id"], d.get("kit_sku"))
+                        if dup_shipment_id:
+                            db.table("shipments").update({"ship_date": date.today().isoformat()}).eq("id", dup_shipment_id).execute()
+                            logger.info(f"[BULK ACTION] reused existing shipment {dup_shipment_id} to avoid "
+                                        f"duplicate history (decision {did[:8]})")
                         else:
-                            logger.info(f"[BULK ACTION] Created shipment (no kit_id to populate items)")
+                            ship_res = db.table("shipments").insert({
+                                "customer_id":      d["customer_id"],
+                                "kit_id":           d.get("kit_id"),
+                                "kit_sku":          d.get("kit_sku"),
+                                "ship_date":        date.today().isoformat(),
+                                "trimester_at_ship": d.get("trimester"),
+                                "platform":         d.get("platform"),
+                                "order_id":         d.get("order_id"),
+                                "notes":            f"Bulk-shipped from decision {did[:8]}",
+                            }).execute()
+                            bulk_ship_id = ship_res.data[0]["id"] if ship_res.data else None
+                            if d.get("kit_id") and bulk_ship_id:
+                                bulk_kit_items = db.table("kit_items").select("item_id").eq("kit_id", d["kit_id"]).execute()
+                                for ki in (bulk_kit_items.data or []):
+                                    try:
+                                        db.table("shipment_items").insert({"shipment_id": bulk_ship_id, "item_id": ki["item_id"]}).execute()
+                                    except Exception:
+                                        pass
+                                logger.info(f"[BULK ACTION] Created shipment {bulk_ship_id[:8]} with {len(bulk_kit_items.data or [])} items")
+                            else:
+                                logger.info(f"[BULK ACTION] Created shipment (no kit_id to populate items)")
                     # Queue the Google Sheet sync — see the note on the approve branch above.
                     cust_email_bulk = (d.get("customers") or {}).get("email", did[:8])
                     sheet_sync_queue.append((cust_email_bulk, d.get("order_id", ""), "shipped", "Bulk-shipped"))
@@ -8770,15 +9461,19 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
 @app.post("/decisions/upload-tracking")
 async def upload_tracking(request: Request):
     """
-    Push Pirate Ship tracking back to Shopify so processed orders flip to "Fulfilled"
+    Push Pirate Ship tracking back to Shopify / Cratejoy so processed boxes flip to shipped
     and customers get their tracking email.
 
-    Accepts the Pirate Ship "Export Tracking Data" CSV as multipart form field 'file'.
-    For each row: resolve the Shopify order (by order number, else by email), then create
-    a fulfillment with the tracking number via the Admin API.
-
-    Idempotent / retry-safe: an order with no open fulfillment orders is already fulfilled
-    and is counted as 'already' (no duplicate fulfillment). Returns a JSON summary.
+    Accepts the Pirate Ship "Export Tracking Data" file (.xlsx or .csv) as form field 'file'.
+    Every row is tied to exactly ONE engine decision, then pushed to that decision's exact
+    Shopify order or Cratejoy shipment (Threads 20/21 — THREADS_20_21_FIX_PLAN.md A5):
+      1. tracking already stored on a decision            → 'already' (re-upload = no-op)
+      2. row → candidate decisions: OBB Ref / order id, else email (all recipient profiles)
+      3. more than one candidate → narrow by recipient name → else 'ambiguous' (nothing touched)
+      4. Shopify: fulfill decision.order_id · Cratejoy: the decision's exact shipment, never a
+         future box ('needs_review' when it can't be pinned down)
+      5. on success/already the tracking number is stored on the decision.
+    Returns {summary, details} JSON.
     """
     try:
         sc = get_shopify_client()
@@ -8824,21 +9519,33 @@ async def upload_tracking(request: Request):
             logger.info("[UPLOAD TRACKING] CSV parsed — headers=%s rows=%d notify=%s",
                         headers, len(records), notify)
 
+        # Each header may satisfy only ONE lookup (e.g. "Tracking URL" must not become the
+        # tracking-number column). Exact header match wins over a substring match.
+        used_headers: set = set()
+
         def find_col(cands: list[str]):
-            for h in headers:
-                hl = (h or "").strip().lower()
-                for c in cands:
-                    if c in hl:
+            free = [h for h in headers if h and h not in used_headers]
+            for c in cands:
+                for h in free:
+                    if h.strip().lower() == c:
+                        used_headers.add(h)
+                        return h
+            for c in cands:
+                for h in free:
+                    if c in h.strip().lower():
+                        used_headers.add(h)
                         return h
             return None
 
-        col_track   = find_col(["tracking number", "tracking_no", "tracking #", "tracking"])
-        col_order   = find_col(["order number", "order id", "order #", "order_no", "order", "reference"])
-        col_carrier = find_col(["carrier", "service", "provider"])
-        col_email   = find_col(["email", "e-mail"])
         col_url     = find_col(["tracking url", "tracking link", "url"])
-        logger.info("[UPLOAD TRACKING] columns mapped — track=%s order=%s carrier=%s email=%s url=%s",
-                    col_track, col_order, col_carrier, col_email, col_url)
+        col_track   = find_col(["tracking number", "tracking_no", "tracking #", "tracking"])
+        col_ref     = find_col(["obb ref"])
+        col_order   = find_col(["order id", "order number", "order #", "order_no", "reference", "order"])
+        col_email   = find_col(["email", "e-mail"])
+        col_name    = find_col(["recipient", "full name", "ship to name", "name"])
+        col_carrier = find_col(["carrier", "provider", "service"])
+        logger.info("[UPLOAD TRACKING] columns mapped — track=%s ref=%s order=%s email=%s name=%s carrier=%s url=%s",
+                    col_track, col_ref, col_order, col_email, col_name, col_carrier, col_url)
         if not col_track:
             return JSONResponse(
                 {"error": f"No tracking-number column found. Headers seen: {headers}"},
@@ -8846,64 +9553,196 @@ async def upload_tracking(request: Request):
             )
 
         from shopify_client import normalize_carrier
+        from cratejoy_client import CratejoyError
+        db = get_supabase()
         cj = get_cratejoy_client()
-        summary = {"rows": 0, "fulfilled": 0, "already": 0, "failed": 0, "unmatched": 0}
+        summary = {"rows": 0, "fulfilled": 0, "already": 0, "failed": 0,
+                   "unmatched": 0, "ambiguous": 0, "needs_review": 0}
         details: list[dict] = []
+        # A box whose last update is older than this is a previous month's box, not this upload's.
+        since = (datetime.utcnow() - timedelta(days=21)).isoformat()
+        open_statuses = ["approved", "shipped"]
+        dec_cols = "*, customers(*)"
+
+        def _open_candidates(rows_: list) -> list:
+            return [r for r in (rows_ or [])
+                    if r.get("status") in open_statuses and not r.get("tracking_number")
+                    and (r.get("updated_at") or "") >= since]
+
+        def _cands_by_obb_ref(ref: str) -> list:
+            prefix = ref.strip()[4:12].lower()
+            if not re.fullmatch(r"[0-9a-f]{8}", prefix):
+                return []
+            # decisions.id is a uuid — range on the first group instead of LIKE
+            rows_ = (db.table("decisions").select(dec_cols)
+                     .gte("id", f"{prefix}-0000-0000-0000-000000000000")
+                     .lte("id", f"{prefix}-ffff-ffff-ffff-ffffffffffff")
+                     .execute().data or [])
+            return [r for r in rows_ if r.get("status") in open_statuses]
+
+        def _cands_by_order_ref(ref: str) -> list:
+            oid = ref if ref.isdigit() else (sc.find_order_id_by_name(ref) or "")
+            if not oid:
+                return []
+            by_order = db.table("decisions").select(dec_cols).eq("order_id", oid).execute().data or []
+            by_ship = db.table("decisions").select(dec_cols).eq("cratejoy_shipment_id", oid).execute().data or []
+            seen, out = set(), []
+            for r in by_order + by_ship:
+                if r["id"] not in seen:
+                    seen.add(r["id"])
+                    out.append(r)
+            return _open_candidates(out)
+
+        def _cands_by_email(em: str) -> list:
+            profiles = db.table("customers").select("id").ilike("email", em).execute().data or []
+            ids = [p["id"] for p in profiles]
+            if not ids:
+                return []
+            rows_ = db.table("decisions").select(dec_cols).in_("customer_id", ids).in_("status", open_statuses) \
+                .is_("tracking_number", "null").gte("updated_at", since).execute().data or []
+            return _open_candidates(rows_)
+
+        def _record_tracking(decision_id: str, tracking_no: str) -> None:
+            try:
+                db.table("decisions").update({
+                    "tracking_number": tracking_no,
+                    "tracking_pushed_at": datetime.utcnow().isoformat(),
+                }).eq("id", decision_id).is_("tracking_number", "null").execute()
+            except Exception as rec_err:
+                logger.error("[UPLOAD TRACKING] could not store tracking on decision=%s: %s",
+                             decision_id, rec_err, exc_info=True)
+
+        def _push_cratejoy(d: dict, tracking_no: str, carrier_, url_) -> tuple:
+            """Returns (status, reason). Never touches any box but this decision's own."""
+            if cj is None:
+                return "failed", "Cratejoy client not configured"
+            cust = d.get("customers") or {}
+            try:
+                if d.get("cratejoy_shipment_id"):
+                    shipment = cj.get_shipment(d["cratejoy_shipment_id"])
+                    why = "ok"
+                else:
+                    cj_cid = cust.get("cratejoy_customer_id")
+                    if not cj_cid:
+                        return "needs_review", "customer has no Cratejoy customer id — add tracking by hand"
+                    shipment, why = pick_cratejoy_shipment_for_tracking(
+                        cj.list_customer_shipments(cj_cid), d, date.today())
+            except CratejoyError as e:
+                return "failed", f"Cratejoy lookup failed: {e}"
+            if shipment is None:
+                return "needs_review", f"could not pin the exact Cratejoy box ({why}) — add tracking by hand"
+            if (shipment.get("status") or "").lower() == "shipped":
+                note = "" if (shipment.get("tracking_number") or "") == tracking_no else \
+                    f" (box already has tracking {shipment.get('tracking_number')})"
+                return "already", f"Cratejoy box {shipment['id']} already shipped{note}"
+            try:
+                cj.add_tracking(shipment_id=shipment["id"], tracking_number=tracking_no,
+                                carrier=carrier_, tracking_url=url_ or None)
+            except CratejoyError as e:
+                return "failed", f"Cratejoy add_tracking failed: {e}"
+            if not d.get("cratejoy_shipment_id"):
+                try:
+                    db.table("decisions").update({"cratejoy_shipment_id": str(shipment["id"])}) \
+                        .eq("id", d["id"]).is_("cratejoy_shipment_id", "null").execute()
+                except Exception as link_err:
+                    logger.warning("[UPLOAD TRACKING] could not link shipment %s to decision %s: %s",
+                                   shipment["id"], d["id"], link_err)
+            return "fulfilled", f"Cratejoy box {shipment['id']} marked shipped"
 
         for row in records:
             summary["rows"] += 1
             tracking = (row.get(col_track) or "").strip()
+            ref_val   = (row.get(col_ref) or "").strip() if col_ref else ""
             order_ref = (row.get(col_order) or "").strip() if col_order else ""
-            email     = (row.get(col_email) or "").strip() if col_email else ""
+            email     = (row.get(col_email) or "").strip().lower() if col_email else ""
+            row_name  = (row.get(col_name) or "").strip() if col_name else ""
             carrier   = normalize_carrier(row.get(col_carrier)) if col_carrier else None
             url       = (row.get(col_url) or "").strip() if col_url else ""
-            label     = order_ref or email or f"row{summary['rows']}"
+            if not ref_val and order_ref.upper().startswith("OBB-"):
+                ref_val, order_ref = order_ref, ""
+            label = ref_val or order_ref or email or f"row{summary['rows']}"
+            detail = {"order_ref": label, "tracking": tracking, "recipient": row_name}
+
+            def _finish(status: str, reason: str = "", d: Optional[dict] = None, platform: str = ""):
+                summary[status] += 1
+                detail.update({"status": status, "error": reason, "platform": platform,
+                               "decision_id": (d or {}).get("id"), "customer_id": (d or {}).get("customer_id")})
+                if d and not detail["recipient"]:
+                    detail["recipient"] = decision_ship_to(d, d.get("customers") or {})["name"]
+                details.append(detail)
+                logger.info("[UPLOAD TRACKING] row=%s tracking=%s decision=%s platform=%s → %s %s",
+                            label, tracking, (d or {}).get("id"), platform or "-", status, reason)
 
             if not tracking:
-                summary["unmatched"] += 1
-                details.append({"ref": label, "status": "skipped", "reason": "no tracking number"})
+                _finish("unmatched", "no tracking number")
                 continue
 
-            # Resolve Shopify order id: numeric ref → direct; name → lookup; else email lookup.
-            order_id = None
+            # 1. Idempotency — this tracking number was already recorded on a decision.
             try:
-                if order_ref:
-                    order_id = order_ref if order_ref.isdigit() else sc.find_order_id_by_name(order_ref)
-                if not order_id and email:
-                    order_id = sc.find_order_id_by_email(email)
+                seen_rows = db.table("decisions").select("id, customer_id, platform").eq("tracking_number", tracking) \
+                    .limit(1).execute().data or []
             except Exception as e:
-                logger.warning("[UPLOAD TRACKING] Shopify order resolve failed for %s: %s", label, e)
-
-            if not order_id:
-                # Not a Shopify order — try Cratejoy fallback (email required)
-                if cj and email:
-                    logger.info("[UPLOAD TRACKING] Shopify unmatched for %s — trying Cratejoy", label)
-                    cj_res = cj.mark_tracking_by_email(email, tracking, carrier=carrier,
-                                                       tracking_url=url or None)
-                    cj_st = cj_res.get("status")
-                    summary[cj_st if cj_st in ("fulfilled", "already") else "failed"] += 1
-                    details.append({"ref": label, "tracking": tracking, "status": cj_st,
-                                    "platform": "cratejoy", "error": cj_res.get("error")})
-                else:
-                    summary["unmatched"] += 1
-                    details.append({"ref": label, "tracking": tracking, "status": "unmatched",
-                                    "platform": "shopify", "reason": "no Shopify order found"})
+                _finish("failed", f"DB lookup failed: {e}")
+                continue
+            if seen_rows:
+                _finish("already", "tracking already recorded — nothing changed", seen_rows[0],
+                        seen_rows[0].get("platform") or "")
                 continue
 
-            res = sc.fulfill_order(order_id, tracking_number=tracking, carrier=carrier,
-                                   tracking_url=url or None, notify_customer=notify)
-            st = res.get("status")
-            summary[st if st in ("fulfilled", "already") else "failed"] += 1
-            details.append({"ref": label, "order_id": order_id, "tracking": tracking,
-                            "status": st, "platform": "shopify", "error": res.get("error")})
+            # 2–3. Tie the row to exactly one decision.
+            try:
+                if ref_val:
+                    cands = _cands_by_obb_ref(ref_val)
+                    if len(cands) == 1 and cands[0].get("tracking_number"):
+                        _finish("needs_review", f"box already has tracking {cands[0]['tracking_number']}",
+                                cands[0], cands[0].get("platform") or "")
+                        continue
+                elif order_ref:
+                    cands = _cands_by_order_ref(order_ref)
+                elif email:
+                    cands = _cands_by_email(email)
+                else:
+                    cands = []
+            except Exception as e:
+                logger.warning("[UPLOAD TRACKING] candidate lookup failed for %s: %s", label, e, exc_info=True)
+                _finish("failed", f"lookup failed: {e}")
+                continue
+            d, why = choose_decision_for_tracking_row(cands, row_name)
+            if d is None:
+                reason = ("no approved/shipped box without tracking in the last 21 days" if why == "unmatched"
+                          else f"{len(cands)} open boxes match — add this tracking by hand")
+                _finish(why, reason)
+                continue
+
+            # 4. Push to the platform of that one decision.
+            platform = d.get("platform") or ""
+            if platform == "shopify":
+                if not d.get("order_id"):
+                    _finish("needs_review", "decision has no Shopify order id — add tracking by hand", d, platform)
+                    continue
+                res = sc.fulfill_order(d["order_id"], tracking_number=tracking, carrier=carrier,
+                                       tracking_url=url or None, notify_customer=notify)
+                st = res.get("status")
+                status = st if st in ("fulfilled", "already") else "failed"
+                reason = res.get("error") or ("Shopify order fulfilled" if st == "fulfilled" else "Shopify order already fulfilled")
+            elif platform == "cratejoy":
+                status, reason = _push_cratejoy(d, tracking, carrier, url)
+            else:
+                status, reason = "needs_review", f"unknown platform '{platform}' — add tracking by hand"
+
+            # 5. Remember the tracking so a re-upload is a no-op.
+            if status in ("fulfilled", "already"):
+                _record_tracking(d["id"], tracking)
+            _finish(status, reason, d, platform)
 
         logger.info("[UPLOAD TRACKING] done — %s", summary)
         await log_activity(
             "fulfillment",
-            f"Shopify tracking upload: {summary['fulfilled']} fulfilled, "
-            f"{summary['already']} already, {summary['failed']} failed, {summary['unmatched']} unmatched",
+            f"Tracking upload: {summary['fulfilled']} fulfilled, {summary['already']} already, "
+            f"{summary['failed']} failed, {summary['unmatched']} unmatched, "
+            f"{summary['ambiguous']} ambiguous, {summary['needs_review']} needs review",
             f"rows={summary['rows']}",
-            "success" if summary["failed"] == 0 else "warning",
+            "success" if (summary["failed"] + summary["ambiguous"] + summary["needs_review"]) == 0 else "warning",
         )
         return JSONResponse({"summary": summary, "details": details})
     except Exception as e:
@@ -8998,6 +9837,7 @@ async def export_decisions_csv(request: Request):
             "Weight (oz)", "Length (in)", "Width (in)", "Height (in)",
             # Phase 3 — international customs cols (appended; Pirate Ship ignores unknown cols)
             "Customs Description", "Customs Value", "Customs Quantity", "Customs Country of Origin",
+            "OBB Ref",  # Threads 20/21 A6 — map to Pirate Ship "Order ID" so tracking comes back tied to this box
         ])
         # Defaults confirmed by Sheena on Apr 15 call: ~3 lb (48 oz), 10 × 7.5 × 4 inches
         DEFAULT_WEIGHT_OZ = 48
@@ -9008,10 +9848,11 @@ async def export_decisions_csv(request: Request):
         from veracore_client import normalize_country as _norm_country, build_customs as _build_customs
         for d in rows:
             c    = d.get("customers") or {}
-            ship_first = d.get("ship_first_name") or c.get("first_name") or ""
-            ship_last  = d.get("ship_last_name")  or c.get("last_name")  or ""
-            name = f"{ship_first} {ship_last}".strip()
-            country_iso = _norm_country(c.get("country") or "US")
+            # Ship-to = this box's own snapshot (recipient + address), falling back to the
+            # customer row for pre-migration-022 decisions — decision_ship_to() (Threads 20/21).
+            st = decision_ship_to(d, c)
+            name = st["name"]
+            country_iso = _norm_country(st["country"] or "US")
             is_intl = country_iso != "US"
             if is_intl:
                 # Use kit cost_per_kit if available; else fallback in build_customs defaults.
@@ -9027,13 +9868,13 @@ async def export_decisions_csv(request: Request):
             writer.writerow([
                 name,
                 c.get("email", ""),
-                c.get("address_line1", ""),
-                c.get("address_line2") or "",
-                c.get("city", ""),
-                c.get("province", ""),
-                c.get("zip") or c.get("zip_code", ""),
+                st["address1"],
+                st["address2"],
+                st["city"],
+                st["state"],
+                st["zip"],
                 country_iso,
-                c.get("phone") or "",
+                st["phone"],
                 d.get("order_id", ""),
                 d.get("kit_sku", ""),
                 f"T{d.get('trimester', '')}",
@@ -9045,6 +9886,7 @@ async def export_decisions_csv(request: Request):
                 customs_value,
                 customs_qty,
                 customs_origin,
+                f"OBB-{str(d.get('id', ''))[:8]}",
             ])
 
         output.seek(0)
@@ -9089,6 +9931,7 @@ async def export_decisions_csv_selected(request: Request):
             "Order Number", "Kit SKU", "Trimester",
             "Weight (oz)", "Length (in)", "Width (in)", "Height (in)",
             "Customs Description", "Customs Value", "Customs Quantity", "Customs Country of Origin",
+            "OBB Ref",  # Threads 20/21 A6 — map to Pirate Ship "Order ID" so tracking comes back tied to this box
         ])
         DEFAULT_WEIGHT_OZ = 48
         DEFAULT_LENGTH_IN = 10
@@ -9096,10 +9939,11 @@ async def export_decisions_csv_selected(request: Request):
         DEFAULT_HEIGHT_IN = 4
         for d in rows:
             c = d.get("customers") or {}
-            ship_first = d.get("ship_first_name") or c.get("first_name") or ""
-            ship_last = d.get("ship_last_name") or c.get("last_name") or ""
-            name = f"{ship_first} {ship_last}".strip()
-            country_iso = _norm_country(c.get("country") or "US")
+            # Ship-to = this box's own snapshot (recipient + address), falling back to the
+            # customer row for pre-migration-022 decisions — decision_ship_to() (Threads 20/21).
+            st = decision_ship_to(d, c)
+            name = st["name"]
+            country_iso = _norm_country(st["country"] or "US")
             is_intl = country_iso != "US"
             if is_intl:
                 customs = _build_customs({"cost_per_kit": None})
@@ -9112,18 +9956,19 @@ async def export_decisions_csv_selected(request: Request):
             writer.writerow([
                 name,
                 c.get("email", ""),
-                c.get("address_line1", ""),
-                c.get("address_line2") or "",
-                c.get("city", ""),
-                c.get("province", ""),
-                c.get("zip") or c.get("zip_code", ""),
+                st["address1"],
+                st["address2"],
+                st["city"],
+                st["state"],
+                st["zip"],
                 country_iso,
-                c.get("phone") or "",
+                st["phone"],
                 d.get("order_id", ""),
                 d.get("kit_sku", ""),
                 f"T{d.get('trimester', '')}",
                 DEFAULT_WEIGHT_OZ, DEFAULT_LENGTH_IN, DEFAULT_WIDTH_IN, DEFAULT_HEIGHT_IN,
                 customs_desc, customs_value, customs_qty, customs_origin,
+                f"OBB-{str(d.get('id', ''))[:8]}",
             ])
 
         output.seek(0)
@@ -9183,13 +10028,14 @@ async def export_decisions_veracore_csv(request: Request):
         for d in rows:
             c = d.get("customers") or {}
             k = d.get("kits") or {}
-            ship_first = d.get("ship_first_name") or c.get("first_name") or ""
-            ship_last = d.get("ship_last_name") or c.get("last_name") or ""
-            name = f"{ship_first} {ship_last}".strip() or c.get("email", "")
-            country_iso = _norm_country(c.get("country") or "US")
+            # Ship-to = this box's own snapshot (recipient + address), falling back to the
+            # customer row for pre-migration-022 decisions — decision_ship_to() (Threads 20/21).
+            st = decision_ship_to(d, c)
+            name = st["name"]
+            country_iso = _norm_country(st["country"] or "US")
             is_intl = country_iso != "US"
             offer_id = k.get("veracore_sku") or k.get("sku") or d.get("kit_sku", "")
-            order_public_id = d.get("order_id") or f"OBB-{str(d.get('id', ''))[:8]}"
+            order_public_id, _ = veracore_order_id_for(d)
             if is_intl:
                 customs = _build_customs(k)
                 customs_desc  = customs["description"]
@@ -9200,13 +10046,13 @@ async def export_decisions_veracore_csv(request: Request):
             writer.writerow([
                 order_public_id,
                 name,
-                c.get("address_line1", ""),
-                c.get("address_line2") or "",
-                c.get("city", ""),
-                c.get("province", ""),
-                c.get("zip") or c.get("zip_code", ""),
+                st["address1"],
+                st["address2"],
+                st["city"],
+                st["state"],
+                st["zip"],
                 country_iso,
-                c.get("phone") or "",
+                st["phone"],
                 offer_id,
                 1,
                 _pick_ship(country_iso),
@@ -9311,19 +10157,20 @@ async def export_decisions_sheet(request: Request, background_tasks: BackgroundT
                 sheet_rows = [header]
                 for d in rows_data:
                     c    = d.get("customers") or {}
-                    ship_first = d.get("ship_first_name") or c.get("first_name") or ""
-                    ship_last = d.get("ship_last_name") or c.get("last_name") or ""
-                    name = f"{ship_first} {ship_last}".strip()
+                    # Ship-to = this box's own snapshot (recipient + address), falling back to the
+                    # customer row for pre-migration-022 decisions — decision_ship_to() (Threads 20/21).
+                    st = decision_ship_to(d, c)
+                    name = st["name"]
                     sheet_rows.append([
                         name,
                         c.get("email", ""),
-                        c.get("address_line1", ""),
-                        c.get("address_line2") or "",
-                        c.get("city", ""),
-                        c.get("province", ""),
-                        c.get("zip") or c.get("zip_code", ""),
-                        c.get("country") or "US",
-                        c.get("phone") or "",
+                        st["address1"],
+                        st["address2"],
+                        st["city"],
+                        st["state"],
+                        st["zip"],
+                        st["country"] or "US",
+                        st["phone"],
                         d.get("order_id", ""),
                         d.get("kit_sku", ""),
                         f"T{d.get('trimester', '')}",

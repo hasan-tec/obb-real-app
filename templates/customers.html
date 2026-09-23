@@ -308,7 +308,10 @@
                         <br><small style="color:var(--accent);">🎁 matched box receiver: {{ c._match_recipient }}</small>
                         {% endif %}
                     </td>
-                    <td style="font-size:12px;">{{ c.email }}</td>
+                    <td style="font-size:12px;">
+                        {{ c.email }}
+                        {% if c._recipient_count and c._recipient_count > 1 %}<br><span class="badge badge-dim" style="font-size:10px;">{{ c._recipient_index }} of {{ c._recipient_count }} recipients</span>{% if c.recipient_name %} <small style="color:var(--accent);">→ ships to {{ c.recipient_name }}</small>{% endif %}{% endif %}
+                    </td>
                     <td>
                         {% if c.platform == 'shopify' %}<span class="badge badge-green">Shopify</span>
                         {% elif c.platform == 'cratejoy' %}<span class="badge badge-blue">Cratejoy</span>
@@ -373,7 +376,10 @@
                         <br><small style="color:var(--accent);">🎁 matched box receiver: {{ c._match_recipient }}</small>
                         {% endif %}
                     </td>
-                    <td style="font-size:12px;">{{ c.email }}</td>
+                    <td style="font-size:12px;">
+                        {{ c.email }}
+                        {% if c._recipient_count and c._recipient_count > 1 %}<br><span class="badge badge-dim" style="font-size:10px;">{{ c._recipient_index }} of {{ c._recipient_count }} recipients</span>{% if c.recipient_name %} <small style="color:var(--accent);">→ ships to {{ c.recipient_name }}</small>{% endif %}{% endif %}
+                    </td>
                     <td>
                         {% if c.platform == 'shopify' %}<span class="badge badge-green">Shopify</span>
                         {% elif c.platform == 'cratejoy' %}<span class="badge badge-blue">Cratejoy</span>

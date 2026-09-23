@@ -4,12 +4,15 @@ cratejoy_client.py — Cratejoy Merchant API client (outbound tracking write-bac
 Auth: Basic base64(client_id:client_secret) — same creds as webhook validation.
 Endpoint: https://api.cratejoy.com/v1/
 
-Flow per row from Pirate Ship export:
-  1. find_unshipped_shipment_by_email(email) — GET /v1/shipments/?customer.email__ilike=…&status=unshipped
-  2. add_tracking(shipment_id, …)            — PUT /v1/shipments/{id}/ with status="shipped"
+Flow per row from the Pirate Ship tracking export (see app.upload_tracking):
+  1. the row is tied to ONE engine decision (OBB Ref / order id / email + recipient name)
+  2. list_customer_shipments(cj_customer_id) + app.pick_cratejoy_shipment_for_tracking()
+     choose that decision's EXACT shipment (never "most recent by email")
+  3. add_tracking(shipment_id, …) — PUT /v1/shipments/{id}/ with status="shipped"
 
-Idempotent: the find step filters status=unshipped, so already-shipped rows are excluded
-(counted as 'already'). Re-uploading the same file will NOT re-notify customers.
+Threads 20/21: the old email-based lookup picked "the most recent unshipped shipment", so a
+re-uploaded file marked the customer's NEXT prepaid box shipped (24 future boxes, 21 customers).
+It was removed; idempotency now lives in decisions.tracking_number (migration 022).
 """
 
 from __future__ import annotations
@@ -38,8 +41,8 @@ class CratejoyClient:
 
     Usage:
         cc = CratejoyClient(client_id="...", client_secret="...")
-        result = cc.mark_tracking_by_email("jane@example.com", "1Z...", carrier="UPS")
-        # result: {status: 'fulfilled'|'already'|'unmatched'|'failed', ...}
+        shipments = cc.list_customer_shipments("7093449651")
+        cc.add_tracking(shipment_id=7093457045, tracking_number="9334...", carrier="USPS")
     """
 
     def __init__(self, client_id: str, client_secret: str, timeout: float = 30.0):
@@ -54,71 +57,52 @@ class CratejoyClient:
         return {"Authorization": self._auth_header, "Content-Type": "application/json"}
 
     # ─────────────────────────────────────────────────────────
-    # Find
+    # Read (exact shipments only)
     # ─────────────────────────────────────────────────────────
 
-    def find_unshipped_shipment_by_email(self, email: str) -> Optional[dict]:
-        """
-        Return the unshipped shipment for this email, or None if not found.
-
-        Primary: customer.email__ilike filter on /v1/shipments/ (single call).
-        Fallback: customer lookup -> customer_id -> shipments (two calls) in case
-                  the relation filter misbehaves.
-        If >1 unshipped shipment, pick the most recent by created_at and log a warning.
-        """
-        email = email.strip().lower()
-        logger.info("[CRATEJOY] finding unshipped shipment — email=%s", email)
-
-        # Primary path
+    def get_shipment(self, shipment_id) -> dict:
+        """GET /v1/shipments/{id}/ — the one shipment, or raise CratejoyError."""
+        logger.info("[CRATEJOY] get_shipment shipment=%s", shipment_id)
         try:
-            r = self._http.get(
-                f"{_BASE}/shipments/",
-                headers=self._headers(),
-                params={"customer.email__ilike": email, "status": "unshipped", "limit": 5},
-            )
+            r = self._http.get(f"{_BASE}/shipments/{shipment_id}/", headers=self._headers())
         except httpx.HTTPError as e:
-            raise CratejoyError(f"network error on shipment lookup: {e}") from e
+            raise CratejoyError(f"network error on get_shipment: {e}") from e
         if r.status_code != 200:
-            raise CratejoyError(f"shipment lookup failed: {r.status_code}", r.status_code, r.text)
+            raise CratejoyError(f"get_shipment failed: {r.status_code}", r.status_code, r.text[:300])
+        return r.json()
 
-        results = r.json().get("results") or []
-
-        if not results:
-            # Fallback: look up customer_id then query shipments
-            logger.info("[CRATEJOY] primary filter returned 0 — trying 2-step fallback for email=%s", email)
-            results = self._find_by_customer_id_fallback(email)
-
-        if not results:
-            logger.info("[CRATEJOY] no unshipped shipment found for email=%s", email)
-            return None
-
-        if len(results) > 1:
-            logger.warning("[CRATEJOY] %d unshipped shipments for email=%s — picking most recent",
-                           len(results), email)
-            results = sorted(results, key=lambda s: s.get("created_at") or "", reverse=True)
-
-        return results[0]
-
-    def _find_by_customer_id_fallback(self, email: str) -> list:
-        try:
-            r = self._http.get(
-                f"{_BASE}/customers/",
-                headers=self._headers(),
-                params={"email__ilike": email, "limit": 1},
-            )
-            if r.status_code != 200 or not r.json().get("results"):
-                return []
-            customer_id = r.json()["results"][0]["id"]
-            r2 = self._http.get(
-                f"{_BASE}/shipments/",
-                headers=self._headers(),
-                params={"customer_id": customer_id, "status": "unshipped", "limit": 5},
-            )
-            if r2.status_code != 200:
-                return []
-            return r2.json().get("results") or []
-        except httpx.HTTPError:
-            return []
+    def list_customer_shipments(self, cj_customer_id) -> list[dict]:
+        """
+        GET /v1/shipments/?customer_id={id} — ALL of this Cratejoy customer's shipments
+        (any status, every subscription), following `next` pages. Raises CratejoyError.
+        """
+        logger.info("[CRATEJOY] list_customer_shipments customer=%s", cj_customer_id)
+        url: Optional[str] = f"{_BASE}/shipments/"
+        params: Optional[dict] = {"customer_id": cj_customer_id, "limit": 100}
+        out: list[dict] = []
+        pages = 0
+        while url and pages < 20:  # hard stop — a customer never has 2,000 shipments
+            pages += 1
+            try:
+                r = self._http.get(url, headers=self._headers(), params=params)
+            except httpx.HTTPError as e:
+                raise CratejoyError(f"network error on list_customer_shipments: {e}") from e
+            if r.status_code != 200:
+                raise CratejoyError(f"list_customer_shipments failed: {r.status_code}", r.status_code, r.text[:300])
+            data = r.json()
+            out.extend(data.get("results") or [])
+            nxt = data.get("next")
+            params = None  # `next` already carries the query string
+            if not nxt:
+                url = None
+            elif nxt.startswith("http"):
+                url = nxt
+            elif nxt.startswith("/"):
+                url = "https://api.cratejoy.com" + nxt
+            else:
+                url = f"{_BASE}/shipments/" + nxt
+        logger.info("[CRATEJOY] list_customer_shipments customer=%s → %d shipment(s)", cj_customer_id, len(out))
+        return out
 
     # ─────────────────────────────────────────────────────────
     # Write (tracking)
@@ -160,49 +144,6 @@ class CratejoyClient:
             )
         logger.info("[CRATEJOY] tracking added — shipment=%s status=shipped", shipment_id)
         return r.json()
-
-    # ─────────────────────────────────────────────────────────
-    # Combined helper (used by upload-tracking route)
-    # ─────────────────────────────────────────────────────────
-
-    def mark_tracking_by_email(
-        self,
-        email: str,
-        tracking_number: str,
-        carrier: Optional[str] = None,
-        tracking_url: Optional[str] = None,
-    ) -> dict:
-        """
-        Find the unshipped Cratejoy shipment for `email` and push tracking.
-
-        Returns a dict with the same shape as ShopifyClient.fulfill_order:
-          {status: 'fulfilled'|'already'|'unmatched'|'failed', shipment_id?, error?}
-        """
-        try:
-            shipment = self.find_unshipped_shipment_by_email(email)
-        except CratejoyError as e:
-            logger.error("[CRATEJOY] find failed for email=%s: %s", email, e)
-            return {"status": "failed", "error": str(e)}
-
-        if shipment is None:
-            return {"status": "unmatched"}
-
-        # Belt-and-suspenders: shouldn't happen given the filter
-        if (shipment.get("status") or "").lower() == "shipped":
-            logger.info("[CRATEJOY] shipment %s already shipped — skipping", shipment["id"])
-            return {"status": "already", "shipment_id": shipment["id"]}
-
-        try:
-            self.add_tracking(
-                shipment_id=shipment["id"],
-                tracking_number=tracking_number,
-                carrier=carrier,
-                tracking_url=tracking_url,
-            )
-            return {"status": "fulfilled", "shipment_id": shipment["id"]}
-        except CratejoyError as e:
-            logger.error("[CRATEJOY] add_tracking failed for shipment=%s: %s", shipment["id"], e)
-            return {"status": "failed", "shipment_id": shipment["id"], "error": str(e)}
 
     def close(self):
         try:

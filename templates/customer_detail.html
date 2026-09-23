@@ -28,6 +28,20 @@
     </div>
     {% endif %}
 
+    <!-- Sibling recipient profiles — same purchaser email, different recipient (Threads 20/21). -->
+    {% if sibling_profiles %}
+    <div
+        style="background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+        <span style="font-size: 18px;">👪</span>
+        <div>
+            Purchaser {{ customer.email }} also sends boxes to:
+            {% for sp in sibling_profiles %}
+            <a href="/customers/{{ sp.id }}" style="color:var(--accent);">{{ sp.name }} →</a>{% if not loop.last %},{% endif %}
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
     <!-- Warning banner for missing data (Cratejoy customers without quiz data) -->
     {% if not customer.due_date or not customer.trimester %}
     <div
@@ -215,6 +229,9 @@
                             value="{{ customer.country or 'US' }}"
                             placeholder="e.g. US">
                     </div>
+                </div>
+                <div style="font-size:11px; color:var(--text-dim); margin-top:8px;">
+                    Address changes also apply to this profile's open boxes (pending, or approved but not yet sent to VeraCore).
                 </div>
                 <div style="margin-top: 8px;">
                     <button type="submit" class="btn btn-primary">✓ Save Changes</button>
@@ -616,11 +633,11 @@
                     {% if is_gift_order %}<span class="badge badge-purple" style="font-size:10px; margin-left:6px;">Gift</span>{% endif %}
                 </div>
                 <div style="font-size:12px; color:var(--text-dim); margin-top:10px;">
-                    {{ customer.address_line1 or '' }}{% if customer.address_line2 %}, {{ customer.address_line2 }}{% endif %}<br>
-                    {{ customer.city or '' }}{% if customer.province %}, {{ customer.province }}{% endif %}
-                    {{ customer.zip or '' }}<br>
-                    {{ customer.country or '' }}
-                    {% if customer.phone %}<br>📞 {{ customer.phone }}{% endif %}
+                    {{ latest_ship_to.address1 or '' }}{% if latest_ship_to.address2 %}, {{ latest_ship_to.address2 }}{% endif %}<br>
+                    {{ latest_ship_to.city or '' }}{% if latest_ship_to.state %}, {{ latest_ship_to.state }}{% endif %}
+                    {{ latest_ship_to.zip or '' }}<br>
+                    {{ latest_ship_to.country or '' }}
+                    {% if latest_ship_to.phone %}<br>📞 {{ latest_ship_to.phone }}{% endif %}
                 </div>
                 {% if recipient_history | length > 1 %}
                 <div style="font-size:11px; color:var(--text-dim); margin-top:10px; padding-top:8px; border-top:1px solid var(--border, #2a2f3a);">
