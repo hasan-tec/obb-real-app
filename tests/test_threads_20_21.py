@@ -242,3 +242,5 @@ def test_veracore_order_id_unique_per_cratejoy_box():
     assert veracore_order_id_for(sept)[0] != veracore_order_id_for(octo)[0]
     assert veracore_order_id_for({"id": "b", "platform": "shopify", "order_id": "7548199141665"}) == ("7548199141665", "order_id")
     assert veracore_order_id_for({"id": "68ffd1be-569d", "platform": "cratejoy", "order_id": None}) == ("OBB-68ffd1be", "decision_id")
+    # Cratejoy box without a linked shipment (override/recurate): never the subscription id
+    assert veracore_order_id_for({"id": "541863ce-aaaa", "platform": "cratejoy", "order_id": "7093457035"}) == ("OBB-541863ce", "decision_id")
