@@ -7865,12 +7865,16 @@ def _build_veracore_ship_to(d: dict, c: dict) -> dict:
 def veracore_order_id_for(d: dict) -> tuple:
     """
     (order_id, rule) for VeraCore — max 20 chars.
-    Cratejoy: the shipment id (unique per box). decisions.order_id is the SUBSCRIPTION id, the
-    same every month of a prepay, so month 2 would reuse month 1's OrderID (Threads 20/21 A7).
+    Cratejoy: the shipment id (unique per box), else OBB-<decision id>. decisions.order_id is the
+    SUBSCRIPTION id, the same every month of a prepay, so it must never be the OrderID (A7).
     Others: decisions.order_id (Shopify order id), else OBB-<decision id prefix>.
     """
     if d.get("platform") == "cratejoy" and d.get("cratejoy_shipment_id"):
         raw, rule = str(d["cratejoy_shipment_id"]), "cratejoy_shipment_id"
+    elif d.get("platform") == "cratejoy":
+        # No shipment linked (override / recurate / older box): the subscription id would repeat
+        # an OrderID VeraCore already has (14 open boxes on 2026-09-24) — use the decision id.
+        raw, rule = f"OBB-{str(d.get('id', ''))[:8]}", "decision_id"
     elif d.get("order_id"):
         raw, rule = str(d["order_id"]), "order_id"
     else:
