@@ -3225,6 +3225,12 @@ async def shopify_customer_webhook(request: Request):
 #   - Never creates a customer (no ghosts) and never creates a decision.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _ship_to_key(st: dict) -> tuple:
+    """Comparable form of a decision_ship_to() result (case/space-insensitive)."""
+    return tuple(" ".join(str(st.get(k) or "").lower().split())
+                 for k in ("name", "address1", "address2", "city", "state", "zip"))
+
+
 async def _sync_order_ship_to_from_shopify(db, shopify_order_id: str, shipping: dict, ship_name: str,
                                           cust_row: dict, changes: list) -> None:
     """
@@ -3250,18 +3256,29 @@ async def _sync_order_ship_to_from_shopify(db, shopify_order_id: str, shipping: 
                       if k != "ship_to_source" and (box.get(k) or None) != (v or None))
         if not diff:
             continue
-        old_to = f"{box.get('ship_first_name') or ''} {box.get('ship_last_name') or ''}".strip()
+        # Compare where the box EFFECTIVELY ships (its snapshot, else the profile address) with
+        # Shopify — a box that simply never had a snapshot (e.g. shipped before migration 022) is
+        # not a change. Only a real name/address difference is logged or warned about.
+        current = decision_ship_to(box, cust_row)
         new_to = decision_ship_to({**box, **ship_cols}, cust_row)
+        real_change = _ship_to_key(current) != _ship_to_key(new_to)
+        old_to = f"{current['name']}, {current['address1']}, {current['city']} {current['state']} {current['zip']}"
         new_line = f"{new_to['name']}, {new_to['address1']}, {new_to['city']} {new_to['state']} {new_to['zip']}"
         editable = box["status"] == "pending" or (box["status"] == "approved" and not box.get("veracore_order_id"))
         if editable:
             db.table("decisions").update(ship_cols).eq("id", box["id"]).execute()
+            if not real_change:
+                logger.info("[SHOPIFY ORDER UPDATED] decision=%s ship-to snapshot filled (no change): %s",
+                            box["id"], new_line)
+                continue
             logger.info("[SHOPIFY ORDER UPDATED] ship-to synced decision=%s order=%s fields=%s: %s → %s",
                         box["id"], shopify_order_id, diff, old_to, new_line)
             changes.append(f"box {box['id'][:8]} ship-to → {new_line}")
             await log_activity("decision", f"Ship-to updated from Shopify for {cust_row.get('email')}",
                                f"decision {box['id'][:8]}: {old_to} → {new_line}", "success")
             continue
+        if not real_change:
+            continue  # shipped box, same effective ship-to — nothing to flag
         warn = f"Ship-to changed in Shopify after approval — decision {box['id'][:8]}"
         logger.warning("[SHOPIFY ORDER UPDATED] %s (status=%s veracore=%s) — not changed; Shopify now: %s",
                        warn, box["status"], box.get("veracore_order_id"), new_line)

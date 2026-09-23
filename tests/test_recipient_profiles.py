@@ -283,3 +283,25 @@ def test_order_edit_updates_pending_box_and_flags_shipped_box(monkeypatch):
                                       "created_at": "2099-01-01T00:00:00"})
     asyncio.run(appmod._sync_order_ship_to_from_shopify(db, "7548199141665", kailin, "Kailin Goldstein", cust, []))
     assert len(log.calls) == n_logs
+
+
+def test_order_edit_no_false_alarm_for_unsnapshotted_boxes(monkeypatch):
+    # Production 2026-09-23 (morganwoodlpn84): shipped boxes from before migration 022 have no
+    # address snapshot; Shopify re-sent the SAME address. That is not a change — no warning.
+    log = _no_log(monkeypatch)
+    db = FakeDB(activity_log=[], decisions=[
+        {"id": "dd120666-shipped", "order_id": "7537763713313", "status": "shipped", "veracore_order_id": None,
+         "ship_to_source": None, "ship_first_name": "Bailey", "ship_last_name": "Wood"},
+        {"id": "eeeeeeee-pending", "order_id": "7537763713313", "status": "pending", "veracore_order_id": None,
+         "ship_to_source": None, "ship_first_name": "Bailey", "ship_last_name": "Wood"},
+    ])
+    cust = {"email": "morganwoodlpn84@gmail.com", "first_name": "Morgan", "last_name": "Wood",
+            "address_line1": "421 Meadow Lake Cir", "city": "Searcy", "province": "Arkansas", "zip": "72143"}
+    same = {"first_name": "Bailey", "last_name": "Wood", "address1": "421 Meadow Lake Cir", "city": "Searcy",
+            "province": "Arkansas", "zip": "72143", "country_code": "US"}
+    changes = []
+    asyncio.run(appmod._sync_order_ship_to_from_shopify(db, "7537763713313", same, "Bailey Wood", cust, changes))
+    assert log.calls == [] and changes == []                                  # no warning, no "updated" noise
+    boxes = {d["id"]: d for d in db.tables["decisions"]}
+    assert boxes["dd120666-shipped"].get("ship_address1") is None             # shipped box untouched
+    assert boxes["eeeeeeee-pending"]["ship_address1"] == "421 Meadow Lake Cir"  # open box snapshot filled quietly
