@@ -646,6 +646,8 @@ def _cj_shipment_ship_date(shipment: dict):
 # Never attach tracking to a Cratejoy box due further ahead than this (a prepay's future
 # months share one created_at, which is how "most recent unshipped" marked Oct/Nov boxes).
 CJ_TRACKING_MAX_LEAD_DAYS = 10
+# A tracking row can only belong to a box dated within this many days (box date = decision ship_date).
+TRACKING_BOX_WINDOW_DAYS = 45
 
 
 def norm_name(s) -> str:
@@ -805,21 +807,27 @@ def pick_cratejoy_shipment_for_tracking(shipments: list, decision: dict, today: 
 def choose_decision_for_tracking_row(candidates: list, recipient_name: str) -> tuple:
     """
     Tie one tracking-file row to exactly one decision (each candidate has an embedded
-    `customers` dict). 0 -> (None, "unmatched"); 1 -> (it, "ok"); several -> keep only those
-    whose ship-to name equals recipient_name (norm_name); exactly one left -> ok, else "ambiguous".
+    `customers` dict). 0 -> (None, "unmatched"); several -> keep only those whose ship-to name
+    equals recipient_name (norm_name, when given); one left -> ok; several left but all on the
+    SAME profile -> the newest box (ship_date, created_at); several profiles -> "ambiguous".
     """
     candidates = candidates or []
     if not candidates:
         return None, "unmatched"
+    want = norm_name(recipient_name)
+    if want and len(candidates) > 1:
+        candidates = [d for d in candidates
+                      if norm_name(decision_ship_to(d, d.get("customers") or {})["name"]) == want]
+        if not candidates:
+            return None, "ambiguous"
     if len(candidates) == 1:
         return candidates[0], "ok"
-    want = norm_name(recipient_name)
-    if not want:
-        return None, "ambiguous"
-    hits = [d for d in candidates
-            if norm_name(decision_ship_to(d, d.get("customers") or {})["name"]) == want]
-    if len(hits) == 1:
-        return hits[0], "ok"
+    # Several open boxes for ONE recipient profile (e.g. last month's box shipped before tracking
+    # was recorded + this month's box): the label just printed is for the newest box. Boxes that
+    # belong to DIFFERENT profiles are never guessed between.
+    if len({d.get("customer_id") for d in candidates}) == 1:
+        newest = max(candidates, key=lambda d: (str(d.get("ship_date") or ""), str(d.get("created_at") or "")))
+        return newest, "ok"
     return None, "ambiguous"
 
 
@@ -9581,14 +9589,17 @@ async def upload_tracking(request: Request):
                    "unmatched": 0, "ambiguous": 0, "needs_review": 0}
         details: list[dict] = []
         # A box whose last update is older than this is a previous month's box, not this upload's.
-        since = (datetime.utcnow() - timedelta(days=21)).isoformat()
+        # "Recent" = the box's OWN date (ship_date is set when the decision is created, i.e. the box
+        # month). updated_at is NOT used: bookkeeping (profile splits, backfills, reconcile) bumps it
+        # and made last month's already-shipped boxes look new.
+        since = (date.today() - timedelta(days=TRACKING_BOX_WINDOW_DAYS)).isoformat()
         open_statuses = ["approved", "shipped"]
         dec_cols = "*, customers(*)"
 
         def _open_candidates(rows_: list) -> list:
             return [r for r in (rows_ or [])
                     if r.get("status") in open_statuses and not r.get("tracking_number")
-                    and (r.get("updated_at") or "") >= since]
+                    and str(r.get("ship_date") or r.get("created_at") or "")[:10] >= since]
 
         def _cands_by_obb_ref(ref: str) -> list:
             prefix = ref.strip()[4:12].lower()
@@ -9620,7 +9631,7 @@ async def upload_tracking(request: Request):
             if not ids:
                 return []
             rows_ = db.table("decisions").select(dec_cols).in_("customer_id", ids).in_("status", open_statuses) \
-                .is_("tracking_number", "null").gte("updated_at", since).execute().data or []
+                .is_("tracking_number", "null").gte("ship_date", since).execute().data or []
             return _open_candidates(rows_)
 
         def _record_tracking(decision_id: str, tracking_no: str) -> None:
@@ -9653,9 +9664,12 @@ async def upload_tracking(request: Request):
             if shipment is None:
                 return "needs_review", f"could not pin the exact Cratejoy box ({why}) — add tracking by hand"
             if (shipment.get("status") or "").lower() == "shipped":
-                note = "" if (shipment.get("tracking_number") or "") == tracking_no else \
-                    f" (box already has tracking {shipment.get('tracking_number')})"
-                return "already", f"Cratejoy box {shipment['id']} already shipped{note}"
+                if (shipment.get("tracking_number") or "") in ("", tracking_no):
+                    return "already", f"Cratejoy box {shipment['id']} already shipped"
+                # Shipped with a DIFFERENT tracking number: this row is not for that box (or the box
+                # was re-labelled). Never overwrite and never record it — a person must look.
+                return "needs_review", (f"Cratejoy box {shipment['id']} already shipped with tracking "
+                                        f"{shipment.get('tracking_number')} — check which box this label is for")
             try:
                 cj.add_tracking(shipment_id=shipment["id"], tracking_number=tracking_no,
                                 carrier=carrier_, tracking_url=url_ or None)
@@ -9730,7 +9744,7 @@ async def upload_tracking(request: Request):
                 continue
             d, why = choose_decision_for_tracking_row(cands, row_name)
             if d is None:
-                reason = ("no approved/shipped box without tracking in the last 21 days" if why == "unmatched"
+                reason = (f"no approved/shipped box without tracking in the last {TRACKING_BOX_WINDOW_DAYS} days" if why == "unmatched"
                           else f"{len(cands)} open boxes match — add this tracking by hand")
                 _finish(why, reason)
                 continue

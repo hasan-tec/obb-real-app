@@ -121,6 +121,10 @@ def _recent():
     return (datetime.utcnow() - timedelta(hours=2)).isoformat()
 
 
+def _today():
+    return datetime.utcnow().date().isoformat()
+
+
 def _box(sid, sub, target, status="unshipped", cj_cid="7093449651"):
     return {"id": int(sid), "status": status, "target_at": target, "customer_id": cj_cid,
             "created_at": "2026-09-09T16:13:57-07:00", "tracking_number": None,
@@ -162,7 +166,7 @@ def _bednarfive_world():
     decisions = [{"id": "0069318c-03cb-4489-bfeb-5bc1f8509d58", "customer_id": "c-leah", "platform": "cratejoy",
                   "status": "shipped", "order_id": "7093457035", "cratejoy_shipment_id": "7093457045",
                   "ship_first_name": "Leah", "ship_last_name": "Hudson", "tracking_number": None,
-                  "updated_at": _recent()}]
+                  "updated_at": _recent(), "ship_date": _today()}]
     boxes = [_box(7093457045, 7093457035, "2026-09-09T23:08:36Z"),   # Leah Sept
              _box(7093457046, 7093457035, "2026-10-01T07:00:00Z"),   # Leah Oct
              _box(7093458562, 7093458554, "2026-09-09T23:13:57Z"),   # Lana Sept
@@ -208,7 +212,7 @@ def test_two_open_boxes_same_email_without_name_is_ambiguous_and_touches_nothing
     db.tables["decisions"].append({"id": "11111111-0000-0000-0000-000000000000", "customer_id": "c-lana",
                                    "platform": "cratejoy", "status": "shipped", "order_id": "7093458554",
                                    "cratejoy_shipment_id": "7093458562", "ship_first_name": "Lana",
-                                   "ship_last_name": "Bain", "tracking_number": None, "updated_at": _recent()})
+                                   "ship_last_name": "Bain", "tracking_number": None, "updated_at": _recent(), "ship_date": _today()})
     out = _upload(monkeypatch, db, cj, FakeShopify(), "Email,Tracking Number\nbednarfive@gmail.com,TRK9\n")
     assert out["summary"]["ambiguous"] == 1
     assert cj.add_calls == []
@@ -221,7 +225,7 @@ def test_shopify_row_uses_decision_order_and_reupload_is_noop(monkeypatch):
     customers = [{"id": "c-n", "email": "nicgoldstein@goldsteinus.net", "first_name": "Nicole", "last_name": "Goldstein"}]
     decisions = [{"id": "68ffd1be-569d-4c29-b955-7847955567bf", "customer_id": "c-n", "platform": "shopify",
                   "status": "shipped", "order_id": "7548199141665", "ship_first_name": "Kailin",
-                  "ship_last_name": "Goldstein", "tracking_number": None, "updated_at": _recent()}]
+                  "ship_last_name": "Goldstein", "tracking_number": None, "updated_at": _recent(), "ship_date": _today()}]
     db, sc = FakeDB(customers, decisions), FakeShopify()
     csv_text = CSV_HEADER + "Kailin Goldstein,nicgoldstein@goldsteinus.net,9400TRK\n"
     assert _upload(monkeypatch, db, None, sc, csv_text)["summary"]["fulfilled"] == 1
@@ -240,7 +244,7 @@ def test_obb_ref_in_order_id_column_matches_exact_box(monkeypatch):
 
 def test_old_box_outside_window_is_unmatched(monkeypatch):
     db, cj = _bednarfive_world()
-    db.tables["decisions"][0]["updated_at"] = (datetime.utcnow() - timedelta(days=40)).isoformat()
+    db.tables["decisions"][0]["ship_date"] = (datetime.utcnow() - timedelta(days=60)).date().isoformat()
     out = _upload(monkeypatch, db, cj, FakeShopify(), CSV_HEADER + "Leah Hudson,bednarfive@gmail.com,TRKOLD\n")
     assert out["summary"]["unmatched"] == 1 and cj.add_calls == []
 
@@ -250,3 +254,27 @@ def test_tracking_url_column_is_not_mistaken_for_tracking_number(monkeypatch):
     out = _upload(monkeypatch, db, cj, FakeShopify(),
                   "Tracking URL,Name,Email,Tracking Number\nhttps://t/x,Leah Hudson,bednarfive@gmail.com,TRKU\n")
     assert cj.add_calls == [("7093457045", "TRKU")] and out["summary"]["fulfilled"] == 1
+
+
+
+def test_same_recipient_old_unrecorded_box_does_not_block_new_box(monkeypatch):
+    # Found in the post-deploy simulation on real data: last month's shipped box has no tracking
+    # recorded (recording started 2026-09-23) and a bookkeeping update bumped its updated_at.
+    # The new label belongs to the NEWEST box of that recipient — not "ambiguous".
+    db, cj = _bednarfive_world()
+    old_box = dict(db.tables["decisions"][0])
+    old_box.update({"id": "0aaaaaaa-0000-0000-0000-000000000000", "cratejoy_shipment_id": "7093457044",
+                    "ship_date": (datetime.utcnow() - timedelta(days=30)).date().isoformat(),
+                    "updated_at": _recent()})                                 # bumped by bookkeeping
+    db.tables["decisions"].append(old_box)
+    out = _upload(monkeypatch, db, cj, FakeShopify(), CSV_HEADER + "Leah Hudson,bednarfive@gmail.com,TRK-NEW\n")
+    assert out["summary"]["fulfilled"] == 1
+    assert cj.add_calls == [("7093457045", "TRK-NEW")]                       # the newest box's own shipment
+
+
+def test_cratejoy_box_already_shipped_with_other_tracking_needs_review(monkeypatch):
+    db, cj = _bednarfive_world()
+    cj.shipments["7093457045"].update({"status": "shipped", "tracking_number": "9334611043900211332504"})
+    out = _upload(monkeypatch, db, cj, FakeShopify(), CSV_HEADER + "Leah Hudson,bednarfive@gmail.com,TRK-OTHER\n")
+    assert out["summary"]["needs_review"] == 1 and cj.add_calls == []
+    assert db.tables["decisions"][0]["tracking_number"] is None          # nothing recorded

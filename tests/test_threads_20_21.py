@@ -150,8 +150,9 @@ def test_pick_skips_already_shipped_in_rule_2():
 
 # ─── choose_decision_for_tracking_row ───
 
-def _dec(did, first, last):
-    return {"id": did, "ship_first_name": first, "ship_last_name": last, "customers": {"email": "x@y.z"}}
+def _dec(did, first, last, customer_id=None, ship_date="2026-09-01"):
+    return {"id": did, "ship_first_name": first, "ship_last_name": last, "customers": {"email": "x@y.z"},
+            "customer_id": customer_id or f"cust-{first}", "ship_date": ship_date}
 
 
 def test_choose_decision_counts_and_names():
@@ -161,6 +162,15 @@ def test_choose_decision_counts_and_names():
     assert choose_decision_for_tracking_row([leah, lana], "lana  bain") == (lana, "ok")
     assert choose_decision_for_tracking_row([leah, lana], "") == (None, "ambiguous")
     assert choose_decision_for_tracking_row([leah, lana], "Someone Else") == (None, "ambiguous")
+
+
+def test_choose_decision_same_profile_takes_newest_box():
+    aug = _dec("aug", "Leah", "Hudson", customer_id="c1", ship_date="2026-08-09")
+    sep = _dec("sep", "Leah", "Hudson", customer_id="c1", ship_date="2026-09-09")
+    lana = _dec("lana", "Lana", "Bain", customer_id="c2", ship_date="2026-09-09")
+    assert choose_decision_for_tracking_row([aug, sep], "") == (sep, "ok")          # one profile, no name
+    assert choose_decision_for_tracking_row([aug, sep, lana], "Leah Hudson") == (sep, "ok")
+    assert choose_decision_for_tracking_row([aug, sep, lana], "") == (None, "ambiguous")  # two profiles
 
 
 # ─── recipient refs ───
