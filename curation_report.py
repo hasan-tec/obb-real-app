@@ -338,7 +338,7 @@ def load_renewal_pool(db, ship_date: date, include_paused: bool = False, recency
     for status in valid_statuses:
         customers = _paginate_all(
             db.table("customers")
-            .select("id, email, first_name, last_name, due_date, clothing_size, subscription_status, platform")
+            .select("id, email, first_name, last_name, recipient_name, due_date, clothing_size, subscription_status, platform")
             .eq("subscription_status", status)
             .not_.is_("due_date", "null")
         )
@@ -475,7 +475,7 @@ def load_renewal_pool_from_decisions(
 
     customers = _paginate_all(
         db.table("customers")
-        .select("id, email, first_name, last_name, due_date, clothing_size, subscription_status, platform")
+        .select("id, email, first_name, last_name, recipient_name, due_date, clothing_size, subscription_status, platform")
         .not_.is_("due_date", "null")
         .in_("subscription_status", ["active", "cancelled-prepaid"])
     )
@@ -1211,6 +1211,8 @@ def run_monthly_report(
                 "email": cust.get("email"),
                 "first_name": cust.get("first_name"),
                 "last_name": cust.get("last_name"),
+                # Threads 20/21: one profile per recipient — show who this profile's boxes go to
+                "recipient_name": cust.get("recipient_name"),
                 "clothing_size": cust.get("clothing_size"),
                 "platform": cust.get("platform"),
                 "projected_trimester": tri,

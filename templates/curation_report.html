@@ -438,7 +438,7 @@
                 <tbody>
                     {% for c in covered %}
                     <tr>
-                        <td><strong>{{ c.first_name }} {{ c.last_name }}</strong></td>
+                        <td><strong>{{ c.first_name }} {{ c.last_name }}</strong>{% if c.recipient_name and c.recipient_name|lower != ((c.first_name or '') ~ ' ' ~ (c.last_name or ''))|trim|lower %}<br><small style="color:var(--accent);">→ ships to {{ c.recipient_name }}</small>{% endif %}</td>
                         <td style="font-size: 0.85em; color: var(--text-dim);">{{ c.email }}</td>
                         <td>
                             {% if c.platform == 'shopify' %}
@@ -487,7 +487,7 @@
                 <tbody>
                     {% for c in needs %}
                     <tr>
-                        <td><strong>{{ c.first_name }} {{ c.last_name }}</strong></td>
+                        <td><strong>{{ c.first_name }} {{ c.last_name }}</strong>{% if c.recipient_name and c.recipient_name|lower != ((c.first_name or '') ~ ' ' ~ (c.last_name or ''))|trim|lower %}<br><small style="color:var(--accent);">→ ships to {{ c.recipient_name }}</small>{% endif %}</td>
                         <td style="font-size: 0.85em; color: var(--text-dim);">{{ c.email }}</td>
                         <td>
                             {% if c.platform == 'shopify' %}

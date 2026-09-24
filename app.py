@@ -6484,7 +6484,7 @@ async def view_curation_report(request: Request, run_id: str, msg: str = "", msg
         cust_rows = []
         offset = 0
         while True:
-            batch = db.table("curation_run_customers").select("*, customers(email, first_name, last_name, clothing_size, platform)").eq("run_id", run_id).range(offset, offset + 999).execute()
+            batch = db.table("curation_run_customers").select("*, customers(email, first_name, last_name, recipient_name, clothing_size, platform)").eq("run_id", run_id).range(offset, offset + 999).execute()
             cust_rows.extend(batch.data or [])
             if len(batch.data or []) < 1000:
                 break
@@ -6568,6 +6568,7 @@ async def view_curation_report(request: Request, run_id: str, msg: str = "", msg
                         "customer_id": cr["customer_id"],
                         "email": cust_info.get("email", ""),
                         "first_name": cust_info.get("first_name", ""),
+                        "recipient_name": cust_info.get("recipient_name"),
                         "last_name": cust_info.get("last_name", ""),
                         "clothing_size": cust_info.get("clothing_size"),
                         "platform": cust_info.get("platform", ""),
@@ -9519,6 +9520,8 @@ async def upload_tracking(request: Request):
         if upload is None or not hasattr(upload, "read"):
             return JSONResponse({"error": "No file uploaded (multipart form field 'file')"}, status_code=400)
         notify = (form.get("notify", "1").strip() != "0")  # default: email the customer
+        logger.info("[UPLOAD TRACKING] file=%s uploaded_by=%s", getattr(upload, "filename", "") or "?",
+                    getattr(request.state, "user_email", "") or "?")
 
         raw = await upload.read()
         filename = (getattr(upload, "filename", "") or "").lower()
@@ -9776,7 +9779,8 @@ async def upload_tracking(request: Request):
             f"Tracking upload: {summary['fulfilled']} fulfilled, {summary['already']} already, "
             f"{summary['failed']} failed, {summary['unmatched']} unmatched, "
             f"{summary['ambiguous']} ambiguous, {summary['needs_review']} needs review",
-            f"rows={summary['rows']}",
+            f"rows={summary['rows']} file={getattr(upload, 'filename', '') or '?'} "
+            f"uploaded_by={getattr(request.state, 'user_email', '') or '?'}",
             "success" if (summary["failed"] + summary["ambiguous"] + summary["needs_review"]) == 0 else "warning",
         )
         return JSONResponse({"summary": summary, "details": details})
@@ -10253,7 +10257,7 @@ async def export_curation_report_sheet(request: Request, run_id: str, background
         cust_rows = []
         offset = 0
         while True:
-            batch = db.table("curation_run_customers").select("*, customers(email, first_name, last_name, clothing_size, platform)").eq("run_id", run_id).range(offset, offset + 999).execute()
+            batch = db.table("curation_run_customers").select("*, customers(email, first_name, last_name, recipient_name, clothing_size, platform)").eq("run_id", run_id).range(offset, offset + 999).execute()
             cust_rows.extend(batch.data or [])
             if len(batch.data or []) < 1000:
                 break
