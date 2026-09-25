@@ -607,7 +607,11 @@
         fd.append('file', file);
 
         fetch('/decisions/upload-tracking', { method: 'POST', body: fd })
-            .then(function(r) { return r.json(); })
+            .then(function(r) {
+                // Large files can outlive Heroku's 30s request limit: the browser gets an HTML error
+                // page while the server keeps going and finishes the upload. Never tell staff it failed.
+                return r.json().catch(function() { throw new Error('still_processing'); });
+            })
             .then(function(data) {
                 if (btn) { btn.innerHTML = origText; btn.disabled = false; }
                 var s = data.summary || {};
@@ -648,7 +652,10 @@
             })
             .catch(function(err) {
                 if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-                document.getElementById('trackingModalBody').innerHTML = '<span style="color:#dc2626;">Upload failed: ' + err + '</span>';
+                document.getElementById('trackingModalBody').innerHTML =
+                    '<div style="color:var(--yellow,#ca8a04);font-weight:600;margin-bottom:8px;">The server is still working on this file. Please do NOT upload it again.</div>' +
+                    '<div style="color:var(--text-dim);">Large files take longer than the page waits. The upload keeps running and usually finishes within 1–2 minutes. ' +
+                    'Check <a href="/activity">Activity</a> for the "tracking upload" entry to see the result.</div>';
                 document.getElementById('trackingModal').style.display = 'flex';
             });
     }
