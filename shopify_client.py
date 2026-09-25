@@ -222,6 +222,39 @@ class ShopifyClient:
         logger.info("[SHOPIFY] on-hold order sweep — pages=%d found=%d", pages, len(ids))
         return ids
 
+    def get_cancelled_orders(self, max_pages: int = 20) -> dict[str, dict]:
+        """
+        Return every cancelled order Shopify will show us, keyed by numeric order id:
+        {id: {"name": "#OBB-14670", "cancelled_at": ISO str, "cancel_reason": "CUSTOMER"}}.
+
+        Same one-search pattern as get_on_hold_order_ids. The app has no read_all_orders scope,
+        so Shopify only returns orders from roughly the last 60 days — the orders/updated webhook
+        is the real-time source and scripts/backfill_shopify_cancellations.py covers history.
+        """
+        orders: dict[str, dict] = {}
+        cursor: Optional[str] = None
+        pages = 0
+        while pages < max_pages:
+            q = ("query($c:String){orders(first:250,after:$c,query:\"status:cancelled\","
+                 "sortKey:UPDATED_AT,reverse:true)"
+                 "{pageInfo{hasNextPage endCursor}nodes{id name cancelledAt cancelReason}}}")
+            data = self._graphql(q, {"c": cursor}).get("orders") or {}
+            for n in data.get("nodes") or []:
+                if not n.get("cancelledAt"):
+                    continue
+                orders[n["id"].rsplit("/", 1)[-1]] = {
+                    "name": n.get("name"),
+                    "cancelled_at": n.get("cancelledAt"),
+                    "cancel_reason": n.get("cancelReason"),
+                }
+            pages += 1
+            page_info = data.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+        logger.info("[SHOPIFY] cancelled order sweep — pages=%d found=%d", pages, len(orders))
+        return orders
+
     def fulfill_order(
         self,
         order_numeric_id: str,

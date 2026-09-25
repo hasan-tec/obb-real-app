@@ -1577,6 +1577,127 @@ async def cratejoy_daily_reconcile(db, dry_run: bool = False) -> dict:
 _SHOPIFY_OPEN_FO_STATES = {"OPEN", "IN_PROGRESS", "SCHEDULED"}
 
 
+# ─── Shopify order cancellations (CANCELLATION_SYNC_PLAN.md) ───
+
+def _order_cancelled_at(db, order_id) -> Optional[str]:
+    """
+    When the Shopify order `order_id` was cancelled, or None if it isn't marked cancelled.
+
+    Reads decisions.order_cancelled_at (migration 023), which is stamped on every decision of a
+    cancelled order whatever its status — so an order whose box already shipped before the
+    cancellation is still recognised. One indexed lookup on decisions.order_id.
+
+    Fail-open: on any error (including running before migration 023 is applied) it logs and
+    returns None, keeping today's behaviour instead of blocking legitimate work.
+    """
+    if not order_id:
+        return None
+    try:
+        rows = (db.table("decisions").select("order_cancelled_at")
+                .eq("order_id", str(order_id))
+                .not_.is_("order_cancelled_at", "null")
+                .limit(1).execute().data or [])
+    except Exception as e:
+        logger.error("[CANCEL SYNC] cancellation lookup failed for order=%s — treating as not cancelled: %s",
+                     order_id, e)
+        return None
+    return rows[0]["order_cancelled_at"] if rows else None
+
+
+def _shopify_cancel_reason_text(order_name: Optional[str], cancelled_at: Optional[str],
+                                cancel_reason: Optional[str], source: str) -> str:
+    """Reason written onto a pending decision closed because its Shopify order was cancelled.
+    Must start with 'Auto-rejected:' — get_rejected_kit_map skips that prefix, so a cancellation
+    never blacklists the kit on the customer's next re-curate."""
+    order_label = f"Shopify order {order_name}" if order_name else "Shopify order"
+    day = (cancelled_at or "")[:10] or "unknown date"
+    why = (cancel_reason or "no reason given").lower()
+    return f"Auto-rejected: {order_label} cancelled {day} ({why}) — {source}."
+
+
+async def _apply_shopify_cancellation(db, order_id, order_name: Optional[str], cancelled_at: Optional[str],
+                                      cancel_reason: Optional[str], source: str,
+                                      dry_run: bool = False) -> dict:
+    """
+    Act on every decision of a cancelled Shopify order. Shared by the orders/updated webhook, the
+    daily reconcile and the backfill script, so all three behave identically.
+
+      any status → stamp order_cancelled_at (separate write, so a missing column never blocks a close)
+      pending    → rejected with an 'Auto-rejected:' reason. Conditional on status still being
+                   pending, so it can never overwrite a box staff approved a moment earlier.
+      approved   → NOT closed (may already be at VeraCore). Activity warning, de-duplicated 7 days.
+      shipped    → left alone, logged.
+
+    Never touches customers.subscription_status: a Shopify order cancel is order-level (duplicates
+    and single renewal orders get cancelled while the subscription continues). Idempotent.
+    """
+    counts = {"closed": 0, "approved_flagged": 0, "left_alone": 0, "stamped": 0}
+    order_id = str(order_id or "")
+    if not order_id:
+        return counts
+
+    rows = (db.table("decisions")
+            .select("id, customer_id, status, kit_sku, veracore_order_id")
+            .eq("order_id", order_id).execute().data or [])
+    label = order_name or f"order {order_id}"
+    if not rows:
+        logger.info("[CANCEL SYNC] %s cancelled (%s) — no decisions for it in the engine", label, source)
+        return counts
+
+    if not dry_run:
+        try:
+            stamped = (db.table("decisions").update({"order_cancelled_at": cancelled_at})
+                       .eq("order_id", order_id).is_("order_cancelled_at", "null")
+                       .execute().data or [])
+            counts["stamped"] = len(stamped)
+        except Exception as e:
+            logger.error("[CANCEL SYNC] could not stamp order_cancelled_at on %s (is migration 023 applied?): %s",
+                         label, e)
+
+    reason = _shopify_cancel_reason_text(order_name, cancelled_at, cancel_reason, source)
+    for d in rows:
+        status = d.get("status")
+        if status == "pending":
+            if dry_run:
+                counts["closed"] += 1
+                logger.info("[CANCEL SYNC] WOULD close pending decision=%s for cancelled %s", d["id"], label)
+                continue
+            closed = (db.table("decisions").update({"status": "rejected", "reason": reason})
+                      .eq("id", d["id"]).eq("status", "pending").execute().data or [])
+            if not closed:
+                logger.info("[CANCEL SYNC] decision=%s for %s is no longer pending — left as is", d["id"], label)
+                continue
+            counts["closed"] += 1
+            logger.info("[CANCEL SYNC] closed pending decision=%s customer=%s kit=%s — %s cancelled (%s)",
+                        d["id"], d.get("customer_id"), d.get("kit_sku"), label, source)
+            await log_activity("decision", f"Closed box for cancelled Shopify order {label}",
+                               f"decision {d['id'][:8]}, kit={d.get('kit_sku') or '—'} — {source}", "info")
+        elif status == "approved":
+            counts["approved_flagged"] += 1
+            warn = f"Approved box {d['id'][:8]} is for cancelled Shopify order {label} — check manually"
+            logger.warning("[CANCEL SYNC] %s (veracore=%s) — not auto-closed", warn, d.get("veracore_order_id"))
+            if dry_run:
+                continue
+            recent = (db.table("activity_log").select("id").eq("summary", warn)
+                      .gte("created_at", (datetime.utcnow() - timedelta(days=7)).isoformat())
+                      .limit(1).execute().data or [])
+            if not recent:
+                at_vc = (f"It is already at VeraCore (order {d['veracore_order_id']}), so cancel it there too. "
+                         if d.get("veracore_order_id") else "")
+                await log_activity(
+                    "decision", warn,
+                    f"{at_vc}Stock and a draft shipment were already taken when it was approved — "
+                    f"rejecting it will not return them. Kit={d.get('kit_sku') or '—'}.",
+                    "warning",
+                )
+        else:
+            counts["left_alone"] += 1
+            logger.info("[CANCEL SYNC] decision=%s status=%s for cancelled %s — left alone", d["id"], status, label)
+
+    logger.info("[CANCEL SYNC] %s %s (%s): %s", "DRY RUN" if dry_run else "done", label, source, counts)
+    return counts
+
+
 async def shopify_daily_reconcile(db, dry_run: bool = False) -> dict:
     """
     PAUSE pass  — a pending decision whose Shopify order is ON_HOLD gets rejected
@@ -1597,13 +1718,37 @@ async def shopify_daily_reconcile(db, dry_run: bool = False) -> dict:
     from shopify_client import ShopifyError
     sc = get_shopify_client()
 
+    # ─── CANCEL pass (CANCELLATION_SYNC_PLAN.md) ───
+    # Safety net for orders/updated webhooks missed during a restart. Runs first so a cancelled
+    # order's pending box is closed before the PAUSE pass looks at open decisions. Independent of
+    # the hold passes: a failure here is logged and the hold work still runs.
+    cancel_counts: dict = {"cancelled_orders": 0, "cancel_closed": 0, "cancel_approved_flagged": 0}
+    try:
+        cancelled = sc.get_cancelled_orders()
+    except ShopifyError as e:
+        logger.error("[SHOPIFY RECONCILE] failed to fetch cancelled orders: %s", e)
+        cancelled = {}
+    cancel_counts["cancelled_orders"] = len(cancelled)
+    for oid, info in cancelled.items():
+        try:
+            r = await _apply_shopify_cancellation(
+                db, oid, info.get("name"), info.get("cancelled_at"), info.get("cancel_reason"),
+                "daily reconcile", dry_run=dry_run,
+            )
+        except Exception as e:
+            logger.error("[SHOPIFY RECONCILE] cancel pass failed for order=%s: %s", oid, e, exc_info=True)
+            continue
+        cancel_counts["cancel_closed"] += r["closed"]
+        cancel_counts["cancel_approved_flagged"] += r["approved_flagged"]
+    logger.info("[SHOPIFY RECONCILE] cancel pass — %s", cancel_counts)
+
     try:
         held = sc.get_on_hold_order_ids()
     except ShopifyError as e:
         logger.error("[SHOPIFY RECONCILE] failed to fetch on-hold order ids: %s", e)
-        return {"error": str(e)}
+        return {"error": str(e), **cancel_counts}
 
-    counts: dict = {"held_orders": len(held)}
+    counts: dict = {"held_orders": len(held), **cancel_counts}
 
     # ─── PAUSE pass ───
     open_decisions: list[dict] = []
@@ -3012,7 +3157,17 @@ async def shopify_order_webhook(request: Request):
             # customer data above is still upserted (address/quiz stay current), just no
             # curation while paused.
             existing_sub_status = (prior_profile or {}).get("subscription_status")
-            if cust_id and is_subscription_order and existing_sub_status == "paused":
+            # CANCELLATION_SYNC_PLAN.md: never queue a box for an order that is already cancelled —
+            # either the payload says so, or an earlier orders/updated marked it (out-of-order delivery).
+            create_cancelled_at = None
+            if cust_id and is_subscription_order:
+                create_cancelled_at = payload.get("cancelled_at") or _order_cancelled_at(db, shopify_order_id)
+            if create_cancelled_at:
+                logger.info(f"[SHOPIFY WEBHOOK] Order {shopify_order_id} for {email} is cancelled "
+                            f"({create_cancelled_at}) — skipping decision engine")
+                await log_activity("webhook", f"Skipped curation for {email} — Shopify order is cancelled",
+                                   f"order={shopify_order_id}, cancelled {str(create_cancelled_at)[:10]}", "info")
+            elif cust_id and is_subscription_order and existing_sub_status == "paused":
                 logger.info(f"[SHOPIFY WEBHOOK] Customer {cust_id} ({email}) is paused — skipping decision engine")
                 await log_activity("webhook", f"Skipped curation for {email} — customer is paused/on hold",
                                    f"order={shopify_order_id}", "info")
@@ -3343,6 +3498,21 @@ async def shopify_order_updated_webhook(request: Request):
     webhook_log_id = webhook_log.data[0]["id"] if webhook_log.data else None
 
     try:
+        # ─── Cancelled order (CANCELLATION_SYNC_PLAN.md) ───
+        # Shopify sends cancellations through orders/updated with cancelled_at set. Handle them
+        # BEFORE the customer lookup and return straight after: a cancelled order's payload can
+        # carry a stale address, quiz answers and recipient ref that must not overwrite the
+        # customer's current profile, and there is no box left to sync a ship-to onto.
+        if payload.get("cancelled_at"):
+            cancel_counts = await _apply_shopify_cancellation(
+                db, shopify_order_id, payload.get("name"), payload.get("cancelled_at"),
+                payload.get("cancel_reason"), "webhook",
+            )
+            logger.info("[SHOPIFY ORDER UPDATED] order=%s is cancelled — %s", shopify_order_id, cancel_counts)
+            if webhook_log_id:
+                db.table("webhook_logs").update({"status": "processed", "processing_time_ms": int((time.time() - start_time) * 1000)}).eq("id", webhook_log_id).execute()
+            return JSONResponse({"status": "ok", "cancelled": cancel_counts})
+
         customer_data = payload.get("customer", {}) or {}
         email = (customer_data.get("email") or payload.get("email") or "").strip().lower()
         shopify_customer_id = str(customer_data.get("id", "") or "")
@@ -4548,7 +4718,17 @@ async def replay_webhook(webhook_id: str):
                         "warning",
                     )
 
+                # CANCELLATION_SYNC_PLAN.md: replay routes stored orders/updated logs through this
+                # create path too, so a replayed cancellation must never mint a fresh box.
+                replay_cancelled_at = None
                 if cust_id and is_subscription_order:
+                    replay_cancelled_at = payload.get("cancelled_at") or _order_cancelled_at(db, shopify_order_id)
+                if replay_cancelled_at:
+                    logger.info(f"[WEBHOOK REPLAY] Order {shopify_order_id} is cancelled ({replay_cancelled_at}) "
+                                f"— no decision created")
+                    await log_activity("webhook", f"Replay skipped curation for {email} — Shopify order is cancelled",
+                                       f"order={shopify_order_id}", "info")
+                elif cust_id and is_subscription_order:
                     kit_decision = await assign_kit(cust_id, date.today())
                     logger.info(f"[WEBHOOK REPLAY] Decision: {kit_decision['decision_type']} — {kit_decision.get('kit_sku', 'none')}")
 
@@ -8708,6 +8888,28 @@ async def _recurate_customer_core(
             "kit_decision": None,
         }
 
+    # Carry order context forward from the customer's original decision so a
+    # re-curated decision keeps its gift ship-to / billing snapshot and order link.
+    # Prefer the most recent decision that actually carries an order_id (the ingested
+    # Shopify/Cratejoy order); fall back to the most recent decision overall.
+    prior_ctx = _prior_order_context(db, customer_id)
+    old_order_id = prior_ctx.get("order_id") or ""
+
+    # Guard: never re-curate onto a cancelled Shopify order (CANCELLATION_SYNC_PLAN.md).
+    # The new decision would inherit old_order_id, and _prior_order_context picks it regardless of
+    # the old decision's status — which is how the 2026-09-17 bulk re-curate recreated 26 boxes for
+    # cancelled orders. Lives here so single re-curate, bulk re-curate and hold RESUME are all covered.
+    cancelled_at = _order_cancelled_at(db, old_order_id)
+    if cancelled_at:
+        logger.warning(f"[RECURATE] {email}: inherited order {old_order_id} was cancelled in Shopify "
+                       f"({cancelled_at}) — blocked")
+        return {
+            "status": "blocked_cancelled",
+            "message": f"This customer's order was cancelled in Shopify on {str(cancelled_at)[:10]}, "
+                       f"so there is nothing to re-curate. A new order will create a new box automatically.",
+            "kit_decision": None,
+        }
+
     # Run the decision engine
     kit_decision = await assign_kit(customer_id, date.today())
     logger.info(f"[RECURATE] Result: {kit_decision['decision_type']} — Kit: {kit_decision.get('kit_sku', 'none')}")
@@ -8735,12 +8937,7 @@ async def _recurate_customer_core(
         except Exception:
             pass
 
-    # Carry order context forward from the customer's original decision so a
-    # re-curated decision keeps its gift ship-to / billing snapshot and order link.
-    # Prefer the most recent decision that actually carries an order_id (the ingested
-    # Shopify/Cratejoy order); fall back to the most recent decision overall.
-    prior_ctx = _prior_order_context(db, customer_id)
-    old_order_id = prior_ctx.get("order_id") or ""
+    # prior_ctx / old_order_id were loaded above, before the cancelled-order guard.
 
     # Update old decision's sheet row to show "re-curated" — batched by the caller when
     # sheet_sync_queue is given (bulk path), written immediately otherwise (single button).
@@ -8827,7 +9024,7 @@ async def recurate_customer(request: Request, customer_id: str, background_tasks
         result = await _recurate_customer_core(db, customer_id, background_tasks)
         if result["status"] == "not_found":
             return RedirectResponse(f"/customers/{customer_id}", status_code=303)
-        if result["status"] in ("blocked_paused", "blocked_pending"):
+        if result["status"] in ("blocked_paused", "blocked_pending", "blocked_cancelled"):
             return RedirectResponse(
                 f"/customers/{customer_id}?msg={quote(result['message'])}&msg_type=error",
                 status_code=303,
@@ -9049,6 +9246,19 @@ async def manual_override_kit(
         #   2. The decisions page falls back to "customer has any shipment?"
         #      when order_type is NULL (app.py ~4605), flipping New → Renewal.
         prior_ctx = _prior_order_context(db, customer_id)
+
+        # CANCELLATION_SYNC_PLAN.md: the override would inherit this order — never for a cancelled one.
+        override_cancelled_at = _order_cancelled_at(db, prior_ctx.get("order_id"))
+        if override_cancelled_at:
+            logger.warning(f"[OVERRIDE] {cust.data.get('email')}: order {prior_ctx.get('order_id')} was cancelled "
+                           f"in Shopify ({override_cancelled_at}) — override blocked")
+            sep = "&" if "?" in _post_action_redirect(request) else "?"
+            msg = (f"This customer's order was cancelled in Shopify on {str(override_cancelled_at)[:10]}, "
+                   f"so a box can't be assigned to it. A new order will create a new box automatically.")
+            return RedirectResponse(
+                f"{_post_action_redirect(request)}{sep}msg={quote(msg)}&msg_type=error",
+                status_code=303,
+            )
 
         decision_record = {
             "customer_id": customer_id,
@@ -9394,6 +9604,20 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                     other_pending = db.table("decisions").select("id").eq("customer_id", cust_id_rc).eq("status", "pending").neq("id", did).execute()
                     if other_pending.data:
                         logger.warning(f"[BULK ACTION] Skipping recurate for {did[:8]} — {len(other_pending.data)} other pending decision(s) exist for customer {cust_id_rc[:8]}")
+                        skipped += 1
+                        continue
+                    # CANCELLATION_SYNC_PLAN.md: a box on a cancelled Shopify order is closed with the
+                    # 'Auto-rejected:' reason and not re-curated. Checked BEFORE the plain reject below,
+                    # whose reason-less reject would count as a staff rejection and blacklist the kit.
+                    rc_cancelled_at = _order_cancelled_at(db, d.get("order_id"))
+                    if rc_cancelled_at:
+                        if current_status == "pending":
+                            db.table("decisions").update({
+                                "status": "rejected",
+                                "reason": _shopify_cancel_reason_text(None, rc_cancelled_at, None, "bulk re-curate"),
+                            }).eq("id", did).eq("status", "pending").execute()
+                        logger.warning(f"[BULK ACTION] Skipping recurate for {did[:8]} — order {d.get('order_id')} "
+                                       f"was cancelled in Shopify ({rc_cancelled_at})")
                         skipped += 1
                         continue
                     # Reject the old decision first (no-op if already rejected)
