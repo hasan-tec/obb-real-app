@@ -246,8 +246,6 @@ def main() -> int:
         reject(extras, f"duplicate of the September box shipped by hand ({kit['sku']})")
         if target:
             upd = {"status": "shipped", "kit_id": kit["id"], "kit_sku": kit["sku"], "reason": reason}
-            if cj_box and not target.get("cratejoy_shipment_id"):
-                upd["cratejoy_shipment_id"] = str(cj_box["id"])
             if tracking:
                 upd.update(tracking_number=tracking, tracking_pushed_at=datetime.utcnow().isoformat())
             db.table("decisions").update(upd).eq("id", target["id"]).in_("status", list(OPEN)).execute()

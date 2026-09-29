@@ -60,10 +60,11 @@ def with_retry(fn, tries: int = 4):
     after a half-done row finishes it instead of duplicating it."""
     import time
     import httpx
+    from cratejoy_client import CratejoyError
     for n in range(1, tries + 1):
         try:
             return fn()
-        except (httpx.TransportError, httpx.RemoteProtocolError, app.CratejoyError) as e:
+        except (httpx.TransportError, httpx.RemoteProtocolError, CratejoyError) as e:
             if n == tries:
                 raise
             logger.warning("[MANUAL IMPORT] network error (%s), retry %d/%d", e, n, tries - 1)
