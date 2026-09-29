@@ -48,8 +48,19 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANO
 
 supabase: Client = None  # type: ignore
 
+# A worker thread (bulk job) can set its own client here. The shared client's HTTP/2
+# connection must not be used from two threads at once: measured locally 2026-09-29, a bulk
+# reject running on its thread and a /customers page load on the event loop hit it at the
+# same moment and Supabase dropped the connection (RemoteProtocolError ConnectionTerminated),
+# failing one bulk row and the page.
+_thread_db = threading.local()
+
+
 def get_supabase() -> Client:
-    """Lazy-init Supabase client."""
+    """Lazy-init Supabase client (the calling thread's own client when it set one)."""
+    own = getattr(_thread_db, "client", None)
+    if own is not None:
+        return own
     global supabase
     if supabase is None:
         if not SUPABASE_URL or not SUPABASE_KEY:
@@ -9733,9 +9744,14 @@ async def bulk_job_status(job_id: str):
 
 def _bulk_job_thread(*args) -> None:
     try:
+        # Own Supabase client for this thread: every get_supabase() inside the job (engine,
+        # recurate, activity log, VeraCore push) uses it instead of the shared one. See _thread_db.
+        _thread_db.client = create_client(SUPABASE_URL, SUPABASE_KEY)
         asyncio.run(_run_bulk_action(*args))
     except Exception as e:  # never let the thread die silently
         logger.error(f"[BULK ACTION] bulk job thread crashed: {e}", exc_info=True)
+    finally:
+        _thread_db.client = None
 
 
 @app.post("/decisions/bulk-action")
