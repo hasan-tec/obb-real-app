@@ -149,3 +149,19 @@ def test_approve_queues_veracore_push_and_runs_it_after_the_loop(monkeypatch):
     assert [r["status"] for r in db.tables["decisions"]] == ["approved", "approved"]
     assert pushed == [("d1", True), ("d2", True)]
     assert len(db.tables["shipments"]) == 2
+
+
+def test_bulk_thread_uses_its_own_db_client(monkeypatch):
+    import threading
+    shared, mine, seen = object(), object(), {}
+    monkeypatch.setattr(app, "supabase", shared)
+    monkeypatch.setattr(app, "create_client", lambda url, key: mine)
+
+    async def fake_run(*_a):
+        seen["thread"] = app.get_supabase()
+    monkeypatch.setattr(app, "_run_bulk_action", fake_run)
+    t = threading.Thread(target=app._bulk_job_thread, args=("j", "reject", [], 0, False))
+    t.start()
+    t.join()
+    assert seen["thread"] is mine          # the job thread gets its own client
+    assert app.get_supabase() is shared    # everyone else keeps the shared one
