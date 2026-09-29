@@ -63,7 +63,7 @@ def with_retry(fn, tries: int = 4):
     for n in range(1, tries + 1):
         try:
             return fn()
-        except (httpx.TransportError, httpx.RemoteProtocolError) as e:
+        except (httpx.TransportError, httpx.RemoteProtocolError, app.CratejoyError) as e:
             if n == tries:
                 raise
             logger.warning("[MANUAL IMPORT] network error (%s), retry %d/%d", e, n, tries - 1)
