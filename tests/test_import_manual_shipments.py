@@ -39,3 +39,18 @@ def test_parse_sheet_sections_and_column_a(tmp_path):
         ("CQ41", "#OBB-2", "b@x.com", "222", "YESTO+WATERMELONMASK"),
         ("CQ31", "#OBB-3", "c@x.com", "333", ""),
     ]
+
+
+def test_manifest_matches_kit_items_ignoring_punctuation():
+    kit = ["Yes To - Watermelon Mask", "Familus - 115 Hacks & Hacktivities for Parents of Mini Humans",
+           "Starlabs Beauty - Deep Wave 80 Hourly Hydro Boost Serum"]
+    manifest = [ims.norm_item(x) for x in ("YESTO+WATERMELONMASK ", "FAMILUS+115HACKS&HACKTIVITIESFORPARENTSOFMINIHUMANS",
+                                           "STARLABSBEAUTY+DEEPWAVE80HOURHYDROBOOSTSERUM")]
+    assert ims.manifest_mismatches(manifest, kit) == []
+    assert ims.manifest_mismatches([ims.norm_item("TUMMYTAPE+SINGLEPLAYFULPINK")], kit) == ["tummytapesingleplayfulpink"]
+
+
+def test_section_manifests_groups_column_a_by_kit():
+    rows = [{"kit_code": "CQ41", "col_a": "YESTO+WATERMELONMASK"}, {"kit_code": "CQ41", "col_a": ""},
+            {"kit_code": "CQ31", "col_a": "BABYSHOWERANNOUNCEMENTCARDS"}]
+    assert ims.section_manifests(rows) == {"CQ41": ["yestowatermelonmask"], "CQ31": ["babyshowerannouncementcards"]}

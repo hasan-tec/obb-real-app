@@ -2,9 +2,12 @@
 Record boxes staff shipped OUTSIDE the engine (September 2026: Sheena's Shopify T3/T4 sheet,
 kits CQ41 / CQ31) as shipments in the engine, so October curation sees their history.
 
-Input: the "Monthly Boxing_Customer Kit Assignment" CSV. A row with an empty ORDER NUMBER and
-text in column A is a section header holding the kit code (CQ41 -> OBB-CQ-41 KITS). Order rows
-start with '#OBB-'; SHIPMENT ID is the Shopify order id (= decisions.order_id).
+Input: the "Monthly Boxing_Customer Kit Assignment" CSV (same layout as the August sheet, see
+import_august_manual_assignments.py). Column A holds two unrelated things: section markers (a lone
+row like CQ41 -> OBB-CQ-41 KITS) and that kit's item manifest, one item per row, printed down the
+first customer rows of the section. The item text on a customer's row is NOT that customer's data;
+it is only used to check the engine's kit has the same items. Order rows start with '#OBB-';
+SHIPMENT ID is the Shopify order id (= decisions.order_id).
 
 Per order row:
   - Ship date + tracking come from the order's Shopify fulfillment (read-only). Fallback: --ship-date.
@@ -13,15 +16,14 @@ Per order row:
   - Other open decisions for the SAME order -> rejected with an 'Auto-rejected:' reason
     (that prefix keeps get_rejected_kit_map from blacklisting the kit).
   - No decision for the order -> shipment history only (like Add Shipment History).
-  - Held (not written, listed in the report): rows with an item in column A (swap question for
-    staff), an order already shipped in the engine with a different kit, a box already at VeraCore,
-    an email with several profiles and no decision to pick one.
+  - Held (not written, listed in the report): an order already shipped in the engine with a
+    different kit, a box already at VeraCore, an email with several profiles and no decision.
+  - Stops before any write if a section's column-A manifest doesn't match the engine kit's items.
 Never: changes stock, pushes to VeraCore, writes to Shopify/Cratejoy, touches Google Sheets.
 Idempotent: a shipment whose notes carry this import's tag + order number is never written twice.
 
 Dry run (default):  python scripts/import_manual_shipments.py --csv "<file>"
 Apply:              ... --apply            (Hasan only)
-Include held swap rows once staff have answered:  --include-swapped
 """
 import argparse
 import csv
@@ -30,6 +32,7 @@ import os
 import re
 import sys
 from collections import Counter
+from difflib import SequenceMatcher
 from datetime import date, datetime
 
 os.environ.setdefault("OBB_DISABLE_SCHEDULER", "1")
@@ -48,6 +51,10 @@ TAG = "Manual Sept 2026 import"
 OPEN = ("pending", "approved")
 
 
+def norm_item(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
 def kit_sku_for_code(code: str) -> str | None:
     m = re.fullmatch(r"([A-Z]{2})(\d{2})", (code or "").strip().upper())
     return f"OBB-{m.group(1)}-{m.group(2)} KITS" if m else None
@@ -55,7 +62,7 @@ def kit_sku_for_code(code: str) -> str | None:
 
 def parse_sheet(path: str) -> list[dict]:
     rows, kit_code = [], None
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         for r in list(csv.reader(f))[1:]:
             if not any(c.strip() for c in r):
                 continue
@@ -69,6 +76,23 @@ def parse_sheet(path: str) -> list[dict]:
                 "email": r[2].strip().lower(), "ship_name": r[4].strip(), "order_id": r[13].strip(),
             })
     return rows
+
+
+def section_manifests(rows: list[dict]) -> dict[str, list[str]]:
+    """kit_code -> the item names printed in column A of that section (normalised)."""
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        if r["col_a"]:
+            out.setdefault(r["kit_code"], []).append(norm_item(r["col_a"]))
+    return out
+
+
+def manifest_mismatches(manifest: list[str], kit_item_names: list[str]) -> list[str]:
+    """Manifest entries that match none of the kit's item names (punctuation ignored, >=90% similar
+    counts as the same item, e.g. '80 HOUR' vs '80 Hourly')."""
+    names = [norm_item(n) for n in kit_item_names]
+    return [m for m in manifest
+            if not any(m == n or m in n or n in m or SequenceMatcher(None, m, n).ratio() >= 0.9 for n in names)]
 
 
 def shopify_fulfillment(sc, order_id: str) -> dict:
@@ -90,7 +114,6 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--ship-date", help="fallback YYYY-MM-DD when Shopify has no fulfillment date")
-    ap.add_argument("--include-swapped", action="store_true", help="also write rows with an item in column A")
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--report", default=f"manual_shipments_report_{date.today().isoformat()}.csv")
     args = ap.parse_args()
@@ -106,12 +129,19 @@ def main() -> int:
         if not k:
             print(f"  STOP: kit code {code!r} -> {sku!r} is not in the Kits page. Staff must add it first.")
             return 2
-        items = [x["item_id"] for x in db.table("kit_items").select("item_id").eq("kit_id", k[0]["id"]).execute().data]
+        ki = db.table("kit_items").select("item_id, items(name)").eq("kit_id", k[0]["id"]).execute().data or []
+        items = [x["item_id"] for x in ki]
         if not items:
             print(f"  STOP: kit {sku} has no items. Staff must add its items on the Kits page first.")
             return 2
+        manifest = section_manifests(rows).get(code, [])
+        bad = manifest_mismatches(manifest, [(x.get("items") or {}).get("name") or "" for x in ki])
+        if bad:
+            print(f"  STOP: sheet's {code} item list doesn't match engine kit {sku}: {bad}")
+            return 2
         kits[code] = {**k[0], "items": items}
-        print(f"  kit {code} -> {sku} (T{k[0]['trimester']}, {len(items)} items)")
+        print(f"  kit {code} -> {sku} (T{k[0]['trimester']}, {len(items)} items; sheet manifest "
+              f"{len(manifest)} items, all match)")
 
     report, outcome = [], Counter()
     for r in rows:
@@ -151,12 +181,11 @@ def main() -> int:
                        note="" if same else f"engine shipped {shipped[-1]['kit_sku']} for this order; sheet says {kit['sku']}")
             outcome[rec["outcome"]] += 1
             continue
+        # Shipments written by THIS import for another order (a customer with two subscriptions,
+        # e.g. two CQ41 boxes) don't count — only pre-existing September history does.
+        same_kit_sept = [x for x in same_kit_sept if TAG not in (x.get("notes") or "")]
         if same_kit_sept:
             rec.update(outcome="already_recorded", note=f"September {kit['sku']} shipment already on the profile")
-            outcome[rec["outcome"]] += 1
-            continue
-        if r["col_a"] and not args.include_swapped:
-            rec.update(outcome="held_swap_question", note=f"column A: {r['col_a']}")
             outcome[rec["outcome"]] += 1
             continue
         if any(d.get("veracore_order_id") for d in open_decs):
@@ -205,7 +234,7 @@ def main() -> int:
             }).eq("id", d["id"]).eq("status", d["status"]).execute()
         ship = db.table("shipments").insert({
             "customer_id": cust_id, "kit_id": kit["id"], "kit_sku": kit["sku"], "ship_date": ship_date,
-            "trimester_at_ship": (target or {}).get("trimester") or kit["trimester"], "platform": "shopify",
+            "trimester_at_ship": kit["trimester"], "platform": "shopify",
             "order_id": r["order_id"],
             "notes": f"{TAG} {r['order_name']}" + (f" (decision {target['id'][:8]})" if target else ""),
         }).execute().data
