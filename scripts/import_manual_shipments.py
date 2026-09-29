@@ -55,6 +55,21 @@ def norm_item(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+def with_retry(fn, tries: int = 4):
+    """Run fn(); on a network error wait and run it again. Every row is idempotent, so a retry
+    after a half-done row finishes it instead of duplicating it."""
+    import time
+    import httpx
+    for n in range(1, tries + 1):
+        try:
+            return fn()
+        except (httpx.TransportError, httpx.RemoteProtocolError) as e:
+            if n == tries:
+                raise
+            logger.warning("[MANUAL IMPORT] network error (%s), retry %d/%d", e, n, tries - 1)
+            time.sleep(3 * n)
+
+
 def kit_sku_for_code(code: str) -> str | None:
     m = re.fullmatch(r"([A-Z]{2})(\d{2})", (code or "").strip().upper())
     return f"OBB-{m.group(1)}-{m.group(2)} KITS" if m else None
@@ -93,6 +108,31 @@ def manifest_mismatches(manifest: list[str], kit_item_names: list[str]) -> list[
     names = [norm_item(n) for n in kit_item_names]
     return [m for m in manifest
             if not any(m == n or m in n or n in m or SequenceMatcher(None, m, n).ratio() >= 0.9 for n in names)]
+
+
+def history_item_names(db, customer_id: str, before: str, kit_item_ids: list, names: dict) -> list[str]:
+    """Kit items this customer already received in a shipment dated before `before` (read-only)."""
+    sids = [x["id"] for x in db.table("shipments").select("id").eq("customer_id", customer_id)
+            .lt("ship_date", before).execute().data or []]
+    seen = set()
+    for i in range(0, len(sids), 100):
+        seen |= {x["item_id"] for x in db.table("shipment_items").select("item_id")
+                 .in_("shipment_id", sids[i:i + 100]).execute().data or []}
+    return [names[i] for i in kit_item_ids if i in seen]
+
+
+def manual_reason(order_name: str, kit_sku: str, engine_kit: str | None, engine_reason: str, dup_items: list) -> str:
+    """Decision reason that says plainly: staff shipped this by hand, and what the engine had decided."""
+    if not engine_kit:
+        why = (engine_reason or "").replace("[Bulk-re-curated] ", "").strip()
+        head = f"engine did not assign a kit ({why[:140]})" if why else "engine did not assign a kit"
+    elif engine_kit != kit_sku:
+        head = f"engine assigned {engine_kit}"
+    else:
+        head = f"engine assigned {engine_kit} (same kit)"
+    dup = f"; {len(dup_items)} item(s) already received before: {', '.join(dup_items)}" if dup_items else ""
+    return (f"[Manually processed] Staff shipped {kit_sku} by hand outside the engine, {head}{dup}. "
+            f"Recorded from the September sheet ({order_name}).")[:1000]
 
 
 def shopify_fulfillment(sc, order_id: str) -> dict:
@@ -139,19 +179,21 @@ def main() -> int:
         if bad:
             print(f"  STOP: sheet's {code} item list doesn't match engine kit {sku}: {bad}")
             return 2
-        kits[code] = {**k[0], "items": items}
+        kits[code] = {**k[0], "items": items,
+                      "names": {x["item_id"]: (x.get("items") or {}).get("name") or x["item_id"] for x in ki}}
         print(f"  kit {code} -> {sku} (T{k[0]['trimester']}, {len(items)} items; sheet manifest "
               f"{len(manifest)} items, all match)")
 
     report, outcome = [], Counter()
-    for r in rows:
+
+    def process(r):
         kit = kits[r["kit_code"]]
         rec = {**r, "kit_sku": kit["sku"], "decision_id": "", "customer_id": "", "ship_date": "",
-               "tracking": "", "outcome": "", "note": ""}
+               "tracking": "", "dup_items": "", "outcome": "", "note": ""}
         report.append(rec)
 
         decs = (db.table("decisions")
-                .select("id, status, kit_sku, customer_id, trimester, veracore_order_id, created_at")
+                .select("id, status, kit_sku, customer_id, trimester, veracore_order_id, created_at, reason")
                 .eq("order_id", r["order_id"]).order("created_at").execute().data or [])
         open_decs = [d for d in decs if d["status"] in OPEN]
         shipped = [d for d in decs if d["status"] == "shipped"]
@@ -163,47 +205,48 @@ def main() -> int:
             if len(profiles) != 1:
                 rec.update(outcome="held_profile", note=f"{len(profiles)} profiles for this email and no decision")
                 outcome[rec["outcome"]] += 1
-                continue
+                return
             cust_id = profiles[0]["id"]
         rec["customer_id"] = cust_id
 
         tagged = (db.table("shipments").select("id").eq("customer_id", cust_id)
                   .ilike("notes", f"%{TAG} {r['order_name']}%").execute().data)
-        if tagged:
+        resume_sid = tagged[0]["id"] if tagged else None
+        if resume_sid and not open_decs:
             rec.update(outcome="already_imported")
             outcome[rec["outcome"]] += 1
-            continue
+            return
         same_kit_sept = (db.table("shipments").select("id, notes").eq("customer_id", cust_id)
                          .eq("kit_sku", kit["sku"]).gte("ship_date", "2026-09-01").execute().data)
-        if shipped:
+        if shipped and not resume_sid:
             same = [d for d in shipped if d["kit_sku"] == kit["sku"]]
             rec.update(outcome="already_recorded" if same else "held_conflict",
                        note="" if same else f"engine shipped {shipped[-1]['kit_sku']} for this order; sheet says {kit['sku']}")
             outcome[rec["outcome"]] += 1
-            continue
+            return
         # Shipments written by THIS import for another order (a customer with two subscriptions,
         # e.g. two CQ41 boxes) don't count — only pre-existing September history does.
         same_kit_sept = [x for x in same_kit_sept if TAG not in (x.get("notes") or "")]
-        if same_kit_sept:
+        if same_kit_sept and not resume_sid:
             rec.update(outcome="already_recorded", note=f"September {kit['sku']} shipment already on the profile")
             outcome[rec["outcome"]] += 1
-            continue
+            return
         if any(d.get("veracore_order_id") for d in open_decs):
             rec.update(outcome="held_veracore", note="an open decision for this order is already at VeraCore")
             outcome[rec["outcome"]] += 1
-            continue
+            return
 
         try:
             ful = shopify_fulfillment(sc, r["order_id"])
         except Exception as e:  # noqa: BLE001 — report and hold, never guess
             rec.update(outcome="held_shopify_error", note=str(e)[:120])
             outcome[rec["outcome"]] += 1
-            continue
+            return
         ship_date = ful["date"] or args.ship_date
         if not ship_date:
             rec.update(outcome="held_no_date", note=f"Shopify status {ful.get('status')}, no fulfillment; pass --ship-date")
             outcome[rec["outcome"]] += 1
-            continue
+            return
         rec.update(ship_date=ship_date, tracking=ful["tracking"] or "")
 
         target = open_decs[-1] if open_decs else None
@@ -216,33 +259,54 @@ def main() -> int:
             notes.append(f"{len(extras)} duplicate open decision(s) auto-rejected")
         if not target:
             notes.append("no decision: history only")
+        dup_items = history_item_names(db, cust_id, "2026-09-01", kit["items"], kit["names"])
+        rec["dup_items"] = len(dup_items)
+        if dup_items:
+            notes.append(f"{len(dup_items)} duplicate item(s)")
+        reason = manual_reason(r["order_name"], kit["sku"], (target or {}).get("kit_sku"),
+                               (target or {}).get("reason") or "", dup_items)
         rec.update(outcome="write", note="; ".join(notes))
         outcome["write"] += 1
         if not args.apply:
-            continue
+            return
 
-        # ── writes ──
-        if target:
-            upd = {"status": "shipped", "kit_id": kit["id"], "kit_sku": kit["sku"]}
-            if ful["tracking"]:
-                upd.update(tracking_number=ful["tracking"], tracking_pushed_at=datetime.utcnow().isoformat())
-            db.table("decisions").update(upd).eq("id", target["id"]).in_("status", list(OPEN)).execute()
+        # ── writes: history first, decision last, so a crash can never leave a shipped decision
+        #    without history (a re-run finds the tagged shipment and finishes the row) ──
+        sid = resume_sid
+        if not sid:
+            ship = db.table("shipments").insert({
+                "customer_id": cust_id, "kit_id": kit["id"], "kit_sku": kit["sku"], "ship_date": ship_date,
+                "trimester_at_ship": kit["trimester"], "platform": "shopify",
+                "order_id": r["order_id"],
+                "notes": f"{TAG} {r['order_name']}: shipped by hand by staff"
+                         + (f" (decision {target['id'][:8]})" if target else "")
+                         + (f"; {len(dup_items)} duplicate item(s)" if dup_items else ""),
+            }).execute().data
+            sid = ship[0]["id"] if ship else None
+        if sid and not db.table("shipment_items").select("item_id").eq("shipment_id", sid).limit(1).execute().data:
+            db.table("shipment_items").insert([{"shipment_id": sid, "item_id": i} for i in kit["items"]]).execute()
         for d in extras:
             db.table("decisions").update({
                 "status": "rejected",
                 "reason": f"Auto-rejected: duplicate of {r['order_name']}, shipped by hand ({TAG}).",
             }).eq("id", d["id"]).eq("status", d["status"]).execute()
-        ship = db.table("shipments").insert({
-            "customer_id": cust_id, "kit_id": kit["id"], "kit_sku": kit["sku"], "ship_date": ship_date,
-            "trimester_at_ship": kit["trimester"], "platform": "shopify",
-            "order_id": r["order_id"],
-            "notes": f"{TAG} {r['order_name']}" + (f" (decision {target['id'][:8]})" if target else ""),
-        }).execute().data
-        sid = ship[0]["id"] if ship else None
-        if sid:
-            db.table("shipment_items").insert([{"shipment_id": sid, "item_id": i} for i in kit["items"]]).execute()
+        if target:
+            upd = {"status": "shipped", "kit_id": kit["id"], "kit_sku": kit["sku"], "reason": reason}
+            if ful["tracking"]:
+                upd.update(tracking_number=ful["tracking"], tracking_pushed_at=datetime.utcnow().isoformat())
+            db.table("decisions").update(upd).eq("id", target["id"]).in_("status", list(OPEN)).execute()
         logger.warning("[MANUAL IMPORT] %s %s -> shipment %s decision %s", r["order_name"], kit["sku"], sid,
                        (target or {}).get("id"))
+
+    for r in rows:
+        before = (len(report), outcome.copy())
+
+        def attempt(r=r, before=before):
+            del report[before[0]:]           # a retried row starts clean in the report/counts
+            outcome.clear()
+            outcome.update(before[1])
+            process(r)
+        with_retry(attempt)
 
     with open(args.report, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(report[0].keys()))

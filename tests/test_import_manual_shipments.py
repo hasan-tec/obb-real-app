@@ -54,3 +54,12 @@ def test_section_manifests_groups_column_a_by_kit():
     rows = [{"kit_code": "CQ41", "col_a": "YESTO+WATERMELONMASK"}, {"kit_code": "CQ41", "col_a": ""},
             {"kit_code": "CQ31", "col_a": "BABYSHOWERANNOUNCEMENTCARDS"}]
     assert ims.section_manifests(rows) == {"CQ41": ["yestowatermelonmask"], "CQ31": ["babyshowerannouncementcards"]}
+
+
+def test_manual_reason_says_staff_shipped_it_and_why():
+    r = ims.manual_reason("#OBB-1", "OBB-CQ-41 KITS", None,
+                          "[Bulk-re-curated] All T4 kits have duplicate items with customer history", ["Yes To - Watermelon Mask"])
+    assert r.startswith("[Manually processed] Staff shipped OBB-CQ-41 KITS by hand outside the engine")
+    assert "engine did not assign a kit (All T4 kits have duplicate items" in r
+    assert "1 item(s) already received before: Yes To - Watermelon Mask" in r
+    assert "engine assigned OBB-CQ-21 KITS" in ims.manual_reason("#OBB-2", "OBB-CQ-31 KITS", "OBB-CQ-21 KITS", "", [])
