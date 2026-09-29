@@ -5875,6 +5875,8 @@ async def decisions_page(request: Request):
             "sort_dir":         sort_dir,
             "filter_qs":        filter_qs,
             "any_filter_active": any_filter_active,
+            "bulk_job_id":      request.query_params.get("bulk_job", ""),
+            "bulk_job":         bulk_job_snapshot(request.query_params.get("bulk_job", "")),
         })
     except Exception as e:
         logger.error(f"[DECISIONS PAGE] Error: {e}", exc_info=True)
@@ -9329,62 +9331,44 @@ async def manual_override_kit(
 # regardless of how the two selections overlap.
 _bulk_action_inflight_decisions: set = set()
 _bulk_action_inflight_lock = threading.Lock()
+# Progress of bulk jobs running on background threads, by job id (single web process; a dyno
+# restart forgets them and the banner says so). Read by the Decisions page banner.
+_bulk_jobs: dict = {}
+_bulk_jobs_lock = threading.Lock()
 
 
-@app.post("/decisions/bulk-action")
-async def bulk_decision_action(request: Request, background_tasks: BackgroundTasks):
-    """Bulk approve or ship multiple decisions at once."""
+def _bulk_job_set(job_id: str, **fields) -> None:
+    with _bulk_jobs_lock:
+        job = _bulk_jobs.get(job_id)
+        if job is not None:
+            job.update(fields)
+            job["updated_at"] = datetime.utcnow().isoformat()
+
+
+def _bulk_job_update(job_id: str, done: int = 0) -> None:
+    with _bulk_jobs_lock:
+        job = _bulk_jobs.get(job_id)
+        if job is not None:
+            job["done"] += done
+            job["updated_at"] = datetime.utcnow().isoformat()
+
+
+def bulk_job_snapshot(job_id: str) -> dict | None:
+    """Copy of a bulk job's progress for the Decisions page banner (None if unknown/restarted)."""
+    with _bulk_jobs_lock:
+        job = _bulk_jobs.get(job_id or "")
+        return dict(job) if job else None
+
+
+async def _run_bulk_action(job_id: str, action: str, decision_ids: list, skipped_contended: int,
+                           ship_to_ob: bool) -> None:
+    """The per-decision work of a bulk action. Runs on its own thread (see _bulk_job_thread) so
+    a large selection no longer hits Heroku's 30 s request limit ("Application Error"), and the
+    rest of the dashboard stays responsive while it runs. Releases the in-flight claims when done."""
+    success = failed = skipped = 0
+    bg = BackgroundTasks()  # VeraCore pushes / recurate side-tasks, run after the loop below
     try:
-        db          = get_supabase()
-        form        = await request.form()
-        action      = form.get("action", "").strip()
-        decision_ids = form.getlist("decision_ids")
-        redirect_qs = form.get("redirect_qs", "")
-        ship_to_ob  = (form.get("ship_to_ordered_by") == "1")
-        logger.info(f"[BULK ACTION] action={action}, count={len(decision_ids)}, ship_to_ob={ship_to_ob}, ids={decision_ids[:5]}")
-
-        if action not in ("approve", "ship", "reject", "recurate"):
-            logger.warning(f"[BULK ACTION] Invalid action: '{action}'")
-            sep = "&" if redirect_qs else ""
-            return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=Invalid+action&msg_type=error", status_code=303)
-
-        if not decision_ids:
-            sep = "&" if redirect_qs else ""
-            return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=No+decisions+selected&msg_type=error", status_code=303)
-
-        # Claim these decisions — see _bulk_action_inflight_decisions above. Anything already
-        # being processed by another in-flight request is dropped from THIS run rather than
-        # processed twice.
-        requested_count = len(decision_ids)
-        with _bulk_action_inflight_lock:
-            contended = [d for d in decision_ids if d in _bulk_action_inflight_decisions]
-            claimed_ids = [d for d in decision_ids if d not in _bulk_action_inflight_decisions]
-            _bulk_action_inflight_decisions.update(claimed_ids)
-
-        if contended:
-            logger.warning(
-                "[BULK ACTION] %d of %d decision(s) already in-flight in another request — "
-                "skipping those to avoid double-processing (action=%s)",
-                len(contended), requested_count, action,
-            )
-        if not claimed_ids:
-            logger.warning("[BULK ACTION] Every selected decision is already being processed — nothing to do")
-            dup_msg = quote("That bulk %s is already running - wait for it to finish" % action)
-            sep = "&" if redirect_qs else ""
-            return RedirectResponse(
-                f"/decisions?{redirect_qs}{sep}msg={dup_msg}&msg_type=error",
-                status_code=303,
-            )
-
-        # Everything below operates only on the ids this request actually owns.
-        decision_ids = claimed_ids
-        skipped_contended = len(contended)
-        logger.info(
-            "[BULK ACTION] Claimed %d/%d decision(s) (action=%s)",
-            len(claimed_ids), requested_count, action,
-        )
-
-        success = failed = skipped = 0
+        db = get_supabase()
         # Issue #2 — one shared VeraCore ReferenceNumber tag for this whole approval run,
         # so warehouse can group/sort the batch in Order Inquiry.
         bulk_batch_ref = _make_batch_ref()
@@ -9523,7 +9507,7 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                     # Phase 3 — Push to VeraCore in background (matches single-approve flow).
                     # Pass the shared batch tag so this run groups under one ReferenceNumber.
                     logger.info("[BULK ACTION] Queuing VeraCore push for %s (background, batch=%s, ship_to_ob=%s)", did[:8], bulk_batch_ref, ship_to_ob)
-                    background_tasks.add_task(submit_to_veracore, did, bulk_batch_ref, ship_to_ob)
+                    bg.add_task(submit_to_veracore, did, bulk_batch_ref, ship_to_ob)
                     success += 1
 
                 elif action == "ship":
@@ -9629,7 +9613,7 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
                     # order_type/gift ship-to/billing snapshot, so a bulk-recurated gift
                     # subscription would ship to the account holder instead of the recipient.
                     rc_result = await _recurate_customer_core(
-                        db, cust_id_rc, background_tasks,
+                        db, cust_id_rc, bg,
                         reason_prefix="Bulk-re-curated", sheet_sync_queue=sheet_sync_queue,
                     )
                     if rc_result["status"] != "ok":
@@ -9642,6 +9626,9 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
             except Exception as row_err:
                 logger.error(f"[BULK ACTION] Error on decision {did}: {row_err}", exc_info=True)
                 failed += 1
+            finally:
+                _bulk_job_update(job_id, done=1)
+                _bulk_job_set(job_id, succeeded=success, skipped=skipped + skipped_contended, failed=failed)
 
         # Issue 9 — one bulk INSERT for all shipment_items across all approved decisions
         if pending_shipment_items:
@@ -9684,28 +9671,121 @@ async def bulk_decision_action(request: Request, background_tasks: BackgroundTas
             f"{len(decision_ids)} total selected",
             "success" if failed == 0 else "warning",
         )
-        parts = [f"{success} {action}d"]
-        if skipped: parts.append(f"{skipped} skipped")
-        if failed:  parts.append(f"{failed} failed")
-        result_msg  = quote(f"Bulk {action}: " + ", ".join(parts))
-        result_type = "success" if failed == 0 else "warning"
-        sep         = "&" if redirect_qs else ""
-        return RedirectResponse(
-            f"/decisions?{redirect_qs}{sep}msg={result_msg}&msg_type={result_type}",
-            status_code=303,
+        _bulk_job_set(job_id, status="done", succeeded=success, skipped=skipped, failed=failed,
+                      finished_at=datetime.utcnow().isoformat())
+        await bg()  # queued VeraCore pushes (approve) — same as the old post-response background tasks
+    except Exception as e:
+        logger.error(f"[BULK ACTION] Fatal error in bulk job {job_id}: {e}", exc_info=True)
+        _bulk_job_set(job_id, status="error", error=str(e)[:300], finished_at=datetime.utcnow().isoformat())
+        await log_activity("decision", f"Bulk {action} stopped with an error: {e}", f"job={job_id}", "error")
+    finally:
+        # Always release the claimed decisions, including on the error path — otherwise a
+        # single failed run would permanently block those decisions from being retried.
+        with _bulk_action_inflight_lock:
+            _bulk_action_inflight_decisions.difference_update(decision_ids)
+        logger.info("[BULK ACTION] job=%s released %d in-flight decision claim(s)", job_id, len(decision_ids))
+
+
+@app.get("/decisions/bulk-job/{job_id}")
+async def bulk_job_status(job_id: str):
+    """Progress of a background bulk job, polled by the Decisions page banner."""
+    job = bulk_job_snapshot(job_id)
+    if not job:
+        return JSONResponse({"status": "unknown"})
+    return JSONResponse(job)
+
+
+def _bulk_job_thread(*args) -> None:
+    try:
+        asyncio.run(_run_bulk_action(*args))
+    except Exception as e:  # never let the thread die silently
+        logger.error(f"[BULK ACTION] bulk job thread crashed: {e}", exc_info=True)
+
+
+@app.post("/decisions/bulk-action")
+async def bulk_decision_action(request: Request, background_tasks: BackgroundTasks):
+    """Bulk approve / ship / reject / re-curate. Validates and claims the selection, then runs the
+    work on a background thread and returns at once (progress banner on /decisions?bulk_job=...)."""
+    handed_off = False
+    try:
+        db          = get_supabase()
+        form        = await request.form()
+        action      = form.get("action", "").strip()
+        decision_ids = form.getlist("decision_ids")
+        # Drop a previous run's bulk_job from the page filters so the redirect shows only this one
+        redirect_qs = "&".join(p for p in (form.get("redirect_qs", "") or "").split("&")
+                               if p and not p.startswith("bulk_job="))
+        ship_to_ob  = (form.get("ship_to_ordered_by") == "1")
+        logger.info(f"[BULK ACTION] action={action}, count={len(decision_ids)}, ship_to_ob={ship_to_ob}, ids={decision_ids[:5]}")
+
+        if action not in ("approve", "ship", "reject", "recurate"):
+            logger.warning(f"[BULK ACTION] Invalid action: '{action}'")
+            sep = "&" if redirect_qs else ""
+            return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=Invalid+action&msg_type=error", status_code=303)
+
+        if not decision_ids:
+            sep = "&" if redirect_qs else ""
+            return RedirectResponse(f"/decisions?{redirect_qs}{sep}msg=No+decisions+selected&msg_type=error", status_code=303)
+
+        # Claim these decisions — see _bulk_action_inflight_decisions above. Anything already
+        # being processed by another in-flight request is dropped from THIS run rather than
+        # processed twice.
+        requested_count = len(decision_ids)
+        with _bulk_action_inflight_lock:
+            contended = [d for d in decision_ids if d in _bulk_action_inflight_decisions]
+            claimed_ids = [d for d in decision_ids if d not in _bulk_action_inflight_decisions]
+            _bulk_action_inflight_decisions.update(claimed_ids)
+
+        if contended:
+            logger.warning(
+                "[BULK ACTION] %d of %d decision(s) already in-flight in another request — "
+                "skipping those to avoid double-processing (action=%s)",
+                len(contended), requested_count, action,
+            )
+        if not claimed_ids:
+            logger.warning("[BULK ACTION] Every selected decision is already being processed — nothing to do")
+            dup_msg = quote("That bulk %s is already running - wait for it to finish" % action)
+            sep = "&" if redirect_qs else ""
+            return RedirectResponse(
+                f"/decisions?{redirect_qs}{sep}msg={dup_msg}&msg_type=error",
+                status_code=303,
+            )
+
+        # Everything below operates only on the ids this request actually owns.
+        decision_ids = claimed_ids
+        skipped_contended = len(contended)
+        logger.info(
+            "[BULK ACTION] Claimed %d/%d decision(s) (action=%s)",
+            len(claimed_ids), requested_count, action,
         )
+
+        job_id = uuid.uuid4().hex[:12]
+        with _bulk_jobs_lock:
+            _bulk_jobs[job_id] = {
+                "id": job_id, "action": action, "total": len(decision_ids), "done": 0,
+                "succeeded": 0, "skipped": skipped_contended, "failed": 0, "status": "running",
+                "started_at": datetime.utcnow().isoformat(), "updated_at": datetime.utcnow().isoformat(),
+            }
+        threading.Thread(target=_bulk_job_thread, name=f"bulk-{action}-{job_id}", daemon=True,
+                         args=(job_id, action, decision_ids, skipped_contended, ship_to_ob)).start()
+        handed_off = True
+        logger.info("[BULK ACTION] job=%s started on a background thread (action=%s, rows=%d)",
+                    job_id, action, len(decision_ids))
+        sep = "&" if redirect_qs else ""
+        return RedirectResponse(f"/decisions?{redirect_qs}{sep}bulk_job={job_id}", status_code=303)
     except Exception as e:
         logger.error(f"[BULK ACTION] Fatal error: {e}", exc_info=True)
         return RedirectResponse(f"/decisions?msg={quote('Bulk action failed: ' + str(e))}&msg_type=error", status_code=303)
     finally:
-        # Always release the claimed decisions, including on the error path above — otherwise a
-        # single failed run would permanently block those decisions from being retried.
-        try:
-            with _bulk_action_inflight_lock:
-                _bulk_action_inflight_decisions.difference_update(claimed_ids)
-            logger.info("[BULK ACTION] Released %d in-flight decision claim(s)", len(claimed_ids))
-        except NameError:
-            pass  # request failed before any ids were claimed
+        # Once the job thread owns the claims it releases them itself; release here only if the
+        # request failed before handing off.
+        if not handed_off:
+            try:
+                with _bulk_action_inflight_lock:
+                    _bulk_action_inflight_decisions.difference_update(claimed_ids)
+                logger.info("[BULK ACTION] Released %d in-flight decision claim(s)", len(claimed_ids))
+            except NameError:
+                pass  # request failed before any ids were claimed
 
 
 # ═══════════════════════════════════════════════════════════

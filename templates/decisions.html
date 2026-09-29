@@ -37,6 +37,54 @@
     {% if error %}
     <div class="alert alert-error">⚠️ {{ error }}</div>
     {% endif %}
+    {% if bulk_job_id %}
+    {# Bulk actions run on a background thread; this banner polls their progress. #}
+    <div id="bulkJobBanner" class="alert {% if bulk_job %}alert-success{% else %}alert-error{% endif %}"
+        style="margin-bottom:16px;" data-job="{{ bulk_job_id }}"
+        data-status="{{ bulk_job.status if bulk_job else 'unknown' }}">
+        {% if bulk_job %}
+        Bulk {{ bulk_job.action }}: {{ bulk_job.done }} of {{ bulk_job.total }} done…
+        {% else %}
+        This bulk run is no longer being tracked (the server restarted). Check Activity for the result.
+        Running it again is safe: rows already done are skipped.
+        {% endif %}
+    </div>
+    <script>
+    (function () {
+        var el = document.getElementById('bulkJobBanner');
+        if (!el || el.dataset.status !== 'running') return;
+        var lastDone = -1, lastChange = Date.now();
+        function tick() {
+            fetch('/decisions/bulk-job/' + encodeURIComponent(el.dataset.job))
+                .then(function (r) { return r.json(); })
+                .then(function (j) {
+                    if (j.status === 'running') {
+                        if (j.done !== lastDone) { lastDone = j.done; lastChange = Date.now(); }
+                        var stalled = Date.now() - lastChange > 10 * 60 * 1000;
+                        el.className = 'alert ' + (stalled ? 'alert-error' : 'alert-success');
+                        el.textContent = stalled
+                            ? 'Bulk ' + j.action + ' has made no progress for 10 minutes. Check Activity. Running it again is safe: rows already done are skipped.'
+                            : 'Bulk ' + j.action + ' running: ' + j.done + ' of ' + j.total + ' done (' + j.skipped + ' skipped, ' + j.failed + ' failed). You can keep working; this updates by itself.';
+                        setTimeout(tick, 3000);
+                    } else if (j.status === 'done' || j.status === 'error') {
+                        var p = new URLSearchParams(location.search);
+                        p.delete('bulk_job');
+                        p.set('msg', j.status === 'done'
+                            ? 'Bulk ' + j.action + ' finished: ' + j.succeeded + ' done, ' + j.skipped + ' skipped, ' + j.failed + ' failed'
+                            : 'Bulk ' + j.action + ' stopped with an error: ' + (j.error || '') + '. Check Activity.');
+                        p.set('msg_type', j.status === 'done' && !j.failed ? 'success' : 'error');
+                        location.replace(location.pathname + '?' + p.toString());
+                    } else {
+                        el.className = 'alert alert-error';
+                        el.textContent = 'This bulk run is no longer being tracked (the server restarted). Check Activity for the result. Running it again is safe: rows already done are skipped.';
+                    }
+                })
+                .catch(function () { setTimeout(tick, 5000); });
+        }
+        setTimeout(tick, 1500);
+    })();
+    </script>
+    {% endif %}
 
     <!-- ── Filter Bar ── -->
     <div
