@@ -2652,6 +2652,42 @@ def get_rejected_kit_map(db, customer_id: str, shipments: list[dict]) -> dict[st
     return rejected
 
 
+def kit_reserved_counts(db, kit_ids: list) -> dict:
+    """kit_id -> number of PENDING decisions holding that kit.
+    Stock (quantity_available) only comes down at approve/ship, so without this every new pending
+    box sees the same on-hand units (Thread 25: 3 BT-21 units assigned to far more boxes).
+    Approved boxes are not counted: approve already took them off quantity_available."""
+    counts: dict = {}
+    ids = [k for k in (kit_ids or []) if k]
+    if not ids:
+        return counts
+    offset = 0
+    while True:
+        rows = (db.table("decisions").select("kit_id").eq("status", "pending").in_("kit_id", ids)
+                .range(offset, offset + 999).execute().data or [])
+        for r in rows:
+            counts[r["kit_id"]] = counts.get(r["kit_id"], 0) + 1
+        if len(rows) < 1000:
+            return counts
+        offset += 1000
+
+
+def kits_with_free_stock(db, kits: list, context: str) -> list:
+    """Keep kits whose on-hand stock minus units reserved by pending boxes is still > 0."""
+    if not kits:
+        return []
+    reserved = kit_reserved_counts(db, [k.get("id") for k in kits])
+    keep = []
+    for k in kits:
+        free = int(k.get("quantity_available") or 0) - reserved.get(k.get("id"), 0)
+        if free > 0:
+            keep.append(k)
+        else:
+            logger.info("[KIT STOCK] %s: %s dropped — on_hand=%s reserved_by_pending=%s free=%s",
+                        context, k.get("sku"), k.get("quantity_available"), reserved.get(k.get("id"), 0), free)
+    return keep
+
+
 def get_eligible_override_kits(db, cust: dict, enriched_shipments: list, exclude_kit_sku: str | None = None) -> list[dict]:
     """Return all kits this customer is eligible for using the same logic as the auto-engine,
     minus the kit already auto-assigned (passed as exclude_kit_sku).
@@ -2704,7 +2740,7 @@ def get_eligible_override_kits(db, cust: dict, enriched_shipments: list, exclude
         .order("age_rank")
         .execute()
     )
-    available_kits = kits_result.data or []
+    available_kits = kits_with_free_stock(db, kits_result.data or [], "override list")
 
     # Size filter — same rule as engine
     if clothing_size:
@@ -2840,14 +2876,14 @@ async def assign_kit(customer_id: str, ship_date_val: date) -> dict:
     else:
         kits_result = db.table("kits").select("*").eq("trimester", trimester).eq("is_welcome_kit", False).gt("quantity_available", 0).order("age_rank").execute()
 
-    available_kits = kits_result.data or []
-    logger.info(f"[DECISION ENGINE] Found {len(available_kits)} {'welcome' if is_new else 'regular'} kits for T{trimester} with stock > 0")
+    available_kits = kits_with_free_stock(db, kits_result.data or [], f"assign_kit customer={customer_id}")
+    logger.info(f"[DECISION ENGINE] Found {len(available_kits)} {'welcome' if is_new else 'regular'} kits for T{trimester} with free stock (on hand minus pending)")
 
     if not available_kits:
         kit_type = "welcome" if is_new else "regular"
         return {
             "decision_type": "needs-curation",
-            "reason": f"No {kit_type} kits with stock > 0 for T{trimester}. Add kits in the Kits page first.",
+            "reason": f"No {kit_type} kits with free stock for T{trimester} (on hand minus units already on pending boxes). Add stock or kits in the Kits page first.",
             "kit_id": None,
             "kit_sku": None,
         }
