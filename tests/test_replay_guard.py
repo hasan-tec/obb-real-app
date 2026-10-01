@@ -27,6 +27,18 @@ class _Q:
         self.filters.append(lambda r: v in str(r.get(col) or "").lower())
         return self
 
+    def gte(self, col, val):
+        self.filters.append(lambda r: str(r.get(col) or "") >= str(val))
+        return self
+
+    def lt(self, col, val):
+        self.filters.append(lambda r: str(r.get(col) or "") < str(val))
+        return self
+
+    def neq(self, col, val):
+        self.filters.append(lambda r: str(r.get(col)) != str(val))
+        return self
+
     def in_(self, col, vals):
         self.filters.append(lambda r: r.get(col) in set(vals))
         return self
@@ -91,14 +103,20 @@ def test_existing_box_shopify_any_decision_blocks():
     assert app._replay_existing_box(db, "222", "shopify") is None
 
 
-def test_existing_box_cratejoy_only_open_or_this_month_blocks():
+def test_existing_box_cratejoy_open_box_or_customer_box_this_month_blocks():
     this_month = date.today().isoformat()[:7] + "-01"
-    old = {"id": "d1", "order_id": "S1", "status": "shipped", "ship_date": "2026-01-01"}
-    assert app._replay_existing_box(FakeDB({"decisions": [old]}), "S1", "cratejoy") is None      # last month's box
-    open_box = {"id": "d2", "order_id": "S1", "status": "pending", "ship_date": "2026-01-01"}
-    assert app._replay_existing_box(FakeDB({"decisions": [old, open_box]}), "S1", "cratejoy")["id"] == "d2"
-    shipped_now = {"id": "d3", "order_id": "S1", "status": "shipped", "ship_date": this_month}
-    assert app._replay_existing_box(FakeDB({"decisions": [shipped_now]}), "S1", "cratejoy")["id"] == "d3"
+    old = {"id": "d1", "order_id": "S1", "customer_id": "c1", "status": "shipped", "ship_date": "2026-01-01"}
+    assert app._replay_existing_box(FakeDB({"decisions": [old]}), "S1", "cratejoy", "c1") is None   # last month's box
+    open_box = {"id": "d2", "order_id": "S1", "customer_id": "c1", "status": "pending", "ship_date": "2026-01-01"}
+    assert app._replay_existing_box(FakeDB({"decisions": [old, open_box]}), "S1", "cratejoy", "c1")["id"] == "d2"
+    # daily-sync box this month stored under a DIFFERENT id (order-type payload) still blocks via the customer
+    synced = {"id": "d3", "order_id": "SUB-9", "customer_id": "c1", "status": "shipped", "ship_date": this_month}
+    assert app._replay_existing_box(FakeDB({"decisions": [synced]}), "ORDER-5", "cratejoy", "c1")["id"] == "d3"
+    # a box staff REJECTED this month doesn't block (same as the daily sync)
+    rejected = {"id": "d4", "order_id": "S1", "customer_id": "c1", "status": "rejected", "ship_date": this_month}
+    assert app._replay_existing_box(FakeDB({"decisions": [rejected]}), "S1", "cratejoy", "c1") is None
+    # no id at all: the customer rule still applies
+    assert app._replay_existing_box(FakeDB({"decisions": [synced]}), "", "cratejoy", "c1")["id"] == "d3"
 
 
 def test_replay_refuses_customer_update_payload(monkeypatch):
@@ -132,7 +150,13 @@ def test_replay_of_order_that_already_has_a_box_creates_no_new_box(monkeypatch):
     asyncio.run(app.replay_webhook("w2"))
     assert not db.inserts.get("decisions")
     assert len([d for d in db.tables["decisions"] if d["order_id"] == "777"]) == 1
-    assert any("already has a box" in a["summary"] for a in db.tables.get("activity_log", []))  # the guard ran
+    acts = [a["summary"] for a in db.tables.get("activity_log", [])]
+    assert any("already has a box" in a for a in acts)                     # the guard ran
+    assert not any(a.startswith("Replayed Shopify webhook") for a in acts)  # no misleading success line
+    original = [r for r in db.tables["webhook_logs"] if r["id"] == "w2"][0]
+    replay = [r for r in db.tables["webhook_logs"] if r["id"] != "w2"][0]
+    assert original["error_message"].startswith("Replay skipped: order already has a box")
+    assert replay["error_message"].startswith("Skipped: order already has a box")
 
 
 def test_control_replay_of_order_without_a_box_still_creates_one(monkeypatch):
