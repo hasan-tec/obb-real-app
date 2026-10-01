@@ -8672,7 +8672,8 @@ async def veracore_sync_inventory_now(request: Request):
             return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
                                     status_code=303)
         from veracore_sync import run_inventory_sync
-        r = await asyncio.get_running_loop().run_in_executor(None, run_inventory_sync, db, vc)
+        r = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: run_inventory_sync(get_supabase(), vc))  # executor thread's own client
         await log_activity("veracore",
                            f"Manual inventory sync: kits={r['synced']} items={r.get('items_synced', 0)} skipped={r['skipped']} alerts={r['alerts_raised']}",
                            (r.get("error") or "")[:200],
@@ -8742,7 +8743,8 @@ async def veracore_sync_expiry_now(request: Request):
             return RedirectResponse("/veracore?msg=VeraCore+client+unavailable&msg_type=error",
                                     status_code=303)
         from veracore_sync import run_expiry_sync
-        r = await asyncio.get_running_loop().run_in_executor(None, run_expiry_sync, db, vc)
+        r = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: run_expiry_sync(get_supabase(), vc))  # executor thread's own client
         await log_activity("veracore",
                            f"Manual expiry sync: updated={r['updated']} no_match={r['skipped_no_match']}",
                            (r.get("error") or "")[:200],
@@ -9728,7 +9730,10 @@ async def _run_bulk_action(job_id: str, action: str, decision_ids: list, skipped
         )
         _bulk_job_set(job_id, status="done", succeeded=success, skipped=skipped, failed=failed,
                       finished_at=datetime.utcnow().isoformat())
-        await bg()  # queued VeraCore pushes (approve) — same as the old post-response background tasks
+        try:
+            await bg()  # queued VeraCore pushes (approve) — same as the old post-response background tasks
+        except Exception as push_err:  # the DB work is done; a push problem must not flip the job to "error"
+            logger.error(f"[BULK ACTION] job={job_id} VeraCore push tasks failed: {push_err}", exc_info=True)
     except Exception as e:
         logger.error(f"[BULK ACTION] Fatal error in bulk job {job_id}: {e}", exc_info=True)
         _bulk_job_set(job_id, status="error", error=str(e)[:300], finished_at=datetime.utcnow().isoformat())
@@ -9758,6 +9763,13 @@ def _bulk_job_thread(*args) -> None:
         asyncio.run(_run_bulk_action(*args))
     except Exception as e:  # never let the thread die silently
         logger.error(f"[BULK ACTION] bulk job thread crashed: {e}", exc_info=True)
+        # If the job never started (e.g. creating the client failed), _run_bulk_action's finally
+        # didn't run: release the claims here so a retry isn't refused as "already running".
+        job_id, decision_ids = args[0], args[2]
+        with _bulk_action_inflight_lock:
+            _bulk_action_inflight_decisions.difference_update(decision_ids)
+        if (bulk_job_snapshot(job_id) or {}).get("status") == "running":
+            _bulk_job_set(job_id, status="error", error=str(e)[:300], finished_at=datetime.utcnow().isoformat())
     finally:
         _thread_db.client = None
 
