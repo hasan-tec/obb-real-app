@@ -48,19 +48,27 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANO
 
 supabase: Client = None  # type: ignore
 
-# A worker thread (bulk job) can set its own client here. The shared client's HTTP/2
-# connection must not be used from two threads at once: measured locally 2026-09-29, a bulk
-# reject running on its thread and a /customers page load on the event loop hit it at the
-# same moment and Supabase dropped the connection (RemoteProtocolError ConnectionTerminated),
-# failing one bulk row and the page.
+# Every thread other than the main (event-loop) thread gets its OWN client. The shared
+# client's HTTP/2 connection must not be used from two threads at once:
+#  - 2026-09-29 local test: a bulk job thread + a page load -> ConnectionTerminated.
+#  - 2026-10-01 renewal night: the daily-sync scheduler thread + incoming Shopify webhooks ->
+#    "[Errno 11] Resource temporarily unavailable"; 12 orders/create webhooks failed and, since the
+#    handler answers Shopify 200 anyway, were never retried.
 _thread_db = threading.local()
 
 
 def get_supabase() -> Client:
-    """Lazy-init Supabase client (the calling thread's own client when it set one)."""
+    """Lazy-init Supabase client. Background threads (scheduler jobs, bulk jobs, thread-pool
+    work) each get their own client; the main thread uses the shared one."""
     own = getattr(_thread_db, "client", None)
     if own is not None:
         return own
+    if threading.current_thread() is not threading.main_thread():
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("Supabase credentials not configured")
+        _thread_db.client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("[SUPABASE] new client for thread %s", threading.current_thread().name)
+        return _thread_db.client
     global supabase
     if supabase is None:
         if not SUPABASE_URL or not SUPABASE_KEY:
