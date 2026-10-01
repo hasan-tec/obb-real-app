@@ -4609,6 +4609,43 @@ async def webhook_detail(request: Request, webhook_id: str):
         return HTMLResponse(f"Webhook not found: {e}", status_code=404)
 
 
+REPLAYABLE_SHOPIFY_EVENTS = ("orders/create", "orders/updated", "orders/paid")
+
+
+def _base_event_type(event_type: str) -> str:
+    """'replay_replay_orders/create' -> 'orders/create'."""
+    et = event_type or ""
+    while et.startswith("replay_"):
+        et = et[len("replay_"):]
+    return et
+
+
+def _replay_existing_box(db, order_id: str, platform: str, customer_id: str | None = None) -> dict | None:
+    """The decision a webhook replay must not duplicate, or None.
+    Shopify: one order = one box, so ANY decision for the order blocks a new one (a rejected one
+    included: a cancelled or closed order must not come back through Replay; use Recurate).
+    Cratejoy: the subscription id repeats every month and an order-type payload carries a different
+    id than the daily sync stores, so it blocks on (a) an open box (pending/approved) with this id, or
+    (b) the daily sync's own rule: a non-rejected box for this customer dated this month."""
+    rows = (db.table("decisions").select("id, status, ship_date, created_at")
+            .eq("order_id", str(order_id)).execute().data or []) if order_id else []
+    if platform == "shopify":
+        return rows[0] if rows else None
+    for r in rows:
+        if r.get("status") in ("pending", "approved"):
+            return r
+    if customer_id:
+        today = date.today()
+        month_start = date(today.year, today.month, 1)
+        month_end = date(today.year + (today.month == 12), today.month % 12 + 1, 1)
+        same_month = (db.table("decisions").select("id, status, ship_date, created_at")
+                      .eq("customer_id", customer_id).gte("ship_date", str(month_start))
+                      .lt("ship_date", str(month_end)).neq("status", "rejected").limit(1).execute().data or [])
+        if same_month:
+            return same_month[0]
+    return None
+
+
 @app.post("/webhooks/{webhook_id}/replay")
 async def replay_webhook(webhook_id: str):
     """
@@ -4619,6 +4656,7 @@ async def replay_webhook(webhook_id: str):
     start_time = time.time()
     db = get_supabase()
     replay_log_id = None
+    replay_skip_note = None  # set when the duplicate guard skips creating a box
 
     try:
         # ─── Load original webhook ───
@@ -4661,6 +4699,16 @@ async def replay_webhook(webhook_id: str):
         # ═══════════════════════════════════════════════════════
         if source == "shopify":
             logger.info(f"[WEBHOOK REPLAY] Processing Shopify payload")
+            base_event = _base_event_type(wh.get("event_type", ""))
+            if base_event not in REPLAYABLE_SHOPIFY_EVENTS:
+                # The code below treats the payload as an ORDER; a customers/update payload would be
+                # misread (its customer id taken as an order id). Refuse instead of guessing.
+                msg = f"Only Shopify order webhooks can be replayed (this one is '{base_event or 'unknown'}') — nothing changed"
+                logger.warning(f"[WEBHOOK REPLAY] {msg}")
+                if replay_log_id:
+                    db.table("webhook_logs").update({"status": "failed", "error_message": msg}).eq("id", replay_log_id).execute()
+                await log_activity("webhook", "Webhook replay refused: not an order webhook", f"{msg}. Original: {webhook_id}", "warning")
+                return RedirectResponse(f"/webhooks/{webhook_id}", status_code=303)
 
             shopify_order_id = str(payload.get("id", ""))
             customer_data = payload.get("customer", {})
@@ -4778,7 +4826,15 @@ async def replay_webhook(webhook_id: str):
                 replay_cancelled_at = None
                 if cust_id and is_subscription_order:
                     replay_cancelled_at = payload.get("cancelled_at") or _order_cancelled_at(db, shopify_order_id)
-                if replay_cancelled_at:
+                replay_existing = (_replay_existing_box(db, shopify_order_id, "shopify")
+                                   if cust_id and is_subscription_order else None)
+                if replay_existing:
+                    replay_skip_note = (f"order already has a box (decision {replay_existing['id'][:8]}, "
+                                        f"{replay_existing['status']}) — no new box created")
+                    logger.info(f"[WEBHOOK REPLAY] Order {shopify_order_id}: {replay_skip_note}")
+                    await log_activity("webhook", f"Replay for {email}: {replay_skip_note}",
+                                       f"order={shopify_order_id}. Customer profile was refreshed.", "info")
+                elif replay_cancelled_at:
                     logger.info(f"[WEBHOOK REPLAY] Order {shopify_order_id} is cancelled ({replay_cancelled_at}) "
                                 f"— no decision created")
                     await log_activity("webhook", f"Replay skipped curation for {email} — Shopify order is cancelled",
@@ -4830,10 +4886,15 @@ async def replay_webhook(webhook_id: str):
             # Mark replay as successful
             elapsed_ms = int((time.time() - start_time) * 1000)
             if replay_log_id:
-                db.table("webhook_logs").update({"status": "processed", "processing_time_ms": elapsed_ms}).eq("id", replay_log_id).execute()
+                db.table("webhook_logs").update({
+                    "status": "processed", "processing_time_ms": elapsed_ms,
+                    **({"error_message": f"Skipped: {replay_skip_note}"} if replay_skip_note else {}),
+                }).eq("id", replay_log_id).execute()
             # Mark original as replayed (isolated try/except — don't crash if CHECK constraint hasn't been updated yet)
             try:
-                db.table("webhook_logs").update({"status": "replayed", "error_message": f"Replayed successfully → {replay_log_id}"}).eq("id", webhook_id).execute()
+                db.table("webhook_logs").update({"status": "replayed", "error_message": (
+                    f"Replay skipped: {replay_skip_note} → {replay_log_id}" if replay_skip_note
+                    else f"Replayed successfully → {replay_log_id}")}).eq("id", webhook_id).execute()
             except Exception as e:
                 logger.warning(f"[WEBHOOK REPLAY] Could not mark original as 'replayed' (CHECK constraint?): {e}")
                 # Fallback: mark as processed with a note
@@ -4841,7 +4902,8 @@ async def replay_webhook(webhook_id: str):
                     db.table("webhook_logs").update({"error_message": f"Replayed → {replay_log_id}"}).eq("id", webhook_id).execute()
                 except Exception:
                     pass
-            await log_activity("webhook", f"Replayed Shopify webhook (order #{shopify_order_id})", f"Original: {webhook_id}, Replay: {replay_log_id}", "success")
+            if not replay_skip_note:  # the skip already wrote its own Activity line
+                await log_activity("webhook", f"Replayed Shopify webhook (order #{shopify_order_id})", f"Original: {webhook_id}, Replay: {replay_log_id}", "success")
             logger.info(f"[WEBHOOK REPLAY] Shopify replay complete in {elapsed_ms}ms")
             return RedirectResponse(f"/webhooks/{replay_log_id}", status_code=303)
 
@@ -5100,7 +5162,15 @@ async def replay_webhook(webhook_id: str):
                             logger.warning(f"[WEBHOOK REPLAY] Address+survey fetch failed (non-fatal): {e}")
 
                 # Decision
-                if cust_id:
+                cj_existing = _replay_existing_box(db, cj_order_id, "cratejoy", cust_id) if cust_id else None
+                if cj_existing:
+                    replay_skip_note = (f"customer already has a box this month or an open one for this "
+                                        f"subscription (decision {cj_existing['id'][:8]}, {cj_existing['status']}) "
+                                        f"— no new box created")
+                    logger.info(f"[WEBHOOK REPLAY] CJ {cj_order_id}: {replay_skip_note}")
+                    await log_activity("webhook", f"Replay for {email}: {replay_skip_note}",
+                                       f"cratejoy={cj_order_id}. Customer profile was refreshed.", "info")
+                elif cust_id:
                     _cj_order_type = _compute_order_type(db, cust_id)
                     if (is_cancelled and not is_prepaid) or is_expired:
                         db.table("decisions").insert({
@@ -5148,17 +5218,23 @@ async def replay_webhook(webhook_id: str):
             # Mark replay as successful
             elapsed_ms = int((time.time() - start_time) * 1000)
             if replay_log_id:
-                db.table("webhook_logs").update({"status": "processed", "processing_time_ms": elapsed_ms}).eq("id", replay_log_id).execute()
+                db.table("webhook_logs").update({
+                    "status": "processed", "processing_time_ms": elapsed_ms,
+                    **({"error_message": f"Skipped: {replay_skip_note}"} if replay_skip_note else {}),
+                }).eq("id", replay_log_id).execute()
             # Mark original as replayed (isolated try/except — don't crash if CHECK constraint hasn't been updated yet)
             try:
-                db.table("webhook_logs").update({"status": "replayed", "error_message": f"Replayed successfully → {replay_log_id}"}).eq("id", webhook_id).execute()
+                db.table("webhook_logs").update({"status": "replayed", "error_message": (
+                    f"Replay skipped: {replay_skip_note} → {replay_log_id}" if replay_skip_note
+                    else f"Replayed successfully → {replay_log_id}")}).eq("id", webhook_id).execute()
             except Exception as e:
                 logger.warning(f"[WEBHOOK REPLAY] Could not mark original as 'replayed' (CHECK constraint?): {e}")
                 try:
                     db.table("webhook_logs").update({"error_message": f"Replayed → {replay_log_id}"}).eq("id", webhook_id).execute()
                 except Exception:
                     pass
-            await log_activity("webhook", f"Replayed Cratejoy webhook (CJ ID: {cj_order_id})", f"Original: {webhook_id}, Replay: {replay_log_id}", "success")
+            if not replay_skip_note:  # the skip already wrote its own Activity line
+                await log_activity("webhook", f"Replayed Cratejoy webhook (CJ ID: {cj_order_id})", f"Original: {webhook_id}, Replay: {replay_log_id}", "success")
             logger.info(f"[WEBHOOK REPLAY] Cratejoy replay complete in {elapsed_ms}ms")
             return RedirectResponse(f"/webhooks/{replay_log_id}", status_code=303)
 
