@@ -165,3 +165,24 @@ def test_bulk_thread_uses_its_own_db_client(monkeypatch):
     t.join()
     assert seen["thread"] is mine          # the job thread gets its own client
     assert app.get_supabase() is shared    # everyone else keeps the shared one
+
+
+def test_any_background_thread_gets_its_own_client_main_thread_keeps_shared(monkeypatch):
+    import threading
+    shared = object()
+    made = []
+    monkeypatch.setattr(app, "supabase", shared)
+    monkeypatch.setattr(app, "create_client", lambda url, key: made.append(object()) or made[-1])
+    monkeypatch.setattr(app, "SUPABASE_URL", "u")
+    monkeypatch.setattr(app, "SUPABASE_KEY", "k")
+    seen = {}
+
+    def worker(name):
+        seen[name] = (app.get_supabase(), app.get_supabase())  # same client twice within one thread
+    ts = [threading.Thread(target=worker, args=(n,), name=n) for n in ("scheduler", "pool-1")]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert seen["scheduler"][0] is seen["scheduler"][1]
+    assert seen["scheduler"][0] is not seen["pool-1"][0]
+    assert shared not in (seen["scheduler"][0], seen["pool-1"][0])
+    assert app.get_supabase() is shared
