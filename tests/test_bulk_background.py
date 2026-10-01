@@ -186,3 +186,28 @@ def test_any_background_thread_gets_its_own_client_main_thread_keeps_shared(monk
     assert seen["scheduler"][0] is not seen["pool-1"][0]
     assert shared not in (seen["scheduler"][0], seen["pool-1"][0])
     assert app.get_supabase() is shared
+
+
+def test_job_thread_releases_claims_if_it_cannot_start(monkeypatch):
+    def boom(url, key):
+        raise RuntimeError("no client")
+    monkeypatch.setattr(app, "create_client", boom)
+    app._bulk_jobs["j9"] = {"id": "j9", "action": "reject", "total": 1, "done": 0, "succeeded": 0,
+                            "skipped": 0, "failed": 0, "status": "running"}
+    app._bulk_action_inflight_decisions.add("z1")
+    app._bulk_job_thread("j9", "reject", ["z1"], 0, False)
+    assert "z1" not in app._bulk_action_inflight_decisions
+    assert app.bulk_job_snapshot("j9")["status"] == "error"
+
+
+def test_veracore_push_failure_does_not_flip_finished_job_to_error(monkeypatch):
+    db = FakeDB([_decision(1)])
+    _setup(monkeypatch, db)
+
+    def bad_push(*_a):
+        raise RuntimeError("veracore down")
+    monkeypatch.setattr(app, "submit_to_veracore", bad_push)
+    app._bulk_jobs["j10"] = {"id": "j10", "action": "approve", "total": 1, "done": 0, "succeeded": 0,
+                             "skipped": 0, "failed": 0, "status": "running"}
+    asyncio.run(app._run_bulk_action("j10", "approve", ["d1"], 0, False))
+    assert app.bulk_job_snapshot("j10")["status"] == "done"
