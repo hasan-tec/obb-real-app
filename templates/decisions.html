@@ -199,7 +199,7 @@
         <!-- Export buttons (outside filter form so they don't interfere with submit) -->
         <div
             style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);align-items:center;">
-            <a href="/decisions/export-csv{% if filter_qs %}?{{ filter_qs }}{% if 'status=' not in filter_qs %}&status=approved{% endif %}{% else %}?status=approved{% endif %}"
+            <a href="/decisions/export-csv{% if filter_qs %}?{{ filter_qs }}{% if 'status=' not in filter_qs %}&status={{ 'shipped' if filters.shipped_on else 'approved' }}{% endif %}{% else %}?status=approved{% endif %}"
                 class="btn btn-sm" style="background:var(--blue);color:white;border:none;"
                 title="Download Pirate Ship CSV">
                 📥 Pirate Ship CSV
@@ -670,18 +670,21 @@
         var d = new Date();
         return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
     }
+    function offsetForDate(ymd) {
+        // getTimezoneOffset for local midnight of THAT date, so a date across a DST change is right
+        var p = (ymd || '').split('-');
+        if (p.length !== 3) return new Date().getTimezoneOffset();
+        return new Date(+p[0], +p[1] - 1, +p[2]).getTimezoneOffset();
+    }
     function shippedToday() {
-        var f = document.getElementById('decisionsFilterForm');
-        document.getElementById('shippedOnInput').value = localToday();
-        var st = f.querySelector('[name=status]');
-        if (st) st.value = 'shipped';
-        document.getElementById('tzoInput').value = String(new Date().getTimezoneOffset());
-        f.submit();
+        // Exactly today's shipped boxes: no leftover month/search filters hiding any.
+        var t = localToday();
+        location.href = '/decisions?status=shipped&shipped_on=' + t + '&tzo=' + offsetForDate(t);
     }
     (function () {
         var f = document.getElementById('decisionsFilterForm');
         if (f) f.addEventListener('submit', function () {
-            document.getElementById('tzoInput').value = String(new Date().getTimezoneOffset());
+            document.getElementById('tzoInput').value = String(offsetForDate(document.getElementById('shippedOnInput').value));
         });
     })();
 

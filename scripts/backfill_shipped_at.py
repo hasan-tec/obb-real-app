@@ -7,7 +7,7 @@ Source of the date, in order:
   2. a shipment for the same customer + order id,
   3. otherwise the decision's own updated_at (approximate; reported separately).
 The date is stored as 12:00 UTC on that day, so it lands on the same calendar day for viewers
-anywhere from UTC-11 to UTC+11. Only rows with status 'shipped' and shipped_at empty are touched,
+anywhere from UTC-12 to UTC+11. Only rows with status 'shipped' and shipped_at empty are touched,
 so a re-run is a no-op.
 
 Dry run (default):  python scripts/backfill_shipped_at.py
@@ -65,15 +65,17 @@ def main() -> int:
     decs = [d for d in _all(db, "decisions", "id, customer_id, order_id, updated_at, shipped_at", status="shipped")
             if not d.get("shipped_at")]
     ships = _all(db, "shipments", "customer_id, order_id, ship_date, notes")
-    by_ref, by_order = {}, {}
+    by_ref, order_days = {}, defaultdict(set)
     for s in ships:
         if not s.get("ship_date"):
             continue
         for ref in DECISION_REF.findall(s.get("notes") or ""):
-            by_ref.setdefault((s["customer_id"], ref.lower()), s["ship_date"])
+            key = (s["customer_id"], ref.lower())
+            by_ref[key] = max(by_ref.get(key, ""), s["ship_date"])  # latest stamp for that decision
         if s.get("order_id"):
-            prev = by_order.get((s["customer_id"], str(s["order_id"])))
-            by_order[(s["customer_id"], str(s["order_id"]))] = max(prev or "", s["ship_date"])
+            order_days[(s["customer_id"], str(s["order_id"]))].add(s["ship_date"])
+    # an order id is only trusted when it maps to ONE ship day (prepaid / multi-box orders repeat ids)
+    by_order = {k: next(iter(v)) for k, v in order_days.items() if len(v) == 1}
 
     plan, sources = defaultdict(list), Counter()
     for d in decs:

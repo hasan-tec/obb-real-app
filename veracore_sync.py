@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 # Matches "EXP 10/2026", "EXP 9/22", "Exp. 04/2022" AND "EXP January 2026", "EXP Jan 2026".
@@ -263,6 +263,17 @@ def run_inventory_sync(db, vc_client) -> dict:
     return result
 
 
+def _iso_or_now(value) -> str:
+    """VeraCore's shipped_at as a UTC ISO string; the current time if it's missing or unparseable."""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return datetime.now(timezone.utc).isoformat()
+
+
 def run_shipment_poll(db, vc_client, since_iso: Optional[str] = None) -> dict:
     """
     Pull shipment/tracking updates from VeraCore → update decisions with
@@ -326,7 +337,8 @@ def run_shipment_poll(db, vc_client, since_iso: Optional[str] = None) -> dict:
                 # Only mark the decision itself as shipped if it isn't already in a later state.
                 if d.get("status") in ("approved", "pending"):
                     patch["status"] = "shipped"
-                    patch["shipped_at"] = datetime.utcnow().isoformat() + "+00:00"  # "Shipped on" filter
+                    # "Shipped on" filter: VeraCore's own ship time when it parses, else now
+                    patch["shipped_at"] = _iso_or_now(shipped_at)
                 db.table("decisions").update(patch).eq("id", d["id"]).execute()
                 result["updated"] += 1
                 logger.info("[VERACORE POLL] Updated decision %s → tracking=%s shipped_at=%s",

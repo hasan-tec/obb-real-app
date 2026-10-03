@@ -5845,6 +5845,8 @@ async def decisions_page(request: Request):
         f_month       = request.query_params.get("month", "").strip()
         f_shipped_on  = request.query_params.get("shipped_on", "").strip()
         f_tzo         = request.query_params.get("tzo", "").strip()
+        if not re.fullmatch(r"-?\d{1,4}", f_tzo or ""):
+            f_tzo = ""  # only a plain minutes offset is echoed back into links
         shipped_range = shipped_on_range(f_shipped_on, f_tzo)
         f_order_type  = request.query_params.get("order_type", "").strip()
         # Thread 16 — filter by the CUSTOMER's clothing size so sized kit variants
@@ -10283,7 +10285,9 @@ async def export_decisions_csv(request: Request):
 
         # Re-apply same filter params as decisions page
         f_trimester  = request.query_params.get("trimester", "").strip()
-        f_status     = request.query_params.get("status", "approved").strip()  # default: approved only
+        # default: approved only — or shipped when a "Shipped on" date is given (only shipped boxes have one)
+        f_status     = request.query_params.get(
+            "status", "shipped" if request.query_params.get("shipped_on") else "approved").strip()
         f_type       = request.query_params.get("type", "").strip()
         f_platform   = request.query_params.get("platform", "").strip()
         f_order_type = request.query_params.get("order_type", "").strip()

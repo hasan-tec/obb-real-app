@@ -54,3 +54,11 @@ def test_backfill_prefers_the_decisions_own_shipment():
     assert bf.pick_ship_day(d, {}, by_order) == ("2026-09-20", "shipment_same_order")
     assert bf.pick_ship_day(d, {}, {}) == ("2026-09-30", "updated_at_fallback")
     assert bf.pick_ship_day({**d, "order_id": None, "updated_at": None}, {}, by_order) == (None, "no_date")
+
+
+def test_veracore_ship_time_is_used_when_present():
+    import veracore_sync as vs
+    assert vs._iso_or_now("2026-09-30T18:45:00Z") == "2026-09-30T18:45:00+00:00"
+    assert vs._iso_or_now("2026-09-30T18:45:00-07:00") == "2026-10-01T01:45:00+00:00"
+    assert vs._iso_or_now("") .endswith("+00:00")          # falls back to now
+    assert vs._iso_or_now(None).endswith("+00:00")
