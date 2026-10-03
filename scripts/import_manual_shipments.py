@@ -292,7 +292,8 @@ def main() -> int:
                 "reason": f"Auto-rejected: duplicate of {r['order_name']}, shipped by hand ({TAG}).",
             }).eq("id", d["id"]).eq("status", d["status"]).execute()
         if target:
-            upd = {"status": "shipped", "kit_id": kit["id"], "kit_sku": kit["sku"], "reason": reason}
+            upd = {"status": "shipped", "kit_id": kit["id"], "kit_sku": kit["sku"], "reason": reason,
+                   "shipped_at": f"{ship_date}T12:00:00+00:00"}
             if ful["tracking"]:
                 upd.update(tracking_number=ful["tracking"], tracking_pushed_at=datetime.utcnow().isoformat())
             db.table("decisions").update(upd).eq("id", target["id"]).in_("status", list(OPEN)).execute()

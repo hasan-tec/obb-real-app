@@ -245,7 +245,8 @@ def main() -> int:
             db.table("shipment_items").insert([{"shipment_id": sid, "item_id": i} for i in kit["items"]]).execute()
         reject(extras, f"duplicate of the September box shipped by hand ({kit['sku']})")
         if target:
-            upd = {"status": "shipped", "kit_id": kit["id"], "kit_sku": kit["sku"], "reason": reason}
+            upd = {"status": "shipped", "kit_id": kit["id"], "kit_sku": kit["sku"], "reason": reason,
+                   "shipped_at": f"{ship_date}T12:00:00+00:00"}
             if tracking:
                 upd.update(tracking_number=tracking, tracking_pushed_at=datetime.utcnow().isoformat())
             db.table("decisions").update(upd).eq("id", target["id"]).in_("status", list(OPEN)).execute()

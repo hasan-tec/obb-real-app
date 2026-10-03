@@ -69,6 +69,13 @@
                     } else if (j.status === 'done' || j.status === 'error') {
                         var p = new URLSearchParams(location.search);
                         p.delete('bulk_job');
+                        if (j.status === 'done' && j.action === 'ship') {
+                            // Land on exactly what was just processed: today's shipped boxes.
+                            p = new URLSearchParams();
+                            p.set('status', 'shipped');
+                            p.set('shipped_on', localToday());
+                            p.set('tzo', String(new Date().getTimezoneOffset()));
+                        }
                         p.set('msg', j.status === 'done'
                             ? 'Bulk ' + j.action + ' finished: ' + j.succeeded + ' done, ' + j.skipped + ' skipped, ' + j.failed + ' failed'
                             : 'Bulk ' + j.action + ' stopped with an error: ' + (j.error || '') + '. Check Activity.');
@@ -89,7 +96,7 @@
     <!-- ── Filter Bar ── -->
     <div
         style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:14px;">
-        <form method="GET" action="/decisions" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+        <form method="GET" action="/decisions" id="decisionsFilterForm" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
             <div style="display:flex;flex-direction:column;gap:3px;">
                 <label
                     style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Trimester</label>
@@ -166,6 +173,19 @@
             </div>
             <div style="display:flex;flex-direction:column;gap:3px;">
                 <label
+                    style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;"
+                    title="Boxes marked shipped on this day (your local time). Pair with Status = Shipped, then use Pirate Ship CSV.">Shipped on</label>
+                <div style="display:flex;gap:4px;">
+                    <input type="date" name="shipped_on" id="shippedOnInput" value="{{ filters.shipped_on or '' }}"
+                        class="form-control" style="height:32px;font-size:13px;min-width:130px;">
+                    <button type="button" class="btn btn-sm" onclick="shippedToday()"
+                        style="height:32px;background:var(--surface2);border:1px solid var(--border);"
+                        title="Show the boxes shipped today">Today</button>
+                </div>
+                <input type="hidden" name="tzo" id="tzoInput" value="{{ filters.tzo or '' }}">
+            </div>
+            <div style="display:flex;flex-direction:column;gap:3px;">
+                <label
                     style="font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">Search</label>
                 <input type="text" name="q" value="{{ filters.q or '' }}" placeholder="name, email, SKU…"
                     class="form-control" style="height:32px;font-size:13px;min-width:150px;">
@@ -191,6 +211,8 @@
                 <input type="hidden" name="platform" value="{{ filters.platform or '' }}">
                 <input type="hidden" name="month" value="{{ filters.month or '' }}">
                 <input type="hidden" name="size" value="{{ filters.size or '' }}">
+                <input type="hidden" name="shipped_on" value="{{ filters.shipped_on or '' }}">
+                <input type="hidden" name="tzo" value="{{ filters.tzo or '' }}">
                 <input type="hidden" name="redirect_qs" value="{{ filter_qs or '' }}">
                 <button type="submit" class="btn btn-sm" style="background:var(--green);color:white;border:none;"
                     title="Push to Google Sheets">
@@ -642,6 +664,26 @@
             return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch];
         });
     }
+
+    // "Shipped on" filter — the date is the viewer's local day; tzo lets the server match it.
+    function localToday() {
+        var d = new Date();
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+    function shippedToday() {
+        var f = document.getElementById('decisionsFilterForm');
+        document.getElementById('shippedOnInput').value = localToday();
+        var st = f.querySelector('[name=status]');
+        if (st) st.value = 'shipped';
+        document.getElementById('tzoInput').value = String(new Date().getTimezoneOffset());
+        f.submit();
+    }
+    (function () {
+        var f = document.getElementById('decisionsFilterForm');
+        if (f) f.addEventListener('submit', function () {
+            document.getElementById('tzoInput').value = String(new Date().getTimezoneOffset());
+        });
+    })();
 
     function uploadTrackingCSV(input) {
         if (!input.files || !input.files[0]) return;

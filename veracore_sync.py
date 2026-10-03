@@ -326,6 +326,7 @@ def run_shipment_poll(db, vc_client, since_iso: Optional[str] = None) -> dict:
                 # Only mark the decision itself as shipped if it isn't already in a later state.
                 if d.get("status") in ("approved", "pending"):
                     patch["status"] = "shipped"
+                    patch["shipped_at"] = datetime.utcnow().isoformat() + "+00:00"  # "Shipped on" filter
                 db.table("decisions").update(patch).eq("id", d["id"]).execute()
                 result["updated"] += 1
                 logger.info("[VERACORE POLL] Updated decision %s → tracking=%s shipped_at=%s",
