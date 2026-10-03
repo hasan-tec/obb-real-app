@@ -5811,6 +5811,24 @@ async def customer_detail(request: Request, customer_id: str):
         return HTMLResponse(f"Customer not found: {e}", status_code=404)
 
 
+def shipped_on_range(date_str: str, tzo_str: str = "") -> tuple[str, str] | None:
+    """'Shipped on' filter -> (start, end) UTC ISO bounds for that calendar day in the VIEWER's
+    timezone. tzo = the browser's Date.getTimezoneOffset() in minutes (UTC minus local, e.g.
+    Manila -480, US Pacific 420); missing/invalid -> UTC. None if the date is empty or invalid."""
+    try:
+        day = datetime.strptime((date_str or "").strip(), "%Y-%m-%d")
+    except ValueError:
+        return None
+    try:
+        tzo = int(str(tzo_str or "0").strip())
+    except ValueError:
+        tzo = 0
+    if not -840 <= tzo <= 720:
+        tzo = 0
+    start = day + timedelta(minutes=tzo)
+    return start.isoformat() + "+00:00", (start + timedelta(days=1)).isoformat() + "+00:00"
+
+
 @app.get("/decisions", response_class=HTMLResponse)
 async def decisions_page(request: Request):
     """View kit assignment decisions. Supports filtering by trimester, status, type, platform, month, and sorting."""
@@ -5825,6 +5843,11 @@ async def decisions_page(request: Request):
         f_type        = request.query_params.get("type", "").strip()
         f_platform    = request.query_params.get("platform", "").strip()
         f_month       = request.query_params.get("month", "").strip()
+        f_shipped_on  = request.query_params.get("shipped_on", "").strip()
+        f_tzo         = request.query_params.get("tzo", "").strip()
+        if not re.fullmatch(r"-?\d{1,4}", f_tzo or ""):
+            f_tzo = ""  # only a plain minutes offset is echoed back into links
+        shipped_range = shipped_on_range(f_shipped_on, f_tzo)
         f_order_type  = request.query_params.get("order_type", "").strip()
         # Thread 16 — filter by the CUSTOMER's clothing size so sized kit variants
         # (e.g. the July baby mama tank) can be grouped and processed together.
@@ -5868,6 +5891,8 @@ async def decisions_page(request: Request):
                     qo = qo.gte("created_at", start_dt2).lt("created_at", end_dt2)
                 except Exception as me:
                     logger.warning(f"[DECISIONS PAGE] Invalid month param '{f_month}': {me}")
+            if shipped_range:  # boxes marked shipped on that day (viewer's timezone)
+                qo = qo.gte("shipped_at", shipped_range[0]).lt("shipped_at", shipped_range[1])
             return qo
 
         # customer_name is a virtual sort (joined field) — use created_at for DB query, sort in Python after
@@ -5971,11 +5996,16 @@ async def decisions_page(request: Request):
         if f_platform:   filter_qs_parts.append(f"platform={f_platform}")
         if f_order_type: filter_qs_parts.append(f"order_type={f_order_type}")
         if f_month:      filter_qs_parts.append(f"month={f_month}")
+        if shipped_range:
+            filter_qs_parts.append(f"shipped_on={f_shipped_on}")
+            if f_tzo:
+                filter_qs_parts.append(f"tzo={f_tzo}")
         if f_size:       filter_qs_parts.append(f"size={f_size}")
         if q:            filter_qs_parts.append(f"q={q}")
         filter_qs = "&".join(filter_qs_parts)
 
-        any_filter_active = bool(f_trimester or f_status or f_type or f_platform or f_order_type or f_month or f_size or q)
+        any_filter_active = bool(f_trimester or f_status or f_type or f_platform or f_order_type or f_month or f_size or q
+                                 or shipped_range)
 
         # Threads 20/21 UI data: each box's OWN ship-to (d._ship_to) and how many recipient
         # profiles its purchaser email has (d._recipient_count — template shows "N recipients").
@@ -5999,6 +6029,8 @@ async def decisions_page(request: Request):
                 "platform":   f_platform,
                 "order_type": f_order_type,
                 "month":      f_month,
+                "shipped_on": f_shipped_on if shipped_range else "",
+                "tzo":        f_tzo,
                 "size":       f_size,
                 "q":          q,
             },
@@ -8901,7 +8933,7 @@ async def ship_decision(request: Request, decision_id: str):
                 logger.info(f"[SHIP] Kit {kit.data['sku']} stock: {kit.data['quantity_available']} → {new_qty}")
 
         # Update decision status to shipped
-        db.table("decisions").update({"status": "shipped"}).eq("id", decision_id).execute()
+        db.table("decisions").update({"status": "shipped", "shipped_at": datetime.utcnow().isoformat() + "+00:00"}).eq("id", decision_id).execute()
 
         # Check if draft shipment was already created at Approve time
         existing_ship = db.table("shipments").select("id").eq("customer_id", d["customer_id"]).ilike("notes", f"%decision {decision_id[:8]}%").execute()
@@ -9657,7 +9689,7 @@ async def _run_bulk_action(job_id: str, action: str, decision_ids: list, skipped
                         _sk = kit_stock[d["kit_id"]]
                         _sk["quantity_available"] = max(0, _sk["quantity_available"] - 1)
                         logger.debug("[BULK ACTION] Kit %s stock -> %d (pending write)", _sk["sku"], _sk["quantity_available"])
-                    db.table("decisions").update({"status": "shipped"}).eq("id", did).execute()
+                    db.table("decisions").update({"status": "shipped", "shipped_at": datetime.utcnow().isoformat() + "+00:00"}).eq("id", did).execute()
                     # Stamp ship_date on existing draft shipment or create new
                     existing = db.table("shipments").select("id").eq("customer_id", d["customer_id"]).ilike("notes", f"%decision {did[:8]}%").execute()
                     if existing.data:
@@ -10253,11 +10285,15 @@ async def export_decisions_csv(request: Request):
 
         # Re-apply same filter params as decisions page
         f_trimester  = request.query_params.get("trimester", "").strip()
-        f_status     = request.query_params.get("status", "approved").strip()  # default: approved only
+        # default: approved only — or shipped when a "Shipped on" date is given (only shipped boxes have one)
+        f_status     = request.query_params.get(
+            "status", "shipped" if request.query_params.get("shipped_on") else "approved").strip()
         f_type       = request.query_params.get("type", "").strip()
         f_platform   = request.query_params.get("platform", "").strip()
         f_order_type = request.query_params.get("order_type", "").strip()
         f_month      = request.query_params.get("month", "").strip()
+        shipped_range = shipped_on_range(request.query_params.get("shipped_on", ""),
+                                         request.query_params.get("tzo", ""))
 
         def _build_export_q():
             qo = db.table("decisions").select("*, customers(*)")
@@ -10283,6 +10319,8 @@ async def export_decisions_csv(request: Request):
                     qo = qo.gte("created_at", start_dt).lt("created_at", end_dt)
                 except Exception as me:
                     logger.warning(f"[EXPORT CSV] Invalid month '{f_month}': {me}")
+            if shipped_range:  # same "Shipped on" day as the Decisions page
+                qo = qo.gte("shipped_at", shipped_range[0]).lt("shipped_at", shipped_range[1])
             return qo
 
         # Paginate past Supabase 1000-row cap
@@ -10578,6 +10616,7 @@ async def export_decisions_sheet(request: Request, background_tasks: BackgroundT
         f_platform  = form.get("platform", "")
         f_month     = form.get("month", "")
         f_size      = form.get("size", "")  # Thread 16 — keep export in step with the page filter
+        shipped_range = shipped_on_range(form.get("shipped_on", ""), form.get("tzo", ""))
         redirect_qs = form.get("redirect_qs", "")
 
         def _build_sheet_q():
@@ -10604,6 +10643,8 @@ async def export_decisions_sheet(request: Request, background_tasks: BackgroundT
                     qo = qo.gte("created_at", start_dt).lt("created_at", end_dt)
                 except Exception:
                     pass
+            if shipped_range:  # same "Shipped on" day as the Decisions page
+                qo = qo.gte("shipped_at", shipped_range[0]).lt("shipped_at", shipped_range[1])
             return qo
 
         # Paginate past Supabase 1000-row cap
