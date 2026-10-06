@@ -18,7 +18,7 @@ Handover package for Oh Baby Boxes. Prepared 2026-10-06. Code state: `main` @ `e
 | Asset | Today | After transfer |
 |---|---|---|
 | Source code | GitHub `hasan-tec/obb-real-app` | Repository transferred to OBB's GitHub account (full history, PRs) |
-| Hosting | Heroku app `obb-real-d4e16a8bb2ff` | App transferred to OBB's Heroku account. **Same URL**, so the Shopify webhooks keep working. Config vars move with the app. |
+| Hosting | Heroku app `obb-real` (Basic dyno, ~$7/mo, no add-ons) | App transferred to OBB's Heroku account. **Same URL**, so the Shopify webhooks keep working. Config vars move with the app. |
 | Database and logins | Supabase project `obb` (ref `tkcvvjxmzfjaesdhyfiy`) | Project transferred to OBB's Supabase organization. **Same URL and keys**, so no app change is needed. |
 | Shopify / Cratejoy / VeraCore / Google access | OBB's own accounts | No change. The app already uses OBB's credentials. |
 

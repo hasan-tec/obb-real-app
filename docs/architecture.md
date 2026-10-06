@@ -81,7 +81,7 @@ Supabase Auth, email + password. The role is in user metadata: `{"role": "admin"
 
 ## Hosting
 
-- Heroku app `obb-real-d4e16a8bb2ff`. URL `https://obb-real-d4e16a8bb2ff.herokuapp.com`. Auto-deploys from GitHub `main`. Python version is set in `.python-version`.
+- Heroku app `obb-real` (Basic dyno, no add-ons). URL `https://obb-real-d4e16a8bb2ff.herokuapp.com`. Auto-deploys from GitHub `main`. Python version is set in `.python-version`.
 - All secrets are Heroku config vars. See the list in [../HANDOVER.md](../HANDOVER.md#environment-variables).
 - Supabase project `obb` (ref `tkcvvjxmzfjaesdhyfiy`).
-- Logs: `heroku logs --tail -a obb-real-d4e16a8bb2ff`. App-level history is also on the Webhooks and Activity pages.
+- Logs: `heroku logs --tail -a obb-real`. App-level history is also on the Webhooks and Activity pages.
