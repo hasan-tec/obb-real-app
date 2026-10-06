@@ -1,97 +1,87 @@
 # OBB Curation Engine — Architecture
 
-## System Overview
+Current as of 2026-10-06 (main `e11f647`, migrations 001–024).
 
-Oh Baby Boxes receives subscription orders from Shopify and Cratejoy, runs a decision engine to assign the right kit to each customer, then pushes approved orders to VeraCore (warehouse/3PL) for fulfillment.
+## What the system does
+
+Oh Baby Boxes sells pregnancy and postpartum subscription boxes on Shopify and Cratejoy. For every box that is due, the engine picks the right kit, based on the customer's trimester at ship time, clothing size, items already received, and stock. Staff then review, approve or ship it, export it to Pirate Ship for labels, and upload the tracking file. Tracking is then pushed back to Shopify or Cratejoy.
 
 ```
-Shopify ──────────────────────────────────────────────┐
-  (order webhooks via HMAC)                            │
-                                                       ▼
-Cratejoy ─────────────────────────────────────────► FastAPI (app.py)
-  (order webhooks via HMAC)                       on Heroku 1x dyno
-                                                       │
-                                                       │  Decision Engine
-                                                       │  ↓ calculate trimester
-                                                       │  ↓ FIFO kit selection
-                                                       │  ↓ size/gender matching
-                                                       │
-                                                  Supabase (PostgreSQL)
-                                                  ├── customers
-                                                  ├── decisions
-                                                  ├── kits / kit_items
-                                                  ├── shipments
-                                                  ├── activity_log
-                                                  └── veracore_sync_log
-                                                       │
-                              ┌────────────────────────┤
-                              │                        │
-                              ▼                        ▼
-                         VeraCore                Google Sheets
-                    (SOAP AddOrder)              (decision export
-                    (REST inventory)              fallback / audit)
-                              │
-                              ▼
-                        Pirate Ship
-                      (CSV export for
-                       shipping labels)
+ Shopify ── webhooks (orders/create, orders/updated, customers/update) ──┐
+                                                                          ▼
+ Cratejoy ── daily pull of the unshipped-shipment queue (07:00 UTC) ──► FastAPI app (app.py)
+             (+ legacy webhook receiver)                                Heroku, 1 web dyno
+                                                                          │
+                                         decision engine (assign_kit) ◄───┤
+                                                                          ▼
+                                                              Supabase (PostgreSQL + Auth)
+                                                                          │
+              ┌───────────────────────────────┬───────────────────────────┼─────────────────────┐
+              ▼                               ▼                           ▼                     ▼
+      Decisions page (staff)          Pirate Ship CSV export        Google Sheet export     VeraCore (3PL)
+   approve / reject / ship /          → labels bought in             (audit / batch view)   inventory + expiry sync,
+   override / recurate / bulk           Pirate Ship                                         order push (when enabled)
+              │
+              ▼
+   Upload Pirate Ship tracking file → Shopify fulfillment / Cratejoy shipment marked shipped
 ```
 
 ## Components
 
-### FastAPI app (app.py)
-Single-file monolith on Heroku (1 web dyno). All routes, business logic, webhook receivers, and the background scheduler live here.
+| Component | Where | Notes |
+|---|---|---|
+| Web app | `app.py` (~11k lines, FastAPI + Jinja2) | All routes, webhook receivers, decision engine, bulk actions, exports, scheduler. |
+| Curation report | `curation_report.py` | Monthly forward look at every active customer (runs on the 3rd, or on demand). |
+| Forward planner | `projection_engine.py` | Projects kit/item demand for the next N months; staff can commit stock. |
+| Shopify client | `shopify_client.py` | Outbound Admin API: fulfillments, hold status, order lookups. |
+| Cratejoy client | `cratejoy_client.py` | Outbound API: shipments, subscriptions, customers. |
+| VeraCore | `veracore_client.py`, `veracore_sync.py` | SOAP AddOrder push, REST inventory + expiry sync, shipment poll (poll currently disabled). |
+| UI | `templates/*.html` | Server-rendered pages. Dark theme. Small vanilla JS on each page. |
+| Schema | `migrations/001…024` | Plain SQL, run by hand in the Supabase SQL editor, in order. |
+| One-off tools | `scripts/` | Imports, backfills, repairs. All dry-run by default, `--apply` to write. |
+| Tests | `tests/` | pytest. Fake DB, no network. |
 
-- **Webhook receivers** — `POST /webhooks/shopify/orders/create`, `POST /webhooks/cratejoy/order`. Verify HMAC, extract quiz data (due date, size, gender, daddy), run decision engine, write to Supabase.
-- **Decision engine** — Calculates trimester from due date, selects kit via FIFO age rank, stores pending decision.
-- **VeraCore push** — On approve, runs `submit_to_veracore()` as a FastAPI `BackgroundTask` (avoids Heroku 30s gateway timeout). Uses SOAP `AddOrder`.
-- **APScheduler-style daemon** — Background daemon thread checks hourly. Monthly curation report triggers on the 1st of month at 06:00 UTC. Daily VeraCore inventory sync at 04:00 UTC.
+## Runtime model
 
-### Supabase (PostgreSQL)
-Primary database. Service role key bypasses RLS for all operations. Auth uses Supabase Auth (built-in).
+- **One process.** Procfile: `web: uvicorn app:app --host 0.0.0.0 --port $PORT`. Single worker. In-memory state (bulk-job progress, report job status) lives in this process and resets on a dyno restart.
+- **Background scheduler.** A daemon thread started at import time (`_start_scheduler`). It wakes every hour and runs each daily job once. A `/tmp` lock file per job/day (`_schedule_lock`) stops a job running twice. Set `OBB_DISABLE_SCHEDULER=1` to switch the scheduler off. Do this in every script and test, or importing `app` will start production jobs.
 
-| Table | Purpose |
-|-------|---------|
-| `customers` | One row per subscriber — email, due_date, clothing_size, trimester, platform |
-| `kits` | Available box SKUs — trimester, size_variant, quantity_available, age_rank, is_welcome_kit |
-| `kit_items` | Junction: items inside each kit |
-| `items` | Inventory item catalog |
-| `item_alternatives` | Substitution rules for out-of-stock items |
-| `decisions` | One row per curation decision — status, kit_sku, veracore_order_id, veracore_status |
-| `shipments` | Historical shipment records (one per box shipped) |
-| `shipment_items` | Items in each historical shipment |
-| `activity_log` | Audit trail — every approve/reject/retry/error |
-| `curation_runs` | Monthly report metadata |
-| `curation_report_details` | Line-level curation report rows |
-| `committed_items` | Forward planner committed inventory |
-| `projection_runs` | Forward planner run metadata |
-| `veracore_sync_log` | VeraCore inventory sync run log |
-| `app_settings` | Key-value config editable from UI (e.g. veracore_freight_service) |
+  | Job | When (UTC) | Function |
+  |---|---|---|
+  | VeraCore inventory + expiry sync | 04:00 hour (only if VeraCore creds are set) | `veracore_sync.run_inventory_sync`, `run_expiry_sync` |
+  | Trimester refresh | after 06:00 daily | `_refresh_customer_trimesters` |
+  | Monthly curation report | the 3rd, after 06:00 | `curation_report.run_monthly_report` (ship date = 14th) |
+  | Cratejoy daily sync (creates decisions for due boxes) | after 07:00 daily | `_cratejoy_daily_sync` |
+  | Cratejoy reconcile (cancellations, ship-to, status) | after 07:00 daily | `cratejoy_daily_reconcile` |
+  | Shopify on-hold reconcile (pause/resume) | after 07:00 daily | `shopify_daily_reconcile` |
+  | VeraCore shipment poll | **disabled** (not in SOW) | `veracore_sync.run_shipment_poll` |
 
-### VeraCore (3PL Warehouse)
-Fulfillment system. Two integrations:
-- **SOAP AddOrder** — pushes an approved decision as a warehouse order. Endpoint: `{VERACORE_BASE_URL}/VeraCore.Services.asmx`
-- **REST Inventory** — reads `quantity_available` per Offer ID. Endpoint: `{VERACORE_BASE_URL}/inventory`
+  The same jobs can be run manually: `POST /api/cratejoy/daily-sync`, `/api/cratejoy/daily-reconcile`, `/api/shopify/hold-reconcile`, `/veracore/sync-inventory-now`, `/veracore/sync-expiry-now`.
+- **Bulk actions** (approve / ship / reject / recurate on many boxes) run on their own thread. The page shows a progress banner that polls `GET /decisions/bulk-job/{id}`. The request returns at once, so Heroku's 30-second router timeout is never hit.
+- **Database clients.** `get_supabase()` gives every non-main thread its own Supabase client. The supabase-py HTTP/2 connection is not safe to share across threads: sharing it caused the 2026-10-01 `[Errno 11]` / `ConnectionTerminated` failures. Never create a client directly. Always call `get_supabase()`.
 
-Env vars: `VERACORE_BASE_URL`, `VERACORE_USER_ID`, `VERACORE_PASSWORD`, `VERACORE_SYSTEM_ID`.
+## Data model (main tables)
 
-### Google Sheets
-Fallback export / audit trail. Each new decision is written to a configured Sheet via service account. On approve/reject, the existing row is updated. Configured via `GOOGLE_SHEET_ID` + `GOOGLE_SERVICE_ACCOUNT_JSON`.
-
-### Pirate Ship
-Shipping labels — no API integration. Team exports via `GET /decisions/export-veracore-csv` and uploads the CSV to Pirate Ship manually.
-
-## Deployment
-
-- **Platform:** Heroku (single web dyno)
-- **Runtime:** Python 3.11, Uvicorn ASGI server
-- **Config:** All secrets in Heroku config vars (env vars)
-- **Logs:** `heroku logs --tail` or Papertrail addon
+| Table | Holds |
+|---|---|
+| `customers` | One row per **recipient profile** (email + recipient). Due date, trimester, size, platform, subscription status, platform ids. One email can have several profiles (gift senders, migration 022). |
+| `decisions` | One row per box to send. Statuses: `pending`, `approved`, `shipped`, `rejected`. Also stores the kit, order/shipment ids, `decision_type`, `reason`, ship-to and billing address, tracking, VeraCore fields, `order_type`, `shipped_at` (024). |
+| `shipments` / `shipment_items` | What each customer actually received. The engine uses this history to block repeat kits and items. |
+| `kits` / `kit_items` / `items` / `item_alternatives` | Catalog. `kits.quantity_available` = units on hand. `age_rank` = FIFO order. `is_welcome_kit`, `is_universal`, `size_variant`, `build_month`. |
+| `webhook_logs` | Every inbound webhook: raw payload, status, error. Can be replayed from the Webhooks page. |
+| `activity_log` | What the dashboard "Activity" feed shows (approvals, bulk summaries, exports, sync results, alerts). |
+| `curation_runs` (+ `curation_run_customers`, `curation_run_items`, `curation_committed_items`) | Monthly curation report runs. |
+| `projection_runs` | Forward planner runs. |
+| `veracore_sync_log`, `kit_stock_alerts` | VeraCore sync history, low-stock alerts. |
+| `app_settings` | Key/value settings editable in the UI (e.g. VeraCore freight service). |
 
 ## Auth
 
-Supabase Auth (email+password, no OAuth). Two roles set in user metadata:
-- `admin` — full read+write access
-- `viewer` — read-only, no approve/reject/edit
+Supabase Auth, email + password. The role is in user metadata: `{"role": "admin"}` or `{"role": "viewer"}`; with no role set, the user is a viewer. `AuthMiddleware` checks the cookie on every request. Viewers get a 403 on any POST. These paths need no login: `/login`, `/logout`, `/health`, `/webhooks/shopify*`, `/webhooks/cratejoy*`, `/api/cratejoy/register-webhooks`. How to add users: [auth-setup.md](auth-setup.md).
 
-FastAPI `AuthMiddleware` validates the JWT cookie on every request except `/login`, `/health`, and incoming webhook POSTs from Shopify/Cratejoy.
+## Hosting
+
+- Heroku app `obb-real-d4e16a8bb2ff`. URL `https://obb-real-d4e16a8bb2ff.herokuapp.com`. Auto-deploys from GitHub `main`. Python version is set in `.python-version`.
+- All secrets are Heroku config vars. See the list in [../HANDOVER.md](../HANDOVER.md#environment-variables).
+- Supabase project `obb` (ref `tkcvvjxmzfjaesdhyfiy`).
+- Logs: `heroku logs --tail -a obb-real-d4e16a8bb2ff`. App-level history is also on the Webhooks and Activity pages.
